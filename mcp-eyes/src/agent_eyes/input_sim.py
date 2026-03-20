@@ -1,4 +1,4 @@
-"""Cross-platform human-like input simulation for mcp-eyes.
+"""Cross-platform human-like input simulation for agent-eyes.
 
 Simulates REAL keyboard and mouse events at the OS level, triggering
 all event listeners (onInput, onChange, keyDown, keyUp) just like
@@ -11,7 +11,7 @@ Platform support:
   - Windows: SendInput via ctypes (kernel input stream)
 
 Usage:
-    from mcp_eyes.input_sim import get_input_backend
+    from agent_eyes.input_sim import get_input_backend
     backend = get_input_backend()
     backend.activate_window(pid)
     backend.click(x, y)
@@ -30,7 +30,7 @@ import subprocess
 import random
 from typing import Optional
 
-logger = logging.getLogger("mcp-eyes")
+logger = logging.getLogger("agent-eyes")
 
 
 class InputBackend(abc.ABC):

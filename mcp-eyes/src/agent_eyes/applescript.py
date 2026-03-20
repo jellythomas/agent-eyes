@@ -164,6 +164,77 @@ def _list_tabs_individual() -> list[AppleScriptTab]:
     return tabs
 
 
+def open_new_tab(url: str = "about:blank") -> AppleScriptTab | None:
+    """Open a new tab in Chrome via AppleScript. No remote debugging needed."""
+    script = f'''
+    var chrome = Application("Google Chrome");
+    var win;
+    if (chrome.windows.length === 0) {{
+        win = chrome.Window().make();
+    }} else {{
+        win = chrome.windows[0];
+    }}
+    var tab = chrome.Tab({{url: {json.dumps(url)}}});
+    win.tabs.push(tab);
+    // Activate the new tab
+    win.activeTabIndex = win.tabs.length;
+    // Bring Chrome to front
+    chrome.activate();
+    // Wait briefly for the tab to start loading
+    delay(0.5);
+    var newTab = win.tabs[win.tabs.length - 1];
+    JSON.stringify({{
+        index: win.tabs.length - 1,
+        title: newTab.title(),
+        url: newTab.url(),
+        window_index: 0
+    }});
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout.strip())
+        return AppleScriptTab(
+            index=data["index"],
+            title=data["title"],
+            url=data["url"],
+            window_index=data.get("window_index", 0),
+        )
+    except Exception:
+        return None
+
+
+def navigate_tab(url: str, tab_index: int = 0, window_index: int = 0) -> str:
+    """Navigate an existing Chrome tab to a URL via AppleScript."""
+    script = f'''
+    var chrome = Application("Google Chrome");
+    var win = chrome.windows[{window_index}];
+    var tab = win.tabs[{tab_index}];
+    tab.url = {json.dumps(url)};
+    chrome.activate();
+    delay(0.5);
+    JSON.stringify({{
+        title: tab.title(),
+        url: tab.url()
+    }});
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return f"ERROR: {result.stderr.strip()}"
+        data = json.loads(result.stdout.strip())
+        return f"Navigated to: {data['url']}\nTitle: {data['title']}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 def get_active_tab_title() -> str:
     """Get the title of Chrome's currently active tab."""
     try:

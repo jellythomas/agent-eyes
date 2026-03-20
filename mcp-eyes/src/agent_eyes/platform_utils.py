@@ -1,4 +1,4 @@
-"""Cross-platform utilities for mcp-eyes.
+"""Cross-platform utilities for agent-eyes.
 
 Provides platform-agnostic browser detection, CDP auto-discovery,
 and Chrome launch instructions. Works on macOS, Linux, and Windows.

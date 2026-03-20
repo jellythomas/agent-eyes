@@ -1,7 +1,7 @@
 [project]
-name = "mcp-eyes"
-version = "0.1.0"
-description = "Universal screen reader MCP server - Claude Code's eyes for ALL applications"
+name = "agent-eyes"
+version = "0.2.0"
+description = "Accessibility-tree vision for AI agents — see and interact with ANY application without screenshots"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
@@ -23,7 +23,7 @@ linux = [
 ]
 
 [project.scripts]
-mcp-eyes = "mcp_eyes.server:main"
+agent-eyes = "agent_eyes.server:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

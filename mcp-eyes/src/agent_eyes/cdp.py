@@ -17,7 +17,7 @@ from typing import Any
 from .adapters.base import UIElement
 from .platform_utils import discover_cdp_port
 
-logger = logging.getLogger("mcp-eyes")
+logger = logging.getLogger("agent-eyes")
 
 # Key name → CDP key descriptor mapping for special keys
 _KEY_MAP: dict[str, dict[str, Any]] = {

@@ -30,7 +30,7 @@ if sys.platform == "darwin":
 else:
     _as = None  # type: ignore
 
-logger = logging.getLogger("mcp-eyes")
+logger = logging.getLogger("agent-eyes")
 
 # ── Platform detection ──────────────────────────────────────────────
 def _get_native_adapter() -> BaseAdapter | None:
@@ -54,7 +54,7 @@ def _get_native_adapter() -> BaseAdapter | None:
 
 
 # ── Server setup ────────────────────────────────────────────────────
-app = Server("mcp-eyes")
+app = Server("agent-eyes")
 registry = ElementRegistry()
 native_adapter = _get_native_adapter()
 cdp_client = CDPClient()
@@ -76,7 +76,7 @@ TOOLS = [
     Tool(
         name="eyes_status",
         description=(
-            "Check mcp-eyes status: platform adapter, permissions, CDP availability. "
+            "Check agent-eyes status: platform adapter, permissions, CDP availability. "
             "Call this first to verify the server is working."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
@@ -578,7 +578,7 @@ def _handle_status() -> str:
     input_backend = get_input_backend()
 
     lines = [
-        "=== mcp-eyes status ===",
+        "=== agent-eyes status ===",
         f"Platform: {sys.platform}",
         _platform_status(),
         "",
@@ -660,7 +660,7 @@ def _handle_get_tree(args: dict) -> str:
             web_content = (
                 "\n\n── Web content not yet visible in native tree ──────────────\n"
                 "The browser may not have built its accessibility tree yet.\n"
-                "Try again — mcp-eyes has signaled the browser to enable accessibility.\n"
+                "Try again — agent-eyes has signaled the browser to enable accessibility.\n"
                 "If this persists, try: eyes_get_tree with max_depth=20"
             )
 
@@ -891,7 +891,7 @@ async def _handle_list_chrome_tabs() -> str:
     return (
         "Chrome remote debugging not available.\n\n"
         f"Start Chrome with CDP enabled:\n  {launch_cmd}\n\n"
-        "Tip: mcp-eyes can auto-discover the CDP port if Chrome writes a\n"
+        "Tip: agent-eyes can auto-discover the CDP port if Chrome writes a\n"
         "DevToolsActivePort file. Use --remote-debugging-port=0 for an auto-assigned port."
     )
 
@@ -1278,7 +1278,7 @@ async def _handle_fill_form(args: dict) -> str:
 # ── Entry point ─────────────────────────────────────────────────────
 def main():
     logging.basicConfig(level=logging.INFO)
-    logger.info("mcp-eyes starting — platform: %s", sys.platform)
+    logger.info("agent-eyes starting — platform: %s", sys.platform)
 
     if native_adapter:
         ok, msg = native_adapter.check_permissions()
