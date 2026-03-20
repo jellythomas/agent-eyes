@@ -5,6 +5,7 @@ and Chrome launch instructions. Works on macOS, Linux, and Windows.
 """
 from __future__ import annotations
 
+import functools
 import os
 import socket
 import sys
@@ -23,12 +24,12 @@ _CHROMIUM_BROWSERS = (
 )
 
 
+@functools.lru_cache(maxsize=64)
 def get_process_name(pid: int) -> str:
-    """Get the process name for a PID. Cross-platform."""
+    """Get the process name for a PID. Cross-platform. Cached per PID."""
     if sys.platform == "win32":
         return _get_process_name_windows(pid)
     else:
-        # macOS and Linux both support ps
         return _get_process_name_unix(pid)
 
 

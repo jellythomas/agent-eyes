@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import asyncio
 import logging
 
@@ -749,7 +750,7 @@ async def _handle_click(args: dict) -> str:
             if element.pid:
                 input_backend.activate_window(element.pid)
                 import time as _time
-                _time.sleep(0.2)
+                _time.sleep(0.1)
             x, y, w, h = element.bounds
             cx, cy = x + w // 2, y + h // 2
             if input_backend.click(cx, cy):
@@ -795,16 +796,13 @@ async def _handle_type(args: dict) -> str:
     if element.pid and input_backend.is_available():
         input_backend.activate_window(element.pid)
         import time as _time
-        _time.sleep(0.2)
+        _time.sleep(0.1)
 
     # Strategy 1: Focus element + keyboard injection (screen-reader approach)
     # This is how VoiceOver/NVDA type text — focus the field, then inject keystrokes.
-    # Works reliably for browser web content because OS-level key events trigger
-    # all JavaScript event listeners (input, keydown, change).
     if hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
-            import time as _time
-            _time.sleep(0.3)
+            time.sleep(0.1)
             # Clear existing content and type new text
             if input_backend.clear_and_type(text):
                 return (
