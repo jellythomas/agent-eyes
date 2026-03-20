@@ -893,34 +893,67 @@ async def _handle_type(args: dict) -> str:
     # ── Strategy 1: Focus + keyboard injection (primary — triggers keyDown events)
     # This is how screen readers type. Real keystrokes trigger ALL event handlers:
     # keyDown, keyUp, textDidChange, input, change — works for both native and web.
+    keyboard_injected = False
     if hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
             time.sleep(0.1)
             if input_backend.clear_and_type(text):
-                return (
-                    f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-                    f"(focus + keyboard injection)"
-                )
+                # Verify the text actually landed — some apps (e.g. Jamf, secure input)
+                # silently ignore CGEvent keystrokes while AX set_value works.
+                time.sleep(0.15)
+                verified = False
+                if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+                    current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
+                    if current_val and text in str(current_val):
+                        verified = True
+                    elif current_val is None:
+                        # Can't verify (field doesn't expose value) — assume success
+                        verified = True
+                else:
+                    verified = True  # No way to verify, assume success
+
+                if verified:
+                    return (
+                        f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                        f"(focus + keyboard injection)"
+                    )
+                # Keyboard injection didn't land — mark it and fall through to set_value
+                keyboard_injected = True
 
     # ── Strategy 2: Coordinate click + type (when focus_element fails)
-    if input_backend.is_available() and element.bounds:
+    # Skip if keyboard injection already tried and failed (same mechanism, same result)
+    if not keyboard_injected and input_backend.is_available() and element.bounds:
         x, y, w, h = element.bounds
         cx, cy = x + w // 2, y + h // 2
         if input_backend.click_and_type(cx, cy, text):
-            return (
-                f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-                f"(coordinate click + type)"
-            )
+            # Verify text landed
+            time.sleep(0.15)
+            verified = False
+            if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+                current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
+                if current_val and text in str(current_val):
+                    verified = True
+                elif current_val is None:
+                    verified = True
+            else:
+                verified = True
 
-    # ── Strategy 3: set_value + AXConfirm (last resort — no keyDown events)
-    # Only use when keyboard injection is impossible (no input backend, no bounds).
-    # Warning: some apps ignore this because it skips keyDown/textDidChange.
+            if verified:
+                return (
+                    f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                    f"(coordinate click + type)"
+                )
+
+    # ── Strategy 3: set_value + AXConfirm (fallback for apps that block keyboard injection)
+    # Used when keyboard injection fails verification, OR when no input backend available.
+    # Works for Jamf Connect, security apps, and apps with secure/custom text fields.
     if native_adapter.set_value(element, text):
         if element.platform_ref:
             native_adapter.perform_action(element, "confirm")
+        method = "set_value fallback — keyboard injection didn't land" if keyboard_injected else "set_value"
         return (
             f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-            f"(set_value — no keyDown events fired)"
+            f"({method})"
         )
 
     return f"ERROR: Could not type into [{element_id}]. Element may not be editable."
