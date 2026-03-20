@@ -8,6 +8,8 @@ from .base import BaseAdapter, UIElement, AppInfo
 class WindowsAdapter(BaseAdapter):
     """Windows UI Automation adapter using pywinauto."""
 
+    _MAX_ELEMENTS = 1000
+
     def __init__(self):
         self._id_counter = 0
 
@@ -91,6 +93,8 @@ class WindowsAdapter(BaseAdapter):
                        in_web_area: bool = False) -> UIElement | None:
         if depth > max_depth:
             return None
+        if self._id_counter >= self._MAX_ELEMENTS:
+            return None
 
         try:
             role = wrapper.friendly_class_name() or "unknown"
@@ -99,6 +103,7 @@ class WindowsAdapter(BaseAdapter):
             # Detect entry into web content
             if role.lower() == "document":
                 in_web_area = True
+                max_depth = max(max_depth, depth + 10)
 
             # Get automation element properties
             value = ""

@@ -8,6 +8,8 @@ from .base import BaseAdapter, UIElement, AppInfo
 class LinuxAdapter(BaseAdapter):
     """Linux AT-SPI2 accessibility adapter."""
 
+    _MAX_ELEMENTS = 1000
+
     def __init__(self):
         self._atspi = None
         self._id_counter = 0
@@ -134,6 +136,8 @@ class LinuxAdapter(BaseAdapter):
                      in_web_area: bool = False) -> UIElement | None:
         if depth > max_depth or obj is None:
             return None
+        if self._id_counter >= self._MAX_ELEMENTS:
+            return None
 
         try:
             role = obj.get_role_name() or "unknown"
@@ -142,6 +146,7 @@ class LinuxAdapter(BaseAdapter):
             # Detect entry into web content
             if role in ("document web", "document frame"):
                 in_web_area = True
+                max_depth = max(max_depth, depth + 10)
             description = obj.get_description() or ""
 
             # Value

@@ -112,8 +112,8 @@ TOOLS = [
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Max tree depth (default 5, max 10)",
-                    "default": 5,
+                    "description": "Max tree depth (default 10, max 20)",
+                    "default": 10,
                 },
             },
             "required": ["pid"],
@@ -153,7 +153,8 @@ TOOLS = [
         name="eyes_click",
         description=(
             "Click/press a UI element by its [id] from the tree. "
-            "Works for buttons, links, checkboxes, menu items, etc."
+            "Works for buttons, links, checkboxes, menu items, etc. "
+            "Alternatively, click by screen coordinates (x, y) with a target pid."
         ),
         inputSchema={
             "type": "object",
@@ -162,8 +163,20 @@ TOOLS = [
                     "type": "integer",
                     "description": "Element ID from the accessibility tree",
                 },
+                "x": {
+                    "type": "integer",
+                    "description": "Screen X coordinate (use with y and pid for coordinate click)",
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Screen Y coordinate (use with x and pid for coordinate click)",
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Target app PID (required for coordinate click)",
+                },
             },
-            "required": ["id"],
+            "required": [],
         },
     ),
     Tool(
@@ -279,10 +292,13 @@ TOOLS = [
     Tool(
         name="eyes_press_key",
         description=(
-            "Press a keyboard key in the active Chrome tab. Supports special keys "
-            "(Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, "
-            "Home, End, PageUp, PageDown, F1-F12, Space) and modifiers "
-            "(Ctrl, Alt, Meta/Cmd, Shift). For typing text, use eyes_type instead."
+            "Press a keyboard key in any application (native or web). "
+            "For native apps, provide a PID to target that app. "
+            "For Chrome/web, optionally provide tab_index. "
+            "Supports special keys (Enter, Tab, Escape, Backspace, Delete, "
+            "ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, F1-F12, Space) "
+            "and modifiers (Ctrl, Alt, Meta/Cmd, Shift). "
+            "For typing text into a field, use eyes_type instead."
         ),
         inputSchema={
             "type": "object",
@@ -296,9 +312,13 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Modifier keys: 'Ctrl', 'Alt', 'Meta', 'Shift'",
                 },
+                "pid": {
+                    "type": "integer",
+                    "description": "Target app PID for native apps. If omitted, targets Chrome tab.",
+                },
                 "tab_index": {
                     "type": "integer",
-                    "description": "Tab index (default 0)",
+                    "description": "Chrome tab index (default 0). Only used when targeting Chrome.",
                     "default": 0,
                 },
             },
@@ -509,6 +529,26 @@ TOOLS = [
             "required": ["fields"],
         },
     ),
+    Tool(
+        name="eyes_get_ocr_hints",
+        description=(
+            "Get visual text hints from a window screenshot using OCR. "
+            "Use when the accessibility tree is insufficient (few interactive elements). "
+            "Returns text blocks with screen coordinates for coordinate-based clicking. "
+            "These are NOT semantic UI elements — text labels may or may not be interactive. "
+            "Requires Screen Recording permission on macOS."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID of the application",
+                },
+            },
+            "required": ["pid"],
+        },
+    ),
 ]
 
 
@@ -567,6 +607,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return await _handle_drag(args)
     elif name == "eyes_fill_form":
         return await _handle_fill_form(args)
+    elif name == "eyes_get_ocr_hints":
+        return _handle_get_ocr_hints(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -628,14 +670,10 @@ def _handle_get_tree(args: dict) -> str:
 
     is_browser = _pu.is_browser_pid(pid)
 
-    # Browsers need deeper traversal to reach web elements inside AXWebArea.
-    # Native apps: default 5, max 10.  Browsers: default 15, max 20.
-    if is_browser:
-        max_depth = min(args.get("max_depth", 15), 20)
-    else:
-        max_depth = min(args.get("max_depth", 5), 10)
+    # Universal depth: default 10, max 20.
+    max_depth = min(args.get("max_depth", 10), 20)
 
-    # Pass is_browser flag so adapter can force AX tree construction
+    # Build tree — pass is_browser for adapters that support it
     if hasattr(native_adapter, "get_tree"):
         import inspect
         sig = inspect.signature(native_adapter.get_tree)
@@ -649,25 +687,53 @@ def _handle_get_tree(args: dict) -> str:
     if tree is None:
         return f"ERROR: Could not get accessibility tree for PID {pid}. App may not be running or permission denied."
 
+    # Auto-retry: if web content found but tree is sparse, rebuild deeper
+    has_web = _tree_has_web_content(tree)
+    interactive_count = _count_interactive(tree)
+
+    if has_web and interactive_count < 5 and max_depth < 20:
+        # Web content exists but not enough interactive elements reached.
+        # Retry with max depth to capture deeply nested buttons/inputs.
+        if hasattr(native_adapter, "get_tree"):
+            import inspect
+            sig = inspect.signature(native_adapter.get_tree)
+            if "is_browser" in sig.parameters:
+                tree = native_adapter.get_tree(pid, 20, is_browser=is_browser)
+            else:
+                tree = native_adapter.get_tree(pid, 20)
+        else:
+            tree = native_adapter.get_tree(pid, 20)
+        if tree is None:
+            return f"ERROR: Could not rebuild accessibility tree for PID {pid}."
+        interactive_count = _count_interactive(tree)
+        max_depth = 20
+
     registry.register_tree(tree, pid=pid)
     text = tree.to_text(max_depth=max_depth)
 
-    # For browsers: check if native tree reached web content.
-    # Native AX traversal is the primary method — no CDP or JS fallback needed.
-    web_content = ""
-    if is_browser:
-        has_web_elements = _tree_has_web_content(tree)
-        if not has_web_elements:
-            web_content = (
-                "\n\n── Web content not yet visible in native tree ──────────────\n"
-                "The browser may not have built its accessibility tree yet.\n"
-                "Try again — agent-eyes has signaled the browser to enable accessibility.\n"
-                "If this persists, try: eyes_get_tree with max_depth=20"
-            )
+    # Metadata and advisories
+    meta = f"Accessibility tree for PID {pid} ({registry.count()} elements"
+    if has_web:
+        meta += ", web content detected"
+    meta += "):"
+
+    advisory = ""
+    if has_web and interactive_count < 5:
+        advisory = (
+            "\n\n── Web content not yet visible in native tree ──────────────\n"
+            "The app may not have built its accessibility tree yet.\n"
+            "Try again — agent-eyes has signaled the app to enable accessibility.\n"
+            "If this persists, try: eyes_get_tree with max_depth=20"
+        )
+    elif interactive_count < 3 and registry.count() > 5:
+        advisory = (
+            "\n\nNote: few interactive elements found. "
+            "Use eyes_get_ocr_hints for visual text detection."
+        )
 
     return (
-        f"Accessibility tree for PID {pid} ({registry.count()} elements):\n\n"
-        f"{text}{web_content}\n\n"
+        f"{meta}\n\n"
+        f"{text}{advisory}\n\n"
         f"Use [id] numbers with eyes_click or eyes_type to interact."
     )
 
@@ -681,6 +747,17 @@ def _tree_has_web_content(element) -> bool:
             return True
     return False
 
+
+def _count_interactive(element, _interactive_roles=frozenset({
+    "button", "link", "textfield", "textarea", "combobox",
+    "checkbox", "radiobutton", "slider", "menuitem", "tab",
+    "searchfield", "popupbutton", "switch", "togglebutton",
+})) -> int:
+    """Count interactive elements in the tree."""
+    count = 1 if element.role in _interactive_roles else 0
+    for child in element.children:
+        count += _count_interactive(child)
+    return count
 
 
 def _handle_find(args: dict) -> str:
@@ -713,8 +790,24 @@ def _handle_find(args: dict) -> str:
 
 async def _handle_click(args: dict) -> str:
     element_id = args.get("id")
+    click_x = args.get("x")
+    click_y = args.get("y")
+    click_pid = args.get("pid")
+
+    # Coordinate-based click (from OCR hints or manual)
+    if click_x is not None and click_y is not None:
+        input_backend = get_input_backend()
+        if not input_backend.is_available():
+            return "ERROR: No input backend available for coordinate click."
+        if click_pid:
+            input_backend.activate_window(click_pid)
+            time.sleep(0.1)
+        if input_backend.click(click_x, click_y):
+            return f"Clicked at ({click_x}, {click_y})"
+        return f"ERROR: Could not click at ({click_x}, {click_y})."
+
     if element_id is None:
-        return "ERROR: id is required."
+        return "ERROR: id is required (or provide x, y coordinates)."
 
     element = registry.get(element_id)
     if element is None:
@@ -1043,19 +1136,69 @@ async def _handle_press_key(args: dict) -> str:
     if not key:
         return "ERROR: key is required."
 
+    pid = args.get("pid")
+    modifiers = args.get("modifiers", [])
+    mod_str = "+".join(modifiers) + "+" if modifiers else ""
+
+    # ── Normalize key names to input_sim format ──
+    key_map = {
+        "enter": "return", "arrowup": "up", "arrowdown": "down",
+        "arrowleft": "left", "arrowright": "right",
+        "backspace": "delete", "pageup": "page_up", "pagedown": "page_down",
+    }
+    native_key = key_map.get(key.lower(), key.lower())
+
+    # ── Normalize modifier names for input_sim ──
+    mod_map = {"ctrl": "control", "meta": "command", "cmd": "command"}
+
+    # ── Route: if PID given, check if it's a native app or browser ──
+    if pid is not None:
+        is_browser = _pu.is_browser_pid(pid)
+
+        if not is_browser:
+            # Native app path — use OS-level input simulation
+            input_backend = get_input_backend()
+            if not input_backend.is_available():
+                return "ERROR: No input backend available for native key press."
+
+            input_backend.activate_window(pid)
+            time.sleep(0.1)
+
+            if modifiers:
+                native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
+                hotkey_keys = native_mods + [native_key]
+                success = input_backend.hotkey(*hotkey_keys)
+            else:
+                success = input_backend.press_key(native_key)
+
+            if success:
+                return f"Pressed {mod_str}{key} in native app (PID {pid})"
+            return f"ERROR: Could not press key '{key}' in native app (PID {pid})."
+
+    # ── Chrome/web path — use CDP ──
     err = await _ensure_tabs()
     if err:
+        # Fallback: if no Chrome tabs but we have an input backend, use native
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            if modifiers:
+                native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
+                hotkey_keys = native_mods + [native_key]
+                success = input_backend.hotkey(*hotkey_keys)
+            else:
+                success = input_backend.press_key(native_key)
+            if success:
+                return f"Pressed {mod_str}{key} (native input fallback — no Chrome tabs)"
         return err
+
     tab, err = _get_tab(args)
     if err:
         return err
 
-    modifiers = args.get("modifiers", [])
     success = await cdp_client.press_key(tab, key, modifiers)
     if success:
-        mod_str = "+".join(modifiers) + "+" if modifiers else ""
-        return f"Pressed {mod_str}{key}"
-    return f"ERROR: Could not press key '{key}'."
+        return f"Pressed {mod_str}{key} in Chrome tab"
+    return f"ERROR: Could not press key '{key}' via CDP."
 
 
 async def _handle_wait_for(args: dict) -> str:
@@ -1274,6 +1417,61 @@ async def _handle_fill_form(args: dict) -> str:
     if errors:
         parts.append(f"Errors:\n" + "\n".join(f"  {e}" for e in errors))
     return "\n".join(parts) or "No fields processed."
+
+
+def _handle_get_ocr_hints(args: dict) -> str:
+    pid = args.get("pid")
+    if pid is None:
+        return "ERROR: pid is required."
+
+    from .screenshot import capture_window
+    from .ocr import get_ocr_engine
+
+    engine = get_ocr_engine()
+    if engine is None:
+        import sys as _sys
+        platform = _sys.platform
+        if platform == "darwin":
+            msg = "Install: pip install 'agent-eyes[macos]'"
+        elif platform == "win32":
+            msg = "Install: pip install winrt-Windows.Media.Ocr"
+        else:
+            msg = "Install: pip install pytesseract (+ apt install tesseract-ocr)"
+        return f"ERROR: No OCR engine available. {msg}"
+
+    capture = capture_window(pid)
+    if capture is None:
+        import sys as _sys
+        if _sys.platform == "darwin":
+            return "ERROR: Could not capture window. Check Screen Recording permission in System Settings > Privacy & Security."
+        return f"ERROR: Could not capture window for PID {pid}."
+
+    hints = engine.recognize(
+        capture.image_data,
+        scale_factor=capture.scale_factor,
+        window_x=capture.window_x,
+        window_y=capture.window_y,
+        window_w=capture.window_w,
+        window_h=capture.window_h,
+    )
+
+    if not hints:
+        return "No text detected in window. The window may be empty or OCR could not read it."
+
+    lines = [
+        f"OCR text hints for PID {pid} ({len(hints)} text blocks detected).",
+        "These are visual text positions — NOT semantic UI elements.",
+        "Use eyes_click(x=..., y=..., pid=...) to click at these coordinates.",
+        "",
+    ]
+    for h in sorted(hints, key=lambda h: (h.y, h.x)):
+        cx = h.x + h.width // 2
+        cy = h.y + h.height // 2
+        lines.append(
+            f'  "{h.text}" @({cx},{cy}) size={h.width}x{h.height} conf={h.confidence}'
+        )
+
+    return "\n".join(lines)
 
 
 # ── Entry point ─────────────────────────────────────────────────────

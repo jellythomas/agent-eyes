@@ -164,7 +164,7 @@ class MacOSAdapter(BaseAdapter):
             return {attr: self._read_attr(ax_el, attr) for attr in self._BATCH_ATTRS}
 
     # Hard cap on elements to prevent runaway traversal on complex pages
-    _MAX_ELEMENTS = 500
+    _MAX_ELEMENTS = 1000
 
     def _element_to_ui(self, ax_el, depth: int, max_depth: int,
                        in_web_area: bool = False) -> UIElement | None:
@@ -188,9 +188,12 @@ class MacOSAdapter(BaseAdapter):
         if role in ("unknown", ""):
             return None
 
-        # Detect entry into web content
+        # Detect entry into web content — dynamically extend depth
         if role == "webarea":
             in_web_area = True
+            # Web content needs deeper traversal. Extend depth budget by 10
+            # from current position (buttons are 3-5 levels below AXWebArea).
+            max_depth = max(max_depth, depth + 10)
 
         name = str(attrs.get("AXTitle") or "")
         if not name:
@@ -294,9 +297,10 @@ class MacOSAdapter(BaseAdapter):
         self.reset_ids()
         ax_app = self._ax.AXUIElementCreateApplication(pid)
 
-        # Force browser to build full accessibility tree
-        if is_browser:
-            self.force_browser_accessibility(pid)
+        # Force ALL apps to enable accessibility tree construction.
+        # Safe no-op on native apps (returns kAXErrorNotImplemented).
+        # Critical for Electron/CEF/WebKit apps that lazily build AX trees.
+        self.force_browser_accessibility(pid)
 
         # Try focused window first, fall back to first window
         ax_window = self._read_attr(ax_app, "AXFocusedWindow")
