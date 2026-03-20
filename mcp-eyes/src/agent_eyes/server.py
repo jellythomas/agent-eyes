@@ -792,26 +792,14 @@ async def _handle_type(args: dict) -> str:
     input_backend = get_input_backend()
     is_web = "scrolltovisible" in element.actions  # web elements have this action
 
-    # ── Strategy 1: AX set_value + AXConfirm (native apps — fastest, most reliable)
-    # Works without window activation — pure accessibility API, no keystrokes.
-    # For native apps like Jamf, this is the only reliable method.
-    if not is_web:
-        if native_adapter.set_value(element, text):
-            # Trigger validation by performing AXConfirm (simulates Enter)
-            if element.platform_ref:
-                native_adapter.perform_action(element, "confirm")
-            return (
-                f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-                f"(set_value + confirm)"
-            )
-
-    # ── Strategy 2: Activate app + focus + keyboard injection (web elements)
-    # Screen-reader approach: bring app to front, focus field, inject keystrokes.
-    # Required for web because set_value doesn't trigger JS event listeners.
+    # ── Step 1: Activate the target app window (always, for all strategies)
     if element.pid and input_backend.is_available():
         input_backend.activate_window(element.pid)
         time.sleep(0.1)
 
+    # ── Strategy 1: Focus + keyboard injection (primary — triggers keyDown events)
+    # This is how screen readers type. Real keystrokes trigger ALL event handlers:
+    # keyDown, keyUp, textDidChange, input, change — works for both native and web.
     if hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
             time.sleep(0.1)
@@ -821,11 +809,8 @@ async def _handle_type(args: dict) -> str:
                     f"(focus + keyboard injection)"
                 )
 
-    # ── Strategy 3: Coordinate click + type (fallback)
+    # ── Strategy 2: Coordinate click + type (when focus_element fails)
     if input_backend.is_available() and element.bounds:
-        if element.pid:
-            input_backend.activate_window(element.pid)
-            time.sleep(0.1)
         x, y, w, h = element.bounds
         cx, cy = x + w // 2, y + h // 2
         if input_backend.click_and_type(cx, cy, text):
@@ -834,11 +819,15 @@ async def _handle_type(args: dict) -> str:
                 f"(coordinate click + type)"
             )
 
-    # ── Strategy 4: set_value as last resort (web elements where keyboard failed)
+    # ── Strategy 3: set_value + AXConfirm (last resort — no keyDown events)
+    # Only use when keyboard injection is impossible (no input backend, no bounds).
+    # Warning: some apps ignore this because it skips keyDown/textDidChange.
     if native_adapter.set_value(element, text):
+        if element.platform_ref:
+            native_adapter.perform_action(element, "confirm")
         return (
             f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-            f"(set_value fallback)"
+            f"(set_value — no keyDown events fired)"
         )
 
     return f"ERROR: Could not type into [{element_id}]. Element may not be editable."
