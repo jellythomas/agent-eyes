@@ -890,11 +890,17 @@ async def _handle_type(args: dict) -> str:
         input_backend.activate_window(element.pid)
         time.sleep(0.1)
 
+    # ── Secure text field detection (NSSecureTextField / SecureField)
+    # These fields call EnableSecureEventInput() when focused, which blocks ALL
+    # CGEvent keyboard injection at the HID level. set_value is the only option.
+    is_secure = "secure" in element.states
+
     # ── Strategy 1: Focus + keyboard injection (primary — triggers keyDown events)
     # This is how screen readers type. Real keystrokes trigger ALL event handlers:
     # keyDown, keyUp, textDidChange, input, change — works for both native and web.
+    # SKIP for secure text fields — CGEvent will always fail, wastes 0.25s.
     keyboard_injected = False
-    if hasattr(native_adapter, 'focus_element') and input_backend.is_available():
+    if not is_secure and hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
             time.sleep(0.1)
             if input_backend.clear_and_type(text):

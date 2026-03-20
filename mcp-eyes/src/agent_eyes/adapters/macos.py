@@ -133,7 +133,7 @@ class MacOSAdapter(BaseAdapter):
 
     # Attributes to batch-read per element (single IPC call instead of 10+)
     _BATCH_ATTRS = [
-        "AXRole", "AXTitle", "AXDescription", "AXRoleDescription",
+        "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXRoleDescription",
         "AXValue", "AXFocused", "AXEnabled", "AXSelected",
         "AXPosition", "AXSize", "AXChildren",
     ]
@@ -212,6 +212,11 @@ class MacOSAdapter(BaseAdapter):
             states.append("disabled")
         if attrs.get("AXSelected"):
             states.append("selected")
+        # Detect secure text fields (NSSecureTextField) — these block CGEvent
+        # keyboard injection via EnableSecureEventInput(). Must use set_value.
+        subrole = str(attrs.get("AXSubrole") or "")
+        if "securetextfield" in subrole.lower().replace("ax", ""):
+            states.append("secure")
 
         # Actions (still a separate call — no batch API for this)
         actions = []
