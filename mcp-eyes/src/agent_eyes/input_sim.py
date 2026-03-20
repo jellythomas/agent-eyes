@@ -255,14 +255,26 @@ class MacOSInputBackend(InputBackend):
             return False
 
     def activate_window(self, pid: int) -> bool:
+        """Bring an app to front via NSRunningApplication (Cocoa API).
+
+        More reliable than AppleScript — works for apps that don't respond
+        to System Events (like Jamf Self Service+).
+        """
         try:
+            from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            if app:
+                app.activateWithOptionSet_(NSApplicationActivateIgnoringOtherApps)
+                time.sleep(0.15)
+                return True
+            # Fallback to System Events if NSRunningApplication fails
             subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to set frontmost of '
                  f'(first process whose unix id is {pid}) to true'],
-                capture_output=True, timeout=5,
+                capture_output=True, timeout=3,
             )
-            time.sleep(0.3)
+            time.sleep(0.15)
             return True
         except Exception as e:
             logger.error("macOS activate_window failed: %s", e)
