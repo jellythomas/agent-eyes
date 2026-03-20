@@ -1,0 +1,33 @@
+[project]
+name = "mcp-eyes"
+version = "0.1.0"
+description = "Universal screen reader MCP server - Claude Code's eyes for ALL applications"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+macos = [
+    "pyobjc-framework-ApplicationServices>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+]
+windows = [
+    "pywinauto>=0.6.8",
+]
+linux = [
+    # pyatspi2 typically installed via system package manager
+    # apt install python3-pyatspi / dnf install python3-pyatspi
+]
+
+[project.scripts]
+mcp-eyes = "mcp_eyes.server:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
