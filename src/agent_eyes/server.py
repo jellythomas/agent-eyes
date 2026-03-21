@@ -51,13 +51,13 @@ def _maybe_auto_setup() -> str | None:
         if is_first_run():
             return (
                 "⚠️ agent-eyes is not configured yet.\n"
-                "Run `/agent-eyes:init` to set up agent-eyes and replace competing MCP servers.\n"
+                "Run `/agent-eyes-init` to set up agent-eyes and replace competing MCP servers.\n"
                 "This only takes a few seconds and uses interactive setup."
             )
         elif needs_rescan(__version__):
             return (
                 "ℹ️ agent-eyes has been upgraded to a new version.\n"
-                "Run `/agent-eyes:init` to re-scan and update your configuration."
+                "Run `/agent-eyes-init` to re-scan and update your configuration."
             )
     except Exception as e:
         logger.debug("Auto-setup skipped: %s", e)
