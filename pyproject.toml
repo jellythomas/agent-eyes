@@ -1,6 +1,6 @@
 [project]
 name = "agent-eyes"
-version = "0.3.1"
+version = "0.3.2"
 description = "Accessibility-tree vision for AI agents — see and interact with ANY application without screenshots"
 requires-python = ">=3.10"
 license = {text = "MIT"}
