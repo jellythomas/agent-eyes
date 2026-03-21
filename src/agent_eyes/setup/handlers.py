@@ -112,28 +112,39 @@ def handle_setup() -> str:
                     )
                     agents_seen.add(ref["agent_file"])
 
-    # ── Next Steps
+    # ── Quick Setup — compact choices with smart defaults
+    # Default: replace ALL competitors, configure ALL detected tools, global
+    all_comp_ids = [c["id"] for c in competitor_list]
+    all_tool_ids = [t["id"] for t in ai_tools]
+    defaults = {
+        "replace": all_letter,
+        "replace_ids": all_comp_ids,
+        "tools": all_tool_ids,
+        "level": "global",
+    }
+
     lines.append("")
     lines.append("=" * 60)
-    lines.append("  Next Steps")
+    lines.append("  Quick Setup")
     lines.append("=" * 60)
     lines.append("")
-    lines.append("Present the options above to the user and ask:")
+    lines.append("Present ONE compact prompt to the user with these choices.")
+    lines.append("Show defaults with [brackets]. User just confirms or changes.")
     lines.append("")
-    lines.append("1. Which competing tools to REPLACE with agent-eyes?")
-    lines.append("   (Select from the lettered options above)")
+    lines.append("FORMAT TO PRESENT (copy this style exactly):")
+    lines.append("─────────────────────────────────────────────")
+    lines.append(f"  Replace competitors?  [{all_letter}] " + " / ".join(
+        [f"({c['option']}) {c['name']}" for c in competitor_list]
+        + [f"({all_letter}) All", f"({none_letter}) None"]
+    ))
+    lines.append(f"  Configure in?         [All] " + " / ".join(
+        [f"{t['id']}" for t in ai_tools]
+    ))
+    lines.append(f"  Level?                [global] / project")
+    lines.append("─────────────────────────────────────────────")
+    lines.append(f"  Press Enter to accept defaults, or type changes.")
     lines.append("")
-    lines.append("2. Which AI tools to CONFIGURE agent-eyes in?")
-    lines.append("   (Select from the tool IDs listed above)")
-    lines.append("")
-    lines.append("3. Installation level: 'global' or 'project'?")
-    lines.append("")
-    lines.append("Then call eyes_setup_apply with the user's choices:")
-    lines.append("  replace_competitors: [list of competitor IDs]")
-    lines.append("  configure_tools: [list of AI tool IDs]")
-    lines.append("  level: 'global' or 'project'")
-    lines.append("")
-    lines.append("IMPORTANT: Warn the user that this will modify config files.")
+    lines.append("After user responds, call eyes_setup_apply with their choices.")
     lines.append("All changes are backed up automatically.")
 
     # Embed machine-readable data for the AI agent
@@ -143,6 +154,7 @@ def handle_setup() -> str:
         "ai_tools": [{"id": t["id"], "name": t["name"]} for t in ai_tools],
         "competitors": competitor_list,
         "scan_report_summary": scan_report["summary"],
+        "defaults": defaults,
     }, indent=2))
 
     return "\n".join(lines)
@@ -171,7 +183,7 @@ def handle_setup_apply(args: dict) -> str:
 
     # Mark as initialized
     mark_initialized(
-        version="0.3.0",
+        version="0.3.1",
         tools_configured=configure_tools,
         competitors_replaced=replace_competitors,
     )

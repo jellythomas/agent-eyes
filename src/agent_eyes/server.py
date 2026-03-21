@@ -971,17 +971,20 @@ def _handle_status() -> str:
     elif sys.platform != "darwin":
         lines.append("AppleScript fallback: N/A (macOS only) — CDP required for browser tabs")
 
-    # First-run detection
+    # First-run detection — auto-trigger setup scan
     try:
         from .setup.state import is_first_run, needs_rescan
-        if is_first_run():
+        if is_first_run() or needs_rescan("0.3.1"):
             lines.append("")
-            lines.append(">>> FIRST RUN DETECTED <<<")
-            lines.append("Run eyes_setup to scan your AI tools and discover competing")
-            lines.append("browser/desktop automation MCP servers that agent-eyes can replace.")
-        elif needs_rescan("0.3.0"):
+            lines.append(">>> FIRST RUN — auto-scanning... <<<")
             lines.append("")
-            lines.append(">>> NEW VERSION — run eyes_setup to check for updates <<<")
+            try:
+                from .setup.handlers import handle_setup
+                setup_result = handle_setup()
+                lines.append(setup_result)
+            except Exception as e:
+                lines.append(f"Setup scan failed: {e}")
+                lines.append("Run eyes_setup manually to retry.")
     except Exception:
         pass  # Setup module not critical for status
 
@@ -1628,8 +1631,20 @@ async def _handle_press_key(args: dict) -> str:
             if not input_backend.is_available():
                 return "ERROR: No input backend available for native key press."
 
+            # Activate target and verify it's frontmost before sending keys.
+            # This prevents keys like Escape/Cmd+A from hitting the wrong app
+            # (e.g., Claude Code's terminal) due to activation race conditions.
             input_backend.activate_window(pid)
             time.sleep(0.1)
+            if not input_backend.is_frontmost(pid):
+                # Retry with longer delay
+                input_backend.activate_window(pid)
+                time.sleep(0.3)
+                if not input_backend.is_frontmost(pid):
+                    return (
+                        f"ERROR: Could not bring app (PID {pid}) to front. "
+                        f"Key '{key}' NOT sent to avoid hitting the wrong app."
+                    )
 
             if modifiers:
                 native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
