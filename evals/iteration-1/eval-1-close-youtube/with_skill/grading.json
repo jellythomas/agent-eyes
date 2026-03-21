@@ -1,0 +1,10 @@
+{
+  "eval_id": 1,
+  "eval_name": "close-youtube-tab",
+  "variant": "with_skill",
+  "expectations": [
+    {"text": "lists-tabs-before-close", "passed": true, "evidence": "Step 2 calls eyes_list_chrome_tabs before Step 3 calls eyes_close_tab"},
+    {"text": "uses-title-matching", "passed": true, "evidence": "Step 3 uses title parameter: eyes_close_tab({title: '<YouTube tab title>'})"},
+    {"text": "no-blind-index-0", "passed": true, "evidence": "Never uses tab_index=0; uses title-based matching exclusively"}
+  ]
+}

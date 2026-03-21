@@ -1,0 +1,10 @@
+{
+  "eval_id": 3,
+  "eval_name": "close-all-except-current",
+  "variant": "without_skill",
+  "expectations": [
+    {"text": "lists-tabs-first", "passed": true, "evidence": "Step 2 calls eyes_list_chrome_tabs before any close"},
+    {"text": "identifies-current-tab", "passed": true, "evidence": "Step 1 calls eyes_context to identify active tab"},
+    {"text": "aware-of-index-shift", "passed": true, "evidence": "Closes from highest index to lowest to avoid shift — valid strategy. However does NOT re-list between closes, risking stale state if a close fails."}
+  ]
+}

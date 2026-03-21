@@ -1,0 +1,25 @@
+{
+  "eval_id": 1,
+  "eval_name": "close-youtube-tab",
+  "prompt": "close the youtube tab that was opened earlier",
+  "assertions": [
+    {
+      "name": "lists-tabs-before-close",
+      "description": "Claude calls eyes_list_chrome_tabs before calling eyes_close_tab",
+      "type": "tool_order",
+      "check": "Plan includes eyes_list_chrome_tabs BEFORE any eyes_close_tab call"
+    },
+    {
+      "name": "uses-title-matching",
+      "description": "Claude uses the title parameter or identifies the correct tab by title/URL before closing",
+      "type": "tool_param",
+      "check": "Plan references matching by title (e.g. 'YouTube') rather than assuming an index"
+    },
+    {
+      "name": "no-blind-index-0",
+      "description": "Claude does NOT call eyes_close_tab with default tab_index 0 without verification",
+      "type": "negative",
+      "check": "Plan does NOT jump straight to eyes_close_tab(tab_index=0) without listing tabs first"
+    }
+  ]
+}

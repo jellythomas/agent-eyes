@@ -1,0 +1,69 @@
+{
+  "skill_name": "agent-eyes",
+  "evals": [
+    {
+      "id": 1,
+      "name": "close-youtube-tab",
+      "prompt": "close the youtube tab that was opened earlier",
+      "expected_output": "Claude should call eyes_list_chrome_tabs BEFORE eyes_close_tab, then use title matching to find the YouTube tab, not default to index 0",
+      "assertions": [
+        {
+          "name": "lists-tabs-before-close",
+          "description": "Claude calls eyes_list_chrome_tabs before calling eyes_close_tab",
+          "type": "tool_order"
+        },
+        {
+          "name": "uses-title-matching",
+          "description": "Claude uses the title parameter or identifies the correct tab by title/URL before closing",
+          "type": "tool_param"
+        },
+        {
+          "name": "no-blind-index-0",
+          "description": "Claude does NOT call eyes_close_tab with default tab_index 0 without verification",
+          "type": "negative"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "navigate-github-tab",
+      "prompt": "go to the issues page on my github tab",
+      "expected_output": "Claude should list tabs or check context first, identify which tab is GitHub, then navigate that specific tab",
+      "assertions": [
+        {
+          "name": "checks-context-or-lists-tabs",
+          "description": "Claude calls eyes_list_chrome_tabs or eyes_context before eyes_navigate",
+          "type": "tool_order"
+        },
+        {
+          "name": "targets-correct-tab",
+          "description": "Claude identifies which tab index corresponds to GitHub before navigating",
+          "type": "tool_param"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "close-all-except-current",
+      "prompt": "i have too many tabs open, close everything except the tab im currently reading",
+      "expected_output": "Claude should list all tabs, identify which one the user is reading (via context), then close others one by one, re-reading state between closes since indexes shift",
+      "assertions": [
+        {
+          "name": "lists-tabs-first",
+          "description": "Claude calls eyes_list_chrome_tabs before any close operations",
+          "type": "tool_order"
+        },
+        {
+          "name": "identifies-current-tab",
+          "description": "Claude calls eyes_context or asks which tab the user is reading before closing",
+          "type": "tool_param"
+        },
+        {
+          "name": "aware-of-index-shift",
+          "description": "Claude either re-reads tab list between closes, closes from highest index first, or uses title matching to avoid index-shift bugs",
+          "type": "behavior"
+        }
+      ]
+    }
+  ]
+}

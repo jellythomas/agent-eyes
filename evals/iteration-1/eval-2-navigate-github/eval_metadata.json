@@ -1,0 +1,19 @@
+{
+  "eval_id": 2,
+  "eval_name": "navigate-github-tab",
+  "prompt": "go to the issues page on my github tab",
+  "assertions": [
+    {
+      "name": "checks-context-or-lists-tabs",
+      "description": "Claude calls eyes_list_chrome_tabs or eyes_context before eyes_navigate",
+      "type": "tool_order",
+      "check": "Plan includes a context/list check BEFORE the navigate call"
+    },
+    {
+      "name": "targets-correct-tab",
+      "description": "Claude identifies which tab index corresponds to GitHub before navigating",
+      "type": "tool_param",
+      "check": "Plan explicitly finds the GitHub tab by title/URL match, then uses that index for navigate"
+    }
+  ]
+}

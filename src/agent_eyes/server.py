@@ -499,14 +499,24 @@ TOOLS = [
     ),
     Tool(
         name="eyes_close_tab",
-        description="Close a Chrome tab by index.",
+        description=(
+            "Close a Chrome tab by title match or index. "
+            "IMPORTANT: Always call eyes_list_chrome_tabs first to verify "
+            "which tab to close. Prefer using 'title' over 'tab_index' for safety."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Substring to match against tab titles (case-insensitive). "
+                        "Preferred over tab_index for safe targeting."
+                    ),
+                },
                 "tab_index": {
                     "type": "integer",
-                    "description": "Tab index to close (default 0 = current)",
-                    "default": 0,
+                    "description": "Tab index to close. Use only after listing tabs.",
                 },
             },
             "required": [],
@@ -1544,7 +1554,7 @@ async def _handle_navigate(args: dict) -> str:
     # Try CDP first
     available = await cdp_client.is_available()
     if available:
-        err = await _ensure_tabs()
+        err = await _ensure_tabs(force=True)
         if err:
             return err
         tab, err = _get_tab(args)
@@ -1789,19 +1799,51 @@ async def _handle_new_tab(args: dict) -> str:
 async def _handle_close_tab(args: dict) -> str:
     global _cached_tabs
 
-    err = await _ensure_tabs()
-    if err:
-        return err
-    tab, err = _get_tab(args)
+    # Always force-refresh tabs for destructive operations
+    err = await _ensure_tabs(force=True)
     if err:
         return err
 
-    idx = args.get("tab_index", 0)
+    title_query = args.get("title")
+    idx = args.get("tab_index")
+
+    # If title is provided, find the matching tab by title (case-insensitive substring)
+    if title_query:
+        query_lower = title_query.lower()
+        matches = [
+            (i, t) for i, t in enumerate(_cached_tabs)
+            if query_lower in t.title.lower()
+        ]
+        if not matches:
+            tab_list = "\n".join(
+                f"  [{i}] {t.title} — {t.url}" for i, t in enumerate(_cached_tabs)
+            )
+            return f"ERROR: No tab matching '{title_query}'. Open tabs:\n{tab_list}"
+        if len(matches) > 1:
+            match_list = "\n".join(
+                f"  [{i}] {t.title} — {t.url}" for i, t in matches
+            )
+            return (
+                f"ERROR: Multiple tabs match '{title_query}'. "
+                f"Specify tab_index to close the correct one:\n{match_list}"
+            )
+        idx, tab = matches[0]
+    else:
+        # Default to index-based lookup
+        if idx is None:
+            idx = 0
+        tab, tab_err = _get_tab({"tab_index": idx})
+        if tab_err:
+            return tab_err
+
+    # Include tab details in confirmation for transparency
+    tab_title = getattr(tab, "title", "unknown")
+    tab_url = getattr(tab, "url", "unknown")
     success = await cdp_client.close_tab(tab)
     if success:
         _cached_tabs.pop(idx)
-        return f"Closed tab [{idx}]."
-    return "ERROR: Could not close tab."
+        return f"Closed tab [{idx}]: {tab_title}\n  URL: {tab_url}"
+    return f"ERROR: Could not close tab [{idx}]: {tab_title} — {tab_url}"
 
 
 async def _handle_dialog(args: dict) -> str:

@@ -102,10 +102,53 @@ eyes_shadow actions: click, type, press_key, scroll, read, js
 
 ## Standard Workflow
 
-1. **Orient:** `eyes_context` → see current state
+Every interaction follows this sequence. Steps marked with a gate are
+**not optional** — skipping them is how bugs like "closed the wrong tab" happen.
+
+1. **Orient (gate):** `eyes_context` → know which app and window is active
 2. **Read:** `eyes_get_web_tree` (web) or `eyes_get_tree` (native)
 3. **Act:** `eyes_click`, `eyes_type`, `eyes_fill_form`, etc.
 4. **Verify:** `eyes_wait_for` → confirm result
+
+## Safety Protocol — Destructive Actions
+
+Destructive actions are those that lose state: closing tabs, navigating away from
+a page, quitting apps, or submitting/deleting data. The reason these need extra
+care is that agent-eyes operates via CDP or accessibility APIs — it will happily
+close the wrong tab or navigate the wrong page without any confirmation dialog.
+You are the only safety layer.
+
+### Before closing a tab (`eyes_close_tab`)
+1. Call `eyes_list_chrome_tabs` — see every open tab with its title and URL
+2. Match the tab the user wants by title/URL — do not guess the index
+3. Use the `title` parameter (preferred) or the verified `tab_index`
+4. Read the response — it confirms exactly which tab was closed
+
+### Before navigating (`eyes_navigate`)
+1. Call `eyes_list_chrome_tabs` — confirm which tab you're about to navigate
+2. Verify the tab at `tab_index` is the one the user expects to change
+3. If the user didn't specify a tab, tell them which one you'll navigate
+
+### Before quitting an app (`eyes_app` with `action: quit`)
+1. Call `eyes_list_apps` — confirm the app name matches what the user asked for
+2. Check whether the app has unsaved state if possible (e.g., document editors)
+
+### Before any action when you're unsure what's focused
+1. Call `eyes_context` — it tells you the active app, window, and focused element
+2. If the active app isn't what you expect, focus the correct app first with `eyes_app`
+
+### Rules
+
+**Do:**
+- Treat `eyes_context` or `eyes_list_chrome_tabs` as a prerequisite, not a nice-to-have
+- Use `title` matching over index-based targeting — titles are human-readable, indexes shift
+- Read every response — the server now includes the title and URL of affected tabs
+
+**Do not:**
+- Act on assumed state — if you haven't called a read/list tool in this turn, you don't know the current state
+- Default to `tab_index: 0` without verifying — tab order changes as users open and close tabs
+- Chain destructive actions without re-reading state between them (closing tab N shifts all indexes above N)
+- Skip the orient step because the user "just" asked you to do something simple — simple requests on the wrong target cause the most damage
 
 ## Tips
 
