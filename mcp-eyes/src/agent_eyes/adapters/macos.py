@@ -22,6 +22,7 @@ class MacOSAdapter(BaseAdapter):
 
     def reset_ids(self):
         self._id_counter = 0
+        self._in_web_area = False
 
     def is_available(self) -> bool:
         if sys.platform != "darwin":
@@ -126,15 +127,17 @@ class MacOSAdapter(BaseAdapter):
             return True
         if role in self._WEB_STRUCTURAL_ROLES and name:
             return True
-        # Keep groups/static text only if they have actions (clickable divs)
-        if role in self._WEB_SKIP_ROLES and actions:
+        # Only count meaningful actions (press, click, confirm).
+        # scrolltovisible/showmenu are Chrome defaults on every DOM element — not real interactivity.
+        meaningful_actions = [a for a in actions if a not in ("scrolltovisible", "showmenu")]
+        if role in self._WEB_SKIP_ROLES and meaningful_actions:
             return True
         return False
 
     # Attributes to batch-read per element (single IPC call instead of 10+)
     _BATCH_ATTRS = [
-        "AXRole", "AXTitle", "AXDescription", "AXRoleDescription",
-        "AXValue", "AXFocused", "AXEnabled", "AXSelected",
+        "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXRoleDescription",
+        "AXValue", "AXPlaceholderValue", "AXFocused", "AXEnabled", "AXSelected",
         "AXPosition", "AXSize", "AXChildren",
     ]
 
@@ -164,7 +167,8 @@ class MacOSAdapter(BaseAdapter):
             return {attr: self._read_attr(ax_el, attr) for attr in self._BATCH_ATTRS}
 
     # Hard cap on elements to prevent runaway traversal on complex pages
-    _MAX_ELEMENTS = 500
+    _MAX_ELEMENTS = 1000
+    _WEB_MAX_ELEMENTS = 3000
 
     def _element_to_ui(self, ax_el, depth: int, max_depth: int,
                        in_web_area: bool = False) -> UIElement | None:
@@ -175,7 +179,8 @@ class MacOSAdapter(BaseAdapter):
         """
         if depth > max_depth:
             return None
-        if self._id_counter >= self._MAX_ELEMENTS:
+        cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
+        if self._id_counter >= cap:
             return None
 
         # Single IPC call for all attributes (~1.3ms vs ~11ms for individual calls)
@@ -188,13 +193,19 @@ class MacOSAdapter(BaseAdapter):
         if role in ("unknown", ""):
             return None
 
-        # Detect entry into web content
+        # Detect entry into web content — dynamically extend depth
         if role == "webarea":
             in_web_area = True
+            self._in_web_area = True
+            # Web content needs deeper traversal. Extend depth budget by 20
+            # from current position (buttons are 3-5 levels below AXWebArea).
+            max_depth = max(max_depth, depth + 20)
 
         name = str(attrs.get("AXTitle") or "")
         if not name:
             name = str(attrs.get("AXDescription") or "")
+        if not name:
+            name = str(attrs.get("AXPlaceholderValue") or "")
         if not name:
             name = str(attrs.get("AXRoleDescription") or "")
 
@@ -209,6 +220,11 @@ class MacOSAdapter(BaseAdapter):
             states.append("disabled")
         if attrs.get("AXSelected"):
             states.append("selected")
+        # Detect secure text fields (NSSecureTextField) — these block CGEvent
+        # keyboard injection via EnableSecureEventInput(). Must use set_value.
+        subrole = str(attrs.get("AXSubrole") or "")
+        if "securetextfield" in subrole.lower().replace("ax", ""):
+            states.append("secure")
 
         # Actions (still a separate call — no batch API for this)
         actions = []
@@ -250,12 +266,15 @@ class MacOSAdapter(BaseAdapter):
                 # Still recurse children — a skipped <div> may contain buttons
                 if depth < max_depth and children_raw:
                     for child_ax in children_raw:
-                        child = self._element_to_ui(
-                            child_ax, depth + 1, max_depth,
-                            in_web_area=True,
-                        )
-                        if child:
-                            element.children.append(child)
+                        try:
+                            child = self._element_to_ui(
+                                child_ax, depth + 1, max_depth,
+                                in_web_area=True,
+                            )
+                            if child:
+                                element.children.append(child)
+                        except Exception:
+                            continue  # Skip crashed/invalid child elements
                 if element.children:
                     return element
                 return None
@@ -263,12 +282,15 @@ class MacOSAdapter(BaseAdapter):
         # Recurse children
         if depth < max_depth and children_raw:
             for child_ax in children_raw:
-                child = self._element_to_ui(
-                    child_ax, depth + 1, max_depth,
-                    in_web_area=in_web_area,
-                )
-                if child:
-                    element.children.append(child)
+                try:
+                    child = self._element_to_ui(
+                        child_ax, depth + 1, max_depth,
+                        in_web_area=in_web_area,
+                    )
+                    if child:
+                        element.children.append(child)
+                except Exception:
+                    continue  # Skip crashed/invalid child elements
 
         return element
 
@@ -288,15 +310,26 @@ class MacOSAdapter(BaseAdapter):
         except Exception:
             pass  # Not all apps support this — that's fine
 
+    def is_element_valid(self, element) -> bool:
+        """Check if an element's AX reference is still valid (not destroyed)."""
+        if element.platform_ref is None:
+            return False
+        try:
+            err, _ = self._ax.AXUIElementCopyAttributeValue(element.platform_ref, "AXRole", None)
+            return err == 0
+        except Exception:
+            return False
+
     def get_tree(self, pid: int, max_depth: int = 5,
                  is_browser: bool = False) -> UIElement | None:
         self._load()
         self.reset_ids()
         ax_app = self._ax.AXUIElementCreateApplication(pid)
 
-        # Force browser to build full accessibility tree
-        if is_browser:
-            self.force_browser_accessibility(pid)
+        # Force ALL apps to enable accessibility tree construction.
+        # Safe no-op on native apps (returns kAXErrorNotImplemented).
+        # Critical for Electron/CEF/WebKit apps that lazily build AX trees.
+        self.force_browser_accessibility(pid)
 
         # Try focused window first, fall back to first window
         ax_window = self._read_attr(ax_app, "AXFocusedWindow")
@@ -381,6 +414,61 @@ class MacOSAdapter(BaseAdapter):
             element.platform_ref, "AXValue", value
         )
         return err == 0
+
+    def element_at_position(self, x: float, y: float) -> UIElement | None:
+        """Get the UI element at the given screen coordinates."""
+        self._load()
+        system_wide = self._ax.AXUIElementCreateSystemWide()
+        err, ax_el = self._ax.AXUIElementCopyElementAtPosition(system_wide, float(x), float(y), None)
+        if err != 0 or ax_el is None:
+            return None
+
+        # Read basic attributes
+        attrs = self._batch_read_attrs(ax_el)
+        role_raw = attrs.get("AXRole") or ""
+        role = str(role_raw).replace("AX", "").lower() if role_raw else "unknown"
+
+        name = str(attrs.get("AXTitle") or "")
+        if not name:
+            name = str(attrs.get("AXDescription") or "")
+        if not name:
+            name = str(attrs.get("AXPlaceholderValue") or "")
+        if not name:
+            name = str(attrs.get("AXRoleDescription") or "")
+
+        value_raw = attrs.get("AXValue")
+        value = str(value_raw)[:200] if value_raw is not None else ""
+
+        bounds = None
+        pos = attrs.get("AXPosition")
+        size = attrs.get("AXSize")
+        if pos is not None and size is not None:
+            try:
+                bounds = self._parse_bounds(pos, size)
+            except Exception:
+                pass
+
+        actions = []
+        err2, action_names = self._ax.AXUIElementCopyActionNames(ax_el, None)
+        if err2 == 0 and action_names:
+            actions = [str(a).replace("AX", "").lower() for a in action_names]
+
+        # Get owning PID
+        err3, pid = self._ax.AXUIElementGetPid(ax_el, None)
+        element_pid = pid if err3 == 0 else 0
+
+        element = UIElement(
+            id=self._next_id(),
+            role=role,
+            name=name,
+            value=value,
+            actions=actions,
+            bounds=bounds,
+            platform_ref=ax_el,
+            source="native",
+            pid=element_pid,
+        )
+        return element
 
     def get_focused_element(self) -> UIElement | None:
         self._load()

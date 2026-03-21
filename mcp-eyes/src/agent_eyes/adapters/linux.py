@@ -8,6 +8,9 @@ from .base import BaseAdapter, UIElement, AppInfo
 class LinuxAdapter(BaseAdapter):
     """Linux AT-SPI2 accessibility adapter."""
 
+    _MAX_ELEMENTS = 1000
+    _WEB_MAX_ELEMENTS = 3000
+
     def __init__(self):
         self._atspi = None
         self._id_counter = 0
@@ -18,6 +21,7 @@ class LinuxAdapter(BaseAdapter):
 
     def reset_ids(self):
         self._id_counter = 0
+        self._in_web_area = False
 
     def is_available(self) -> bool:
         if sys.platform != "linux":
@@ -126,13 +130,19 @@ class LinuxAdapter(BaseAdapter):
             return True
         if role in self._WEB_STRUCTURAL_ROLES and name:
             return True
-        if actions:
+        # Only count meaningful actions (press, click, confirm).
+        # scrolltovisible/showmenu are Chrome defaults on every DOM element — not real interactivity.
+        meaningful_actions = [a for a in actions if a not in ("scrolltovisible", "showmenu")]
+        if meaningful_actions:
             return True
         return False
 
     def _atspi_to_ui(self, obj, depth: int, max_depth: int,
                      in_web_area: bool = False) -> UIElement | None:
         if depth > max_depth or obj is None:
+            return None
+        cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
+        if self._id_counter >= cap:
             return None
 
         try:
@@ -142,6 +152,8 @@ class LinuxAdapter(BaseAdapter):
             # Detect entry into web content
             if role in ("document web", "document frame"):
                 in_web_area = True
+                self._in_web_area = True
+                max_depth = max(max_depth, depth + 20)
             description = obj.get_description() or ""
 
             # Value

@@ -101,7 +101,8 @@ TOOLS = [
             "This is the PRIMARY way to 'see' an application — no screenshot needed. "
             "For Chrome/Chromium browsers, automatically includes web page content "
             "(headings, buttons, inputs, links, chat items) via AppleScript on macOS "
-            "or CDP on all platforms (macOS/Linux/Windows)."
+            "or CDP on all platforms (macOS/Linux/Windows). "
+            "For large apps, use eyes_get_subtree to drill into specific sections."
         ),
         inputSchema={
             "type": "object",
@@ -112,8 +113,8 @@ TOOLS = [
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Max tree depth (default 5, max 10)",
-                    "default": 5,
+                    "description": "Max tree depth (default 10, max 20)",
+                    "default": 10,
                 },
             },
             "required": ["pid"],
@@ -145,6 +146,12 @@ TOOLS = [
                     "type": "string",
                     "description": "Element value to match (partial, case-insensitive)",
                 },
+                "match": {
+                    "type": "string",
+                    "description": "Match type: 'contains' (default), 'exact', 'regex', 'prefix', 'suffix'",
+                    "default": "contains",
+                    "enum": ["contains", "exact", "regex", "prefix", "suffix"],
+                },
             },
             "required": [],
         },
@@ -153,7 +160,8 @@ TOOLS = [
         name="eyes_click",
         description=(
             "Click/press a UI element by its [id] from the tree. "
-            "Works for buttons, links, checkboxes, menu items, etc."
+            "Works for buttons, links, checkboxes, menu items, etc. "
+            "Alternatively, click by screen coordinates (x, y) with a target pid."
         ),
         inputSchema={
             "type": "object",
@@ -162,8 +170,20 @@ TOOLS = [
                     "type": "integer",
                     "description": "Element ID from the accessibility tree",
                 },
+                "x": {
+                    "type": "integer",
+                    "description": "Screen X coordinate (use with y and pid for coordinate click)",
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Screen Y coordinate (use with x and pid for coordinate click)",
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Target app PID (required for coordinate click)",
+                },
             },
-            "required": ["id"],
+            "required": [],
         },
     ),
     Tool(
@@ -279,10 +299,13 @@ TOOLS = [
     Tool(
         name="eyes_press_key",
         description=(
-            "Press a keyboard key in the active Chrome tab. Supports special keys "
-            "(Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, "
-            "Home, End, PageUp, PageDown, F1-F12, Space) and modifiers "
-            "(Ctrl, Alt, Meta/Cmd, Shift). For typing text, use eyes_type instead."
+            "Press a keyboard key in any application (native or web). "
+            "For native apps, provide a PID to target that app. "
+            "For Chrome/web, optionally provide tab_index. "
+            "Supports special keys (Enter, Tab, Escape, Backspace, Delete, "
+            "ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, F1-F12, Space) "
+            "and modifiers (Ctrl, Alt, Meta/Cmd, Shift). "
+            "For typing text into a field, use eyes_type instead."
         ),
         inputSchema={
             "type": "object",
@@ -296,9 +319,13 @@ TOOLS = [
                     "items": {"type": "string"},
                     "description": "Modifier keys: 'Ctrl', 'Alt', 'Meta', 'Shift'",
                 },
+                "pid": {
+                    "type": "integer",
+                    "description": "Target app PID for native apps. If omitted, targets Chrome tab.",
+                },
                 "tab_index": {
                     "type": "integer",
-                    "description": "Tab index (default 0)",
+                    "description": "Chrome tab index (default 0). Only used when targeting Chrome.",
                     "default": 0,
                 },
             },
@@ -331,6 +358,10 @@ TOOLS = [
                     "type": "integer",
                     "description": "Tab index (default 0)",
                     "default": 0,
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID for native app polling (alternative to Chrome tab)",
                 },
             },
             "required": [],
@@ -452,6 +483,10 @@ TOOLS = [
                     "description": "Tab index (default 0)",
                     "default": 0,
                 },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID of a native app to scroll in (omit for browser tabs).",
+                },
             },
             "required": [],
         },
@@ -509,6 +544,195 @@ TOOLS = [
             "required": ["fields"],
         },
     ),
+    Tool(
+        name="eyes_get_ocr_hints",
+        description=(
+            "Get visual text hints from a window screenshot using OCR. "
+            "Use when the accessibility tree is insufficient (few interactive elements). "
+            "Returns text blocks with screen coordinates for coordinate-based clicking. "
+            "These are NOT semantic UI elements — text labels may or may not be interactive. "
+            "Requires Screen Recording permission on macOS."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID of the application",
+                },
+            },
+            "required": ["pid"],
+        },
+    ),
+    Tool(
+        name="eyes_hover",
+        description=(
+            "Hover over a UI element to trigger tooltips, dropdown previews, "
+            "or CSS :hover states. Moves the mouse to the element's center."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Element ID from the accessibility tree",
+                },
+                "x": {
+                    "type": "integer",
+                    "description": "Screen X coordinate (alternative to id)",
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Screen Y coordinate (alternative to id)",
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="eyes_element_at",
+        description=(
+            "Identify the UI element at specific screen coordinates. "
+            "Returns the element with an [id] you can use for click/type. "
+            "Useful after OCR hints to identify what's at a position."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "Screen X coordinate"},
+                "y": {"type": "integer", "description": "Screen Y coordinate"},
+            },
+            "required": ["x", "y"],
+        },
+    ),
+    Tool(
+        name="eyes_app",
+        description=(
+            "Launch, quit, or switch to an application. "
+            "Actions: 'launch' (by name or bundle ID), 'quit', 'focus' (bring to front)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'launch', 'quit', or 'focus'",
+                    "enum": ["launch", "quit", "focus"],
+                },
+                "name": {
+                    "type": "string",
+                    "description": "App name (e.g. 'Safari') or bundle ID (e.g. 'com.apple.Safari')",
+                },
+            },
+            "required": ["action", "name"],
+        },
+    ),
+    Tool(
+        name="eyes_get_subtree",
+        description=(
+            "Get the accessibility subtree rooted at a specific element. "
+            "Use to drill into complex UIs without loading the entire tree. "
+            "Much more efficient than re-fetching the full tree with higher depth."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Element ID to expand (from a previous eyes_get_tree)",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "How many levels deep to expand (default 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["id"],
+        },
+    ),
+    Tool(
+        name="eyes_window",
+        description=(
+            "Manage application windows. Actions: 'list' (all windows with positions), "
+            "'focus' (bring to front), 'minimize', 'close', 'move' (x,y), 'resize' (w,h)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'list', 'focus', 'minimize', 'close', 'move', 'resize'",
+                    "enum": ["list", "focus", "minimize", "close", "move", "resize"],
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID (required for all actions except 'list')",
+                },
+                "x": {"type": "integer", "description": "X position for 'move' action"},
+                "y": {"type": "integer", "description": "Y position for 'move' action"},
+                "width": {"type": "integer", "description": "Width for 'resize' action"},
+                "height": {"type": "integer", "description": "Height for 'resize' action"},
+            },
+            "required": ["action"],
+        },
+    ),
+    Tool(
+        name="eyes_context",
+        description=(
+            "Get a quick context snapshot: frontmost app, active window, focused element, "
+            "and a summary of interactive elements. One call instead of multiple tools. "
+            "Use this to orient yourself before interacting with an app."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    ),
+    Tool(
+        name="eyes_shadow",
+        description=(
+            "Execute browser actions in the background WITHOUT focusing Chrome. "
+            "Actions: 'click' (by text/selector), 'type' (into focused/selected element), "
+            "'press_key' (Enter/Tab/Escape/etc), 'scroll' (up/down), "
+            "'read' (get all interactive elements), 'js' (raw JavaScript). "
+            "Works on any Chrome tab without stealing focus from your current app."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'click', 'type', 'press_key', 'scroll', 'read', 'js'",
+                    "enum": ["click", "type", "press_key", "scroll", "read", "js"],
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to click (for 'click'), text to type (for 'type'), key name (for 'press_key'), JS code (for 'js')",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector (optional, for targeted click/type/scroll)",
+                },
+                "direction": {
+                    "type": "string",
+                    "description": "Scroll direction: 'up' or 'down' (default 'down')",
+                    "default": "down",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Scroll amount in pixels (default 300)",
+                    "default": 300,
+                },
+                "tab_index": {
+                    "type": "integer",
+                    "description": "Chrome tab index (0-based, default: active tab)",
+                    "default": -1,
+                },
+            },
+            "required": ["action"],
+        },
+    ),
 ]
 
 
@@ -523,6 +747,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _dispatch(name, arguments)
         return [TextContent(type="text", text=result)]
     except Exception as e:
+        import traceback
+        logger.error("Tool '%s' failed: %s\n%s", name, e, traceback.format_exc())
         return [TextContent(type="text", text=f"ERROR: {e}")]
 
 
@@ -567,6 +793,22 @@ async def _dispatch(name: str, args: dict) -> str:
         return await _handle_drag(args)
     elif name == "eyes_fill_form":
         return await _handle_fill_form(args)
+    elif name == "eyes_get_ocr_hints":
+        return _handle_get_ocr_hints(args)
+    elif name == "eyes_hover":
+        return _handle_hover(args)
+    elif name == "eyes_element_at":
+        return _handle_element_at(args)
+    elif name == "eyes_app":
+        return _handle_app(args)
+    elif name == "eyes_get_subtree":
+        return _handle_get_subtree(args)
+    elif name == "eyes_window":
+        return _handle_window(args)
+    elif name == "eyes_context":
+        return _handle_context(args)
+    elif name == "eyes_shadow":
+        return _handle_shadow(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -628,14 +870,10 @@ def _handle_get_tree(args: dict) -> str:
 
     is_browser = _pu.is_browser_pid(pid)
 
-    # Browsers need deeper traversal to reach web elements inside AXWebArea.
-    # Native apps: default 5, max 10.  Browsers: default 15, max 20.
-    if is_browser:
-        max_depth = min(args.get("max_depth", 15), 20)
-    else:
-        max_depth = min(args.get("max_depth", 5), 10)
+    # Universal depth: default 10, max 20.
+    max_depth = min(args.get("max_depth", 10), 20)
 
-    # Pass is_browser flag so adapter can force AX tree construction
+    # Build tree — pass is_browser for adapters that support it
     if hasattr(native_adapter, "get_tree"):
         import inspect
         sig = inspect.signature(native_adapter.get_tree)
@@ -649,25 +887,53 @@ def _handle_get_tree(args: dict) -> str:
     if tree is None:
         return f"ERROR: Could not get accessibility tree for PID {pid}. App may not be running or permission denied."
 
+    # Auto-retry: if web content found but tree is sparse, rebuild deeper
+    has_web = _tree_has_web_content(tree)
+    interactive_count = _count_interactive(tree)
+
+    if has_web and interactive_count < 5 and max_depth < 20:
+        # Web content exists but not enough interactive elements reached.
+        # Retry with max depth to capture deeply nested buttons/inputs.
+        if hasattr(native_adapter, "get_tree"):
+            import inspect
+            sig = inspect.signature(native_adapter.get_tree)
+            if "is_browser" in sig.parameters:
+                tree = native_adapter.get_tree(pid, 20, is_browser=is_browser)
+            else:
+                tree = native_adapter.get_tree(pid, 20)
+        else:
+            tree = native_adapter.get_tree(pid, 20)
+        if tree is None:
+            return f"ERROR: Could not rebuild accessibility tree for PID {pid}."
+        interactive_count = _count_interactive(tree)
+        max_depth = 20
+
     registry.register_tree(tree, pid=pid)
     text = tree.to_text(max_depth=max_depth)
 
-    # For browsers: check if native tree reached web content.
-    # Native AX traversal is the primary method — no CDP or JS fallback needed.
-    web_content = ""
-    if is_browser:
-        has_web_elements = _tree_has_web_content(tree)
-        if not has_web_elements:
-            web_content = (
-                "\n\n── Web content not yet visible in native tree ──────────────\n"
-                "The browser may not have built its accessibility tree yet.\n"
-                "Try again — agent-eyes has signaled the browser to enable accessibility.\n"
-                "If this persists, try: eyes_get_tree with max_depth=20"
-            )
+    # Metadata and advisories
+    meta = f"Accessibility tree for PID {pid} ({registry.count()} elements"
+    if has_web:
+        meta += ", web content detected"
+    meta += "):"
+
+    advisory = ""
+    if has_web and interactive_count < 5:
+        advisory = (
+            "\n\n── Web content not yet visible in native tree ──────────────\n"
+            "The app may not have built its accessibility tree yet.\n"
+            "Try again — agent-eyes has signaled the app to enable accessibility.\n"
+            "If this persists, try: eyes_get_tree with max_depth=20"
+        )
+    elif interactive_count < 3 and registry.count() > 5:
+        advisory = (
+            "\n\nNote: few interactive elements found. "
+            "Use eyes_get_ocr_hints for visual text detection."
+        )
 
     return (
-        f"Accessibility tree for PID {pid} ({registry.count()} elements):\n\n"
-        f"{text}{web_content}\n\n"
+        f"{meta}\n\n"
+        f"{text}{advisory}\n\n"
         f"Use [id] numbers with eyes_click or eyes_type to interact."
     )
 
@@ -682,12 +948,46 @@ def _tree_has_web_content(element) -> bool:
     return False
 
 
+def _count_interactive(element, _interactive_roles=frozenset({
+    "button", "link", "textfield", "textarea", "combobox",
+    "checkbox", "radiobutton", "slider", "menuitem", "tab",
+    "searchfield", "popupbutton", "switch", "togglebutton",
+})) -> int:
+    """Count interactive elements in the tree."""
+    count = 1 if element.role in _interactive_roles else 0
+    for child in element.children:
+        count += _count_interactive(child)
+    return count
+
+
+def _match_text(query: str, text: str, match_type: str = "contains") -> bool:
+    """Match text using the specified strategy."""
+    if not query:
+        return True
+    text_lower = text.lower()
+    query_lower = query.lower()
+    if match_type == "exact":
+        return text_lower == query_lower
+    elif match_type == "prefix":
+        return text_lower.startswith(query_lower)
+    elif match_type == "suffix":
+        return text_lower.endswith(query_lower)
+    elif match_type == "regex":
+        import re
+        try:
+            return bool(re.search(query, text, re.IGNORECASE))
+        except re.error:
+            return False
+    else:  # contains (default)
+        return query_lower in text_lower
+
 
 def _handle_find(args: dict) -> str:
     pid = args.get("pid")
     role = args.get("role", "")
     name = args.get("name", "")
     value = args.get("value", "")
+    match_type = args.get("match", "contains")
 
     if not role and not name and not value:
         return "ERROR: Specify at least one of: role, name, value"
@@ -697,8 +997,26 @@ def _handle_find(args: dict) -> str:
         # Re-register found elements
         for el in elements:
             registry._elements[el.id] = el
+        # Apply match-type filtering on name and value (find_elements uses contains)
+        if match_type != "contains":
+            elements = [
+                el for el in elements
+                if (not name or _match_text(name, el.name, match_type))
+                and (not value or _match_text(value, el.value, match_type))
+            ]
     else:
-        elements = registry.find(role, name, value)
+        # Filter from registry using _match_text
+        all_elements = list(registry._elements.values())
+        elements = []
+        for el in all_elements:
+            if role and role.lower() not in el.role.lower():
+                continue
+            if name and not _match_text(name, el.name, match_type):
+                continue
+            if value and not _match_text(value, el.value, match_type):
+                continue
+            if role or name or value:
+                elements.append(el)
 
     if not elements:
         return "No matching elements found."
@@ -713,12 +1031,33 @@ def _handle_find(args: dict) -> str:
 
 async def _handle_click(args: dict) -> str:
     element_id = args.get("id")
+    click_x = args.get("x")
+    click_y = args.get("y")
+    click_pid = args.get("pid")
+
+    # Coordinate-based click (from OCR hints or manual)
+    if click_x is not None and click_y is not None:
+        input_backend = get_input_backend()
+        if not input_backend.is_available():
+            return "ERROR: No input backend available for coordinate click."
+        if click_pid:
+            input_backend.activate_window(click_pid)
+            time.sleep(0.1)
+        if input_backend.click(click_x, click_y):
+            return f"Clicked at ({click_x}, {click_y})"
+        return f"ERROR: Could not click at ({click_x}, {click_y})."
+
     if element_id is None:
-        return "ERROR: id is required."
+        return "ERROR: id is required (or provide x, y coordinates)."
 
     element = registry.get(element_id)
     if element is None:
         return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    # Validate element reference is still alive (app may have navigated, window closed)
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
 
     # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
     if element.source == "cdp" and element.platform_ref is not None:
@@ -772,6 +1111,11 @@ async def _handle_type(args: dict) -> str:
     if element is None:
         return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
 
+    # Validate element reference is still alive (app may have navigated, window closed)
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
+
     # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
     if element.source == "cdp" and element.platform_ref is not None:
         if not _cached_tabs:
@@ -797,37 +1141,92 @@ async def _handle_type(args: dict) -> str:
         input_backend.activate_window(element.pid)
         time.sleep(0.1)
 
+    # ── Secure text field detection (NSSecureTextField / SecureField)
+    # These fields call EnableSecureEventInput() when focused, which blocks ALL
+    # CGEvent keyboard injection at the HID level. set_value is the only option.
+    is_secure = "secure" in element.states
+
     # ── Strategy 1: Focus + keyboard injection (primary — triggers keyDown events)
     # This is how screen readers type. Real keystrokes trigger ALL event handlers:
     # keyDown, keyUp, textDidChange, input, change — works for both native and web.
-    if hasattr(native_adapter, 'focus_element') and input_backend.is_available():
+    # SKIP for secure text fields — CGEvent will always fail, wastes 0.25s.
+    keyboard_injected = False
+    if not is_secure and hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
             time.sleep(0.1)
-            if input_backend.clear_and_type(text):
-                return (
-                    f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-                    f"(focus + keyboard injection)"
-                )
+            # For web elements: type directly WITHOUT clear_and_type.
+            # clear_and_type sends Cmd+A + Delete before typing, which in Chrome
+            # can select the entire page, trigger shortcuts (Cmd+T = new tab), and
+            # cause havoc when the contentEditable div doesn't have perfect focus.
+            if is_web:
+                type_ok = input_backend.type_text(text)
+            else:
+                type_ok = input_backend.clear_and_type(text)
+            if type_ok:
+                # For web elements: trust keyboard injection, skip verification.
+                if is_web:
+                    return (
+                        f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                        f"(focus + keyboard injection)"
+                    )
+
+                # For native elements: verify the text actually landed.
+                # Some apps (e.g. Jamf, secure input) silently ignore CGEvent
+                # keystrokes while AX set_value works.
+                time.sleep(0.15)
+                verified = False
+                if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+                    current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
+                    if current_val and text in str(current_val):
+                        verified = True
+                    elif current_val is None:
+                        # Can't verify (field doesn't expose value) — assume success
+                        verified = True
+                else:
+                    verified = True  # No way to verify, assume success
+
+                if verified:
+                    return (
+                        f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                        f"(focus + keyboard injection)"
+                    )
+                # Keyboard injection didn't land — mark it and fall through to set_value
+                keyboard_injected = True
 
     # ── Strategy 2: Coordinate click + type (when focus_element fails)
-    if input_backend.is_available() and element.bounds:
+    # Skip if keyboard injection already tried and failed (same mechanism, same result)
+    if not keyboard_injected and input_backend.is_available() and element.bounds:
         x, y, w, h = element.bounds
         cx, cy = x + w // 2, y + h // 2
         if input_backend.click_and_type(cx, cy, text):
-            return (
-                f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-                f"(coordinate click + type)"
-            )
+            # Verify text landed
+            time.sleep(0.15)
+            verified = False
+            if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+                current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
+                if current_val and text in str(current_val):
+                    verified = True
+                elif current_val is None:
+                    verified = True
+            else:
+                verified = True
 
-    # ── Strategy 3: set_value + AXConfirm (last resort — no keyDown events)
-    # Only use when keyboard injection is impossible (no input backend, no bounds).
-    # Warning: some apps ignore this because it skips keyDown/textDidChange.
+            if verified:
+                return (
+                    f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                    f"(coordinate click + type)"
+                )
+
+    # ── Strategy 3: set_value + AXConfirm (fallback for apps that block keyboard injection)
+    # Used when keyboard injection fails verification, OR when no input backend available.
+    # Works for Jamf Connect, security apps, and apps with secure/custom text fields.
     if native_adapter.set_value(element, text):
         if element.platform_ref:
             native_adapter.perform_action(element, "confirm")
+        method = "set_value fallback — keyboard injection didn't land" if keyboard_injected else "set_value"
         return (
             f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
-            f"(set_value — no keyDown events fired)"
+            f"({method})"
         )
 
     return f"ERROR: Could not type into [{element_id}]. Element may not be editable."
@@ -847,10 +1246,16 @@ def _handle_get_focused() -> str:
 
 # ── CDP handlers ────────────────────────────────────────────────────
 _cached_tabs: list = []
+_cached_tabs_time: float = 0
 
 
 async def _handle_list_chrome_tabs() -> str:
     global _cached_tabs
+
+    # Always refresh when explicitly listing tabs
+    err = await _ensure_tabs(force=True)
+    if err and not _cached_tabs:
+        pass  # fall through to the non-CDP paths below
 
     # Try CDP first (richer interaction, cross-platform)
     available = await cdp_client.is_available()
@@ -932,15 +1337,22 @@ async def _handle_get_web_tree(args: dict) -> str:
 
 # ── CDP action handlers ─────────────────────────────────────────────
 
-async def _ensure_tabs() -> str:
-    """Ensure cached tabs are available. Returns error string or empty."""
-    global _cached_tabs
-    if not _cached_tabs:
-        available = await cdp_client.is_available()
-        if not available:
-            return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
-        tabs = await cdp_client.list_tabs()
-        _cached_tabs.extend(tabs)
+async def _ensure_tabs(force: bool = False) -> str:
+    """Ensure cached tabs are available. Returns error string or empty.
+
+    Args:
+        force: Always refresh, ignoring cache age. Use when listing tabs explicitly.
+    """
+    global _cached_tabs, _cached_tabs_time
+    cache_age = time.time() - _cached_tabs_time
+    if not force and _cached_tabs and cache_age < 30:
+        return ""
+    available = await cdp_client.is_available()
+    if not available:
+        return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
+    tabs = await cdp_client.list_tabs()
+    _cached_tabs = list(tabs)
+    _cached_tabs_time = time.time()
     if not _cached_tabs:
         return "ERROR: No Chrome tabs found."
     return ""
@@ -1043,19 +1455,69 @@ async def _handle_press_key(args: dict) -> str:
     if not key:
         return "ERROR: key is required."
 
+    pid = args.get("pid")
+    modifiers = args.get("modifiers", [])
+    mod_str = "+".join(modifiers) + "+" if modifiers else ""
+
+    # ── Normalize key names to input_sim format ──
+    key_map = {
+        "enter": "return", "arrowup": "up", "arrowdown": "down",
+        "arrowleft": "left", "arrowright": "right",
+        "backspace": "delete", "pageup": "page_up", "pagedown": "page_down",
+    }
+    native_key = key_map.get(key.lower(), key.lower())
+
+    # ── Normalize modifier names for input_sim ──
+    mod_map = {"ctrl": "control", "meta": "command", "cmd": "command"}
+
+    # ── Route: if PID given, check if it's a native app or browser ──
+    if pid is not None:
+        is_browser = _pu.is_browser_pid(pid)
+
+        if not is_browser:
+            # Native app path — use OS-level input simulation
+            input_backend = get_input_backend()
+            if not input_backend.is_available():
+                return "ERROR: No input backend available for native key press."
+
+            input_backend.activate_window(pid)
+            time.sleep(0.1)
+
+            if modifiers:
+                native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
+                hotkey_keys = native_mods + [native_key]
+                success = input_backend.hotkey(*hotkey_keys)
+            else:
+                success = input_backend.press_key(native_key)
+
+            if success:
+                return f"Pressed {mod_str}{key} in native app (PID {pid})"
+            return f"ERROR: Could not press key '{key}' in native app (PID {pid})."
+
+    # ── Chrome/web path — use CDP ──
     err = await _ensure_tabs()
     if err:
+        # Fallback: if no Chrome tabs but we have an input backend, use native
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            if modifiers:
+                native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
+                hotkey_keys = native_mods + [native_key]
+                success = input_backend.hotkey(*hotkey_keys)
+            else:
+                success = input_backend.press_key(native_key)
+            if success:
+                return f"Pressed {mod_str}{key} (native input fallback — no Chrome tabs)"
         return err
+
     tab, err = _get_tab(args)
     if err:
         return err
 
-    modifiers = args.get("modifiers", [])
     success = await cdp_client.press_key(tab, key, modifiers)
     if success:
-        mod_str = "+".join(modifiers) + "+" if modifiers else ""
-        return f"Pressed {mod_str}{key}"
-    return f"ERROR: Could not press key '{key}'."
+        return f"Pressed {mod_str}{key} in Chrome tab"
+    return f"ERROR: Could not press key '{key}' via CDP."
 
 
 async def _handle_wait_for(args: dict) -> str:
@@ -1065,6 +1527,25 @@ async def _handle_wait_for(args: dict) -> str:
 
     if not role and not name:
         return "ERROR: Specify at least one of: role, name"
+
+    pid = args.get("pid")
+    if pid is not None and native_adapter:
+        # Native app polling — check for element appearance
+        start = time.time()
+        while time.time() - start < timeout:
+            if role or name:
+                elements = native_adapter.find_elements(pid, role=role, name=name)
+                if elements:
+                    # Register found elements
+                    for el in elements:
+                        registry._elements[el.id] = el
+                    el = elements[0]
+                    return (
+                        f"Found [{el.id}] {el.role} \"{el.name}\" "
+                        f"after {time.time() - start:.1f}s"
+                    )
+            await asyncio.sleep(0.5)
+        return f"Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
 
     err = await _ensure_tabs()
     if err:
@@ -1196,17 +1677,34 @@ async def _handle_file_upload(args: dict) -> str:
 
 
 async def _handle_scroll(args: dict) -> str:
+    x = args.get("x", 400)
+    y = args.get("y", 400)
+    delta_x = args.get("delta_x", 0)
+    delta_y = args.get("delta_y", 300)
+    pid = args.get("pid")
+
+    # ── Native path: use OS-level scroll events for non-browser apps
+    if pid is not None:
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            # Convert from CDP convention (positive=down) to CGEvent convention (negative=down)
+            native_delta_y = -delta_y if delta_y != 0 else 0
+            native_delta_x = -delta_x if delta_x != 0 else 0
+            success = input_backend.scroll(x, y, delta_x=native_delta_x, delta_y=native_delta_y)
+            if success:
+                direction = "down" if delta_y > 0 else "up" if delta_y < 0 else ""
+                if delta_x:
+                    direction += (" + right" if delta_x > 0 else " + left")
+                return f"Scrolled {direction} by ({delta_x}, {delta_y}) in native app (pid={pid})"
+        return "ERROR: Native scroll failed or no input backend available."
+
+    # ── CDP path: scroll in browser tab
     err = await _ensure_tabs()
     if err:
         return err
     tab, err = _get_tab(args)
     if err:
         return err
-
-    x = args.get("x", 400)
-    y = args.get("y", 400)
-    delta_x = args.get("delta_x", 0)
-    delta_y = args.get("delta_y", 300)
 
     success = await cdp_client.scroll(tab, x, y, delta_x, delta_y)
     if success:
@@ -1274,6 +1772,432 @@ async def _handle_fill_form(args: dict) -> str:
     if errors:
         parts.append(f"Errors:\n" + "\n".join(f"  {e}" for e in errors))
     return "\n".join(parts) or "No fields processed."
+
+
+def _handle_get_ocr_hints(args: dict) -> str:
+    pid = args.get("pid")
+    if pid is None:
+        return "ERROR: pid is required."
+
+    from .screenshot import capture_window
+    from .ocr import get_ocr_engine
+
+    engine = get_ocr_engine()
+    if engine is None:
+        import sys as _sys
+        platform = _sys.platform
+        if platform == "darwin":
+            msg = "Install: pip install 'agent-eyes[macos]'"
+        elif platform == "win32":
+            msg = "Install: pip install winrt-Windows.Media.Ocr"
+        else:
+            msg = "Install: pip install pytesseract (+ apt install tesseract-ocr)"
+        return f"ERROR: No OCR engine available. {msg}"
+
+    capture = capture_window(pid)
+    if capture is None:
+        import sys as _sys
+        if _sys.platform == "darwin":
+            return "ERROR: Could not capture window. Check Screen Recording permission in System Settings > Privacy & Security."
+        return f"ERROR: Could not capture window for PID {pid}."
+
+    hints = engine.recognize(
+        capture.image_data,
+        scale_factor=capture.scale_factor,
+        window_x=capture.window_x,
+        window_y=capture.window_y,
+        window_w=capture.window_w,
+        window_h=capture.window_h,
+    )
+
+    if not hints:
+        return "No text detected in window. The window may be empty or OCR could not read it."
+
+    lines = [
+        f"OCR text hints for PID {pid} ({len(hints)} text blocks detected).",
+        "These are visual text positions — NOT semantic UI elements.",
+        "Use eyes_click(x=..., y=..., pid=...) to click at these coordinates.",
+        "",
+    ]
+    for h in sorted(hints, key=lambda h: (h.y, h.x)):
+        cx = h.x + h.width // 2
+        cy = h.y + h.height // 2
+        lines.append(
+            f'  "{h.text}" @({cx},{cy}) size={h.width}x{h.height} conf={h.confidence}'
+        )
+
+    return "\n".join(lines)
+
+
+# ── New tool handlers ────────────────────────────────────────────────
+
+def _handle_hover(args: dict) -> str:
+    hover_x = args.get("x")
+    hover_y = args.get("y")
+    element_id = args.get("id")
+
+    if hover_x is not None and hover_y is not None:
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            input_backend.move_mouse(hover_x, hover_y)
+            return f"Hovering at ({hover_x}, {hover_y})"
+        return "ERROR: No input backend available."
+
+    if element_id is None:
+        return "ERROR: id or (x, y) is required."
+
+    element = registry.get(element_id)
+    if element is None:
+        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    if element.bounds:
+        x, y, w, h = element.bounds
+        cx, cy = x + w // 2, y + h // 2
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            if element.pid:
+                input_backend.activate_window(element.pid)
+                time.sleep(0.1)
+            input_backend.move_mouse(cx, cy)
+            return f"Hovering over [{element_id}] {element.role} \"{element.name}\" at ({cx}, {cy})"
+
+    return f"ERROR: Element [{element_id}] has no bounds for hover."
+
+
+def _handle_element_at(args: dict) -> str:
+    x = args.get("x")
+    y = args.get("y")
+    if x is None or y is None:
+        return "ERROR: x and y are required."
+
+    if not native_adapter or not hasattr(native_adapter, 'element_at_position'):
+        return "ERROR: element_at_position not supported on this platform."
+
+    element = native_adapter.element_at_position(float(x), float(y))
+    if element is None:
+        return f"No element found at ({x}, {y})."
+
+    registry._elements[element.id] = element
+    return f"Element at ({x}, {y}):\n{element.to_text(max_depth=0)}\n\nUse [{element.id}] with eyes_click or eyes_type."
+
+
+def _handle_app(args: dict) -> str:
+    action = args.get("action", "").lower()
+    name = args.get("name", "")
+    if not action or not name:
+        return "ERROR: action and name are required."
+
+    if sys.platform != "darwin":
+        return "ERROR: eyes_app currently only supports macOS."
+
+    try:
+        from AppKit import NSWorkspace, NSWorkspaceOpenConfiguration
+        ws = NSWorkspace.sharedWorkspace()
+    except ImportError:
+        return "ERROR: AppKit not available."
+
+    if action == "launch":
+        # Try as bundle ID first, then as app name
+        if "." in name:
+            success = ws.launchAppWithBundleIdentifier_options_additionalEventParamDescriptor_launchIdentifier_(
+                name, 0, None, None
+            )
+            if success[0]:
+                return f"Launched app with bundle ID '{name}'."
+        # Try by name
+        success = ws.launchApplication_(name)
+        if success:
+            return f"Launched '{name}'."
+        return f"ERROR: Could not launch '{name}'. Check the app name or bundle ID."
+
+    elif action == "focus":
+        for app in ws.runningApplications():
+            app_name = app.localizedName() or ""
+            bundle_id = app.bundleIdentifier() or ""
+            if name.lower() in app_name.lower() or name.lower() == bundle_id.lower():
+                app.activateWithOptions_(0)
+                return f"Focused '{app_name}' (PID {app.processIdentifier()})."
+        return f"ERROR: App '{name}' not found running."
+
+    elif action == "quit":
+        for app in ws.runningApplications():
+            app_name = app.localizedName() or ""
+            bundle_id = app.bundleIdentifier() or ""
+            if name.lower() in app_name.lower() or name.lower() == bundle_id.lower():
+                app.terminate()
+                return f"Quit '{app_name}'."
+        return f"ERROR: App '{name}' not found running."
+
+    return f"ERROR: Unknown action '{action}'. Use 'launch', 'quit', or 'focus'."
+
+
+def _handle_get_subtree(args: dict) -> str:
+    element_id = args.get("id")
+    max_depth = min(args.get("max_depth", 5), 15)
+    if element_id is None:
+        return "ERROR: id is required."
+
+    element = registry.get(element_id)
+    if element is None:
+        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    # Validate element is still alive
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale. Call eyes_get_tree to refresh."
+
+    # Re-traverse from this element's platform_ref
+    if element.platform_ref is None:
+        return f"ERROR: Element [{element_id}] has no native reference for subtree expansion."
+
+    subtree = native_adapter._element_to_ui(element.platform_ref, 0, max_depth)
+    if subtree is None:
+        return f"ERROR: Could not expand subtree for [{element_id}]."
+
+    registry.register_tree(subtree, pid=element.pid)
+    text = subtree.to_text(max_depth=max_depth)
+
+    return (
+        f"Subtree of [{element_id}] ({_count_interactive(subtree)} interactive elements):\n\n"
+        f"{text}\n\n"
+        f"Use [id] numbers with eyes_click or eyes_type to interact."
+    )
+
+
+def _handle_window(args: dict) -> str:
+    action = args.get("action", "").lower()
+    pid = args.get("pid")
+
+    if action == "list":
+        if sys.platform != "darwin":
+            return "ERROR: Window listing currently supports macOS only."
+        try:
+            import Quartz
+            window_list = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            )
+            lines = ["Windows on screen:\n"]
+            for win in window_list:
+                layer = win.get(Quartz.kCGWindowLayer, 999)
+                if layer != 0:
+                    continue
+                w_pid = win.get(Quartz.kCGWindowOwnerPID, 0)
+                w_name = win.get(Quartz.kCGWindowOwnerName, "")
+                w_title = win.get(Quartz.kCGWindowName, "")
+                bounds = win.get(Quartz.kCGWindowBounds, {})
+                x = int(bounds.get("X", 0))
+                y = int(bounds.get("Y", 0))
+                w = int(bounds.get("Width", 0))
+                h = int(bounds.get("Height", 0))
+                lines.append(f"  PID {w_pid} | {w_name} | \"{w_title}\" | pos=({x},{y}) size={w}x{h}")
+            return "\n".join(lines) if len(lines) > 1 else "No windows found."
+        except ImportError:
+            return "ERROR: Quartz not available."
+
+    if pid is None:
+        return "ERROR: pid is required for this action."
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    # Get the app's window via AX
+    try:
+        from ApplicationServices import AXUIElementCreateApplication, AXValueCreate, kAXValueCGPointType, kAXValueCGSizeType
+        from Quartz import CGPoint, CGSize
+        ax_app = native_adapter._ax.AXUIElementCreateApplication(pid)
+        window = native_adapter._read_attr(ax_app, "AXFocusedWindow")
+        if window is None:
+            windows = native_adapter._read_attr(ax_app, "AXWindows")
+            if windows and len(windows) > 0:
+                window = windows[0]
+        if window is None:
+            return f"ERROR: No window found for PID {pid}."
+    except Exception as e:
+        return f"ERROR: Could not access window: {e}"
+
+    if action == "focus":
+        try:
+            native_adapter._ax.AXUIElementPerformAction(window, "AXRaise")
+            input_backend = get_input_backend()
+            if input_backend.is_available():
+                input_backend.activate_window(pid)
+            return f"Focused window for PID {pid}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "minimize":
+        try:
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXMinimized", True)
+            return f"Minimized window for PID {pid}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "close":
+        try:
+            close_button = native_adapter._read_attr(window, "AXCloseButton")
+            if close_button:
+                native_adapter._ax.AXUIElementPerformAction(close_button, "AXPress")
+                return f"Closed window for PID {pid}."
+            return "ERROR: No close button found."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "move":
+        x = args.get("x")
+        y = args.get("y")
+        if x is None or y is None:
+            return "ERROR: x and y are required for move."
+        try:
+            new_pos = AXValueCreate(kAXValueCGPointType, CGPoint(float(x), float(y)))
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXPosition", new_pos)
+            return f"Moved window to ({x}, {y})."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "resize":
+        width = args.get("width")
+        height = args.get("height")
+        if width is None or height is None:
+            return "ERROR: width and height are required for resize."
+        try:
+            new_size = AXValueCreate(kAXValueCGSizeType, CGSize(float(width), float(height)))
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXSize", new_size)
+            return f"Resized window to {width}x{height}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    return f"ERROR: Unknown action '{action}'."
+
+
+def _handle_context(args: dict) -> str:
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    lines = []
+
+    # Get frontmost app
+    apps = native_adapter.list_apps()
+    frontmost = None
+    for app in apps:
+        if app.is_frontmost:
+            frontmost = app
+            break
+
+    if frontmost:
+        lines.append(f"Frontmost app: {frontmost.name} (PID {frontmost.pid})")
+        if frontmost.windows:
+            lines.append(f"Active window: \"{frontmost.windows[0]}\"")
+
+        # Get focused element
+        focused = native_adapter.get_focused_element()
+        if focused:
+            registry._elements[focused.id] = focused
+            lines.append(f"Focused: [{focused.id}] {focused.role} \"{focused.name}\"")
+
+        # Get tree and count interactive elements
+        tree = native_adapter.get_tree(frontmost.pid, max_depth=10, is_browser=False)
+        if tree:
+            registry.register_tree(tree, pid=frontmost.pid)
+            interactive = _count_interactive(tree)
+            has_web = _tree_has_web_content(tree)
+            lines.append(f"Elements: {registry.count()} total, {interactive} interactive")
+            if has_web:
+                lines.append("Web content detected (Electron/browser/webview)")
+
+            # List interactive elements (compact)
+            lines.append("\nInteractive elements:")
+            _interactive_roles = frozenset({
+                "button", "link", "textfield", "textarea", "combobox",
+                "checkbox", "radiobutton", "slider", "menuitem", "tab",
+                "searchfield", "popupbutton", "switch", "togglebutton",
+            })
+
+            def collect_interactive(el, results, max_items=30):
+                if len(results) >= max_items:
+                    return
+                if el.role in _interactive_roles:
+                    results.append(el)
+                for child in el.children:
+                    collect_interactive(child, results, max_items)
+
+            interactive_els = []
+            collect_interactive(tree, interactive_els)
+            for el in interactive_els:
+                state = " ".join(el.states) if el.states else ""
+                lines.append(f"  [{el.id}] {el.role} \"{el.name}\" {state}".rstrip())
+            if interactive > len(interactive_els):
+                lines.append(f"  ... and {interactive - len(interactive_els)} more")
+    else:
+        lines.append("No frontmost app detected.")
+        apps_summary = ", ".join(f"{a.name} ({a.pid})" for a in apps[:5])
+        lines.append(f"Running apps: {apps_summary}")
+
+    return "\n".join(lines)
+
+
+# ── Shadow (background browser) handler ─────────────────────────────
+def _handle_shadow(args: dict) -> str:
+    action = args.get("action", "")
+    text = args.get("text", "")
+    selector = args.get("selector", "")
+    tab_idx = args.get("tab_index", -1)
+    direction = args.get("direction", "down")
+    amount = args.get("amount", 300)
+
+    if sys.platform != "darwin":
+        return "ERROR: Shadow mode currently supports macOS only."
+
+    from . import applescript as _as
+    if not _as.is_available():
+        return "ERROR: Chrome is not running."
+
+    # Resolve tab index
+    if tab_idx < 0:
+        tab_idx = _as.shadow_get_active_tab_index() or 0
+
+    if action == "click":
+        if not text and not selector:
+            return "ERROR: 'text' or 'selector' required for click."
+        if selector:
+            ok = _as.shadow_click(selector, tab_index=tab_idx)
+            return f"Shadow clicked '{selector}'" if ok else f"ERROR: Element '{selector}' not found."
+        else:
+            result = _as.shadow_click_by_text(text, tab_index=tab_idx)
+            return f"Shadow clicked: {result}" if result else f"ERROR: No clickable element with text '{text}' found."
+
+    elif action == "type":
+        if not text:
+            return "ERROR: 'text' required for type."
+        ok = _as.shadow_type(text, selector=selector, tab_index=tab_idx)
+        return f"Shadow typed \"{text}\"" if ok else "ERROR: Could not type in background."
+
+    elif action == "press_key":
+        key = text or "Enter"
+        ok = _as.shadow_press_key(key, tab_index=tab_idx)
+        return f"Shadow pressed {key}" if ok else f"ERROR: Could not press {key}."
+
+    elif action == "scroll":
+        ok = _as.shadow_scroll(direction=direction, amount=amount, selector=selector, tab_index=tab_idx)
+        return f"Shadow scrolled {direction} {amount}px" if ok else "ERROR: Could not scroll."
+
+    elif action == "read":
+        result = _as.shadow_read_interactive(tab_index=tab_idx)
+        if result:
+            return f"Interactive elements (background scan):\n\n{result}"
+        return "No interactive elements found or Chrome not available."
+
+    elif action == "js":
+        if not text:
+            return "ERROR: 'text' (JS code) required for js action."
+        result = _as.shadow_execute_js(text, tab_index=tab_idx)
+        if result is not None:
+            return f"JS result: {result}"
+        return "ERROR: JavaScript execution failed."
+
+    return f"ERROR: Unknown action '{action}'."
 
 
 # ── Entry point ─────────────────────────────────────────────────────
