@@ -266,12 +266,15 @@ class MacOSAdapter(BaseAdapter):
                 # Still recurse children — a skipped <div> may contain buttons
                 if depth < max_depth and children_raw:
                     for child_ax in children_raw:
-                        child = self._element_to_ui(
-                            child_ax, depth + 1, max_depth,
-                            in_web_area=True,
-                        )
-                        if child:
-                            element.children.append(child)
+                        try:
+                            child = self._element_to_ui(
+                                child_ax, depth + 1, max_depth,
+                                in_web_area=True,
+                            )
+                            if child:
+                                element.children.append(child)
+                        except Exception:
+                            continue  # Skip crashed/invalid child elements
                 if element.children:
                     return element
                 return None
@@ -279,12 +282,15 @@ class MacOSAdapter(BaseAdapter):
         # Recurse children
         if depth < max_depth and children_raw:
             for child_ax in children_raw:
-                child = self._element_to_ui(
-                    child_ax, depth + 1, max_depth,
-                    in_web_area=in_web_area,
-                )
-                if child:
-                    element.children.append(child)
+                try:
+                    child = self._element_to_ui(
+                        child_ax, depth + 1, max_depth,
+                        in_web_area=in_web_area,
+                    )
+                    if child:
+                        element.children.append(child)
+                except Exception:
+                    continue  # Skip crashed/invalid child elements
 
         return element
 
@@ -303,6 +309,16 @@ class MacOSAdapter(BaseAdapter):
             )
         except Exception:
             pass  # Not all apps support this — that's fine
+
+    def is_element_valid(self, element) -> bool:
+        """Check if an element's AX reference is still valid (not destroyed)."""
+        if element.platform_ref is None:
+            return False
+        try:
+            err, _ = self._ax.AXUIElementCopyAttributeValue(element.platform_ref, "AXRole", None)
+            return err == 0
+        except Exception:
+            return False
 
     def get_tree(self, pid: int, max_depth: int = 5,
                  is_browser: bool = False) -> UIElement | None:

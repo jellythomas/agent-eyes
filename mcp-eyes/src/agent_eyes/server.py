@@ -567,6 +567,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = await _dispatch(name, arguments)
         return [TextContent(type="text", text=result)]
     except Exception as e:
+        import traceback
+        logger.error("Tool '%s' failed: %s\n%s", name, e, traceback.format_exc())
         return [TextContent(type="text", text=f"ERROR: {e}")]
 
 
@@ -817,6 +819,11 @@ async def _handle_click(args: dict) -> str:
     if element is None:
         return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
 
+    # Validate element reference is still alive (app may have navigated, window closed)
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
+
     # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
     if element.source == "cdp" and element.platform_ref is not None:
         if not _cached_tabs:
@@ -868,6 +875,11 @@ async def _handle_type(args: dict) -> str:
     element = registry.get(element_id)
     if element is None:
         return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    # Validate element reference is still alive (app may have navigated, window closed)
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
 
     # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
     if element.source == "cdp" and element.platform_ref is not None:
@@ -983,10 +995,16 @@ def _handle_get_focused() -> str:
 
 # ── CDP handlers ────────────────────────────────────────────────────
 _cached_tabs: list = []
+_cached_tabs_time: float = 0
 
 
 async def _handle_list_chrome_tabs() -> str:
     global _cached_tabs
+
+    # Always refresh when explicitly listing tabs
+    err = await _ensure_tabs(force=True)
+    if err and not _cached_tabs:
+        pass  # fall through to the non-CDP paths below
 
     # Try CDP first (richer interaction, cross-platform)
     available = await cdp_client.is_available()
@@ -1068,15 +1086,22 @@ async def _handle_get_web_tree(args: dict) -> str:
 
 # ── CDP action handlers ─────────────────────────────────────────────
 
-async def _ensure_tabs() -> str:
-    """Ensure cached tabs are available. Returns error string or empty."""
-    global _cached_tabs
-    if not _cached_tabs:
-        available = await cdp_client.is_available()
-        if not available:
-            return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
-        tabs = await cdp_client.list_tabs()
-        _cached_tabs.extend(tabs)
+async def _ensure_tabs(force: bool = False) -> str:
+    """Ensure cached tabs are available. Returns error string or empty.
+
+    Args:
+        force: Always refresh, ignoring cache age. Use when listing tabs explicitly.
+    """
+    global _cached_tabs, _cached_tabs_time
+    cache_age = time.time() - _cached_tabs_time
+    if not force and _cached_tabs and cache_age < 30:
+        return ""
+    available = await cdp_client.is_available()
+    if not available:
+        return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
+    tabs = await cdp_client.list_tabs()
+    _cached_tabs = list(tabs)
+    _cached_tabs_time = time.time()
     if not _cached_tabs:
         return "ERROR: No Chrome tabs found."
     return ""
