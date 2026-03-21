@@ -59,7 +59,7 @@ agent-eyes
 After adding agent-eyes as an MCP server, run the setup wizard to auto-detect competing servers (Playwright, Puppeteer, etc.) and configure your AI tools:
 
 ```
-agent-eyes:init
+/agent-eyes-init
 ```
 
 This scans your machine for AI coding tools and competing MCP servers, then presents interactive choices to replace them with agent-eyes. All changes are backed up automatically.
