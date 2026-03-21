@@ -3,6 +3,27 @@ name = "agent-eyes"
 version = "0.2.0"
 description = "Accessibility-tree vision for AI agents — see and interact with ANY application without screenshots"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Jelly Thomas"},
+]
+readme = "README.md"
+keywords = ["mcp", "accessibility", "ai-agent", "computer-use", "automation", "screen-reader"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Desktop Environment",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
 dependencies = [
     "mcp>=1.0.0",
     "websockets>=12.0",
@@ -22,6 +43,11 @@ linux = [
     # pyatspi2 typically installed via system package manager
     # apt install python3-pyatspi / dnf install python3-pyatspi
 ]
+
+[project.urls]
+Homepage = "https://github.com/jellythomas/agent-eyes"
+Repository = "https://github.com/jellythomas/agent-eyes"
+Issues = "https://github.com/jellythomas/agent-eyes/issues"
 
 [project.scripts]
 agent-eyes = "agent_eyes.server:main"
