@@ -39,17 +39,26 @@ _setup_checked = False
 
 
 def _maybe_auto_setup() -> str | None:
-    """Run setup scan on first-ever run or version upgrade. Returns setup
-    result text if triggered, None otherwise. Runs at most once per process."""
+    """Check if setup is needed. Returns a short reminder nudging the user
+    to run the init command, or None if already configured.
+    Runs at most once per process."""
     global _setup_checked
     if _setup_checked:
         return None
     _setup_checked = True
     try:
         from .setup.state import is_first_run, needs_rescan
-        if is_first_run() or needs_rescan(__version__):
-            from .setup.handlers import handle_setup
-            return handle_setup()
+        if is_first_run():
+            return (
+                "⚠️ agent-eyes is not configured yet.\n"
+                "Run `/agent-eyes:init` to set up agent-eyes and replace competing MCP servers.\n"
+                "This only takes a few seconds and uses interactive setup."
+            )
+        elif needs_rescan(__version__):
+            return (
+                "ℹ️ agent-eyes has been upgraded to a new version.\n"
+                "Run `/agent-eyes:init` to re-scan and update your configuration."
+            )
     except Exception as e:
         logger.debug("Auto-setup skipped: %s", e)
     return None

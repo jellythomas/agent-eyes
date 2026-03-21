@@ -54,6 +54,18 @@ Add to your Claude Code config (`~/.claude.json`):
 agent-eyes
 ```
 
+## First-Time Setup
+
+After adding agent-eyes as an MCP server, run the setup wizard to auto-detect competing servers (Playwright, Puppeteer, etc.) and configure your AI tools:
+
+```
+agent-eyes:init
+```
+
+This scans your machine for AI coding tools and competing MCP servers, then presents interactive choices to replace them with agent-eyes. All changes are backed up automatically.
+
+> **Tip:** In Claude Code, setup uses native multi-choice prompts. In other AI tools, it falls back to text-based selection.
+
 ## Tools (28)
 
 ### Orientation
