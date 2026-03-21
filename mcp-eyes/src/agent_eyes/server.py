@@ -1108,12 +1108,16 @@ async def _handle_type(args: dict) -> str:
     if not is_secure and hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
             time.sleep(0.1)
-            if input_backend.clear_and_type(text):
-                # For web elements (React, Vue, Angular): SKIP verification.
-                # Web frameworks update AXValue asynchronously — reading it back
-                # at 0.15s falsely reports empty. And set_value fallback is WORSE
-                # for web apps (doesn't trigger framework state/event handlers).
-                # Keyboard injection IS the correct approach for web elements.
+            # For web elements: type directly WITHOUT clear_and_type.
+            # clear_and_type sends Cmd+A + Delete before typing, which in Chrome
+            # can select the entire page, trigger shortcuts (Cmd+T = new tab), and
+            # cause havoc when the contentEditable div doesn't have perfect focus.
+            if is_web:
+                type_ok = input_backend.type_text(text)
+            else:
+                type_ok = input_backend.clear_and_type(text)
+            if type_ok:
+                # For web elements: trust keyboard injection, skip verification.
                 if is_web:
                     return (
                         f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
