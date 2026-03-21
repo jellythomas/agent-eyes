@@ -463,3 +463,142 @@ def get_chrome_active_tab_index() -> tuple[int, int]:
     except Exception:
         pass
     return (0, 0)
+
+
+def shadow_execute_js(js_code: str, tab_index: int = 0, window_index: int = 0) -> str | None:
+    """Execute JavaScript in a Chrome tab WITHOUT focusing Chrome.
+    Works entirely in the background via AppleScript.
+    Returns the JS result as a string, or None on failure.
+    Note: Promises/async return empty string — use polling pattern instead.
+    """
+    if sys.platform != "darwin":
+        return None
+    # Escape backslashes and quotes for AppleScript string
+    escaped = js_code.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'tell application "Google Chrome" to tell tab {tab_index + 1} '
+        f'of window {window_index + 1} to execute javascript "{escaped}"'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+    except (subprocess.TimeoutExpired, Exception):
+        return None
+
+
+def shadow_click(selector: str, tab_index: int = 0, window_index: int = 0) -> bool:
+    """Click an element by CSS selector in background."""
+    js = f'var el = document.querySelector("{selector}"); el ? (el.click(), "clicked") : "not found"'
+    result = shadow_execute_js(js, tab_index, window_index)
+    return result == "clicked"
+
+
+def shadow_click_by_text(text: str, role: str = "", tab_index: int = 0, window_index: int = 0) -> str | None:
+    """Click an element by its text content in background. Returns element info or None."""
+    escaped_text = text.replace("\\", "\\\\").replace('"', '\\"')
+    role_selector = f'[role=\\"{role}\\"], ' if role else ''
+    js = (
+        f'var els = Array.from(document.querySelectorAll("{role_selector}button, a, [role=button], [role=link], [role=menuitem], [role=tab], [role=option]"));'
+        f'var el = els.find(e => e.textContent.trim().includes("{escaped_text}"));'
+        f'el ? (el.click(), el.tagName + ": " + el.textContent.trim().substring(0,50)) : "not found"'
+    )
+    result = shadow_execute_js(js, tab_index, window_index)
+    return result if result and result != "not found" else None
+
+
+def shadow_type(text: str, selector: str = "", tab_index: int = 0, window_index: int = 0) -> bool:
+    """Type text into a web element in background using execCommand.
+    If no selector, types into the currently focused element.
+    """
+    escaped_text = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    if selector:
+        escaped_sel = selector.replace("\\", "\\\\").replace('"', '\\"')
+        js = (
+            f'var el = document.querySelector("{escaped_sel}");'
+            f'if(el){{ el.focus(); document.execCommand("insertText", false, "{escaped_text}"); "typed" }}'
+            f'else{{ "not found" }}'
+        )
+    else:
+        js = f'document.execCommand("insertText", false, "{escaped_text}"); "typed"'
+    result = shadow_execute_js(js, tab_index, window_index)
+    return result == "typed"
+
+
+def shadow_press_key(key: str, tab_index: int = 0, window_index: int = 0) -> bool:
+    """Dispatch a keyboard event in background."""
+    key_map = {
+        "enter": ("Enter", "Enter", 13),
+        "tab": ("Tab", "Tab", 9),
+        "escape": ("Escape", "Escape", 27),
+        "backspace": ("Backspace", "Backspace", 8),
+        "delete": ("Delete", "Delete", 46),
+        "arrowup": ("ArrowUp", "ArrowUp", 38),
+        "arrowdown": ("ArrowDown", "ArrowDown", 40),
+        "arrowleft": ("ArrowLeft", "ArrowLeft", 37),
+        "arrowright": ("ArrowRight", "ArrowRight", 39),
+        "space": (" ", "Space", 32),
+    }
+    k = key_map.get(key.lower(), (key, f"Key{key.upper()}", 0))
+    js = (
+        f'var el = document.activeElement || document.body;'
+        f'["keydown","keypress","keyup"].forEach(t => el.dispatchEvent(new KeyboardEvent(t, '
+        f'{{key:"{k[0]}", code:"{k[1]}", keyCode:{k[2]}, which:{k[2]}, bubbles:true}})));'
+        f'"pressed"'
+    )
+    result = shadow_execute_js(js, tab_index, window_index)
+    return result == "pressed"
+
+
+def shadow_scroll(direction: str = "down", amount: int = 300, selector: str = "",
+                  tab_index: int = 0, window_index: int = 0) -> bool:
+    """Scroll page or element in background."""
+    if selector:
+        escaped_sel = selector.replace("\\", "\\\\").replace('"', '\\"')
+        dy = amount if direction == "down" else -amount
+        js = f'var el=document.querySelector("{escaped_sel}"); el?(el.scrollBy(0,{dy}),"scrolled"):"not found"'
+    else:
+        dy = amount if direction == "down" else -amount
+        js = f'window.scrollBy(0,{dy}); "scrolled"'
+    result = shadow_execute_js(js, tab_index, window_index)
+    return result == "scrolled"
+
+
+def shadow_read_interactive(tab_index: int = 0, window_index: int = 0) -> str | None:
+    """Read all interactive elements with positions from a Chrome tab in background."""
+    js = (
+        'Array.from(document.querySelectorAll("button, a, input, textarea, select, '
+        '[role=button], [role=link], [role=menuitem], [role=tab], [role=checkbox], '
+        '[role=textbox], [role=combobox], [contenteditable=true]"))'
+        '.filter(e => e.offsetParent !== null)'  # visible only
+        '.slice(0, 50)'
+        '.map((e, i) => {'
+        '  var r = e.getBoundingClientRect();'
+        '  var text = (e.textContent || e.value || e.placeholder || e.ariaLabel || "").trim().substring(0, 60);'
+        '  var tag = e.tagName.toLowerCase();'
+        '  var role = e.getAttribute("role") || tag;'
+        '  var type = e.type || "";'
+        '  return "[" + i + "] " + role + " \\"" + text + "\\" @(" + Math.round(r.x) + "," + Math.round(r.y) + ") " + Math.round(r.width) + "x" + Math.round(r.height);'
+        '}).join("\\n")'
+    )
+    return shadow_execute_js(js, tab_index, window_index)
+
+
+def shadow_get_active_tab_index(window_index: int = 0) -> int | None:
+    """Get the active tab index (0-based) of a Chrome window."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", f'tell application "Google Chrome" to get active tab index of window {window_index + 1}'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip()) - 1  # Convert to 0-based
+        return None
+    except Exception:
+        return None

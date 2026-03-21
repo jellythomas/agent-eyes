@@ -689,6 +689,50 @@ TOOLS = [
             "required": [],
         },
     ),
+    Tool(
+        name="eyes_shadow",
+        description=(
+            "Execute browser actions in the background WITHOUT focusing Chrome. "
+            "Actions: 'click' (by text/selector), 'type' (into focused/selected element), "
+            "'press_key' (Enter/Tab/Escape/etc), 'scroll' (up/down), "
+            "'read' (get all interactive elements), 'js' (raw JavaScript). "
+            "Works on any Chrome tab without stealing focus from your current app."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'click', 'type', 'press_key', 'scroll', 'read', 'js'",
+                    "enum": ["click", "type", "press_key", "scroll", "read", "js"],
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to click (for 'click'), text to type (for 'type'), key name (for 'press_key'), JS code (for 'js')",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector (optional, for targeted click/type/scroll)",
+                },
+                "direction": {
+                    "type": "string",
+                    "description": "Scroll direction: 'up' or 'down' (default 'down')",
+                    "default": "down",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Scroll amount in pixels (default 300)",
+                    "default": 300,
+                },
+                "tab_index": {
+                    "type": "integer",
+                    "description": "Chrome tab index (0-based, default: active tab)",
+                    "default": -1,
+                },
+            },
+            "required": ["action"],
+        },
+    ),
 ]
 
 
@@ -763,6 +807,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return _handle_window(args)
     elif name == "eyes_context":
         return _handle_context(args)
+    elif name == "eyes_shadow":
+        return _handle_shadow(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -2090,6 +2136,68 @@ def _handle_context(args: dict) -> str:
         lines.append(f"Running apps: {apps_summary}")
 
     return "\n".join(lines)
+
+
+# ── Shadow (background browser) handler ─────────────────────────────
+def _handle_shadow(args: dict) -> str:
+    action = args.get("action", "")
+    text = args.get("text", "")
+    selector = args.get("selector", "")
+    tab_idx = args.get("tab_index", -1)
+    direction = args.get("direction", "down")
+    amount = args.get("amount", 300)
+
+    if sys.platform != "darwin":
+        return "ERROR: Shadow mode currently supports macOS only."
+
+    from . import applescript as _as
+    if not _as.is_available():
+        return "ERROR: Chrome is not running."
+
+    # Resolve tab index
+    if tab_idx < 0:
+        tab_idx = _as.shadow_get_active_tab_index() or 0
+
+    if action == "click":
+        if not text and not selector:
+            return "ERROR: 'text' or 'selector' required for click."
+        if selector:
+            ok = _as.shadow_click(selector, tab_index=tab_idx)
+            return f"Shadow clicked '{selector}'" if ok else f"ERROR: Element '{selector}' not found."
+        else:
+            result = _as.shadow_click_by_text(text, tab_index=tab_idx)
+            return f"Shadow clicked: {result}" if result else f"ERROR: No clickable element with text '{text}' found."
+
+    elif action == "type":
+        if not text:
+            return "ERROR: 'text' required for type."
+        ok = _as.shadow_type(text, selector=selector, tab_index=tab_idx)
+        return f"Shadow typed \"{text}\"" if ok else "ERROR: Could not type in background."
+
+    elif action == "press_key":
+        key = text or "Enter"
+        ok = _as.shadow_press_key(key, tab_index=tab_idx)
+        return f"Shadow pressed {key}" if ok else f"ERROR: Could not press {key}."
+
+    elif action == "scroll":
+        ok = _as.shadow_scroll(direction=direction, amount=amount, selector=selector, tab_index=tab_idx)
+        return f"Shadow scrolled {direction} {amount}px" if ok else "ERROR: Could not scroll."
+
+    elif action == "read":
+        result = _as.shadow_read_interactive(tab_index=tab_idx)
+        if result:
+            return f"Interactive elements (background scan):\n\n{result}"
+        return "No interactive elements found or Chrome not available."
+
+    elif action == "js":
+        if not text:
+            return "ERROR: 'text' (JS code) required for js action."
+        result = _as.shadow_execute_js(text, tab_index=tab_idx)
+        if result is not None:
+            return f"JS result: {result}"
+        return "ERROR: JavaScript execution failed."
+
+    return f"ERROR: Unknown action '{action}'."
 
 
 # ── Entry point ─────────────────────────────────────────────────────
