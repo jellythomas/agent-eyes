@@ -676,6 +676,19 @@ TOOLS = [
             "required": ["action"],
         },
     ),
+    Tool(
+        name="eyes_context",
+        description=(
+            "Get a quick context snapshot: frontmost app, active window, focused element, "
+            "and a summary of interactive elements. One call instead of multiple tools. "
+            "Use this to orient yourself before interacting with an app."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    ),
 ]
 
 
@@ -748,6 +761,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return _handle_get_subtree(args)
     elif name == "eyes_window":
         return _handle_window(args)
+    elif name == "eyes_context":
+        return _handle_context(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -1993,6 +2008,72 @@ def _handle_window(args: dict) -> str:
             return f"ERROR: {e}"
 
     return f"ERROR: Unknown action '{action}'."
+
+
+def _handle_context(args: dict) -> str:
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    lines = []
+
+    # Get frontmost app
+    apps = native_adapter.list_apps()
+    frontmost = None
+    for app in apps:
+        if app.is_frontmost:
+            frontmost = app
+            break
+
+    if frontmost:
+        lines.append(f"Frontmost app: {frontmost.name} (PID {frontmost.pid})")
+        if frontmost.windows:
+            lines.append(f"Active window: \"{frontmost.windows[0]}\"")
+
+        # Get focused element
+        focused = native_adapter.get_focused_element()
+        if focused:
+            registry._elements[focused.id] = focused
+            lines.append(f"Focused: [{focused.id}] {focused.role} \"{focused.name}\"")
+
+        # Get tree and count interactive elements
+        tree = native_adapter.get_tree(frontmost.pid, max_depth=10, is_browser=False)
+        if tree:
+            registry.register_tree(tree, pid=frontmost.pid)
+            interactive = _count_interactive(tree)
+            has_web = _tree_has_web_content(tree)
+            lines.append(f"Elements: {registry.count()} total, {interactive} interactive")
+            if has_web:
+                lines.append("Web content detected (Electron/browser/webview)")
+
+            # List interactive elements (compact)
+            lines.append("\nInteractive elements:")
+            _interactive_roles = frozenset({
+                "button", "link", "textfield", "textarea", "combobox",
+                "checkbox", "radiobutton", "slider", "menuitem", "tab",
+                "searchfield", "popupbutton", "switch", "togglebutton",
+            })
+
+            def collect_interactive(el, results, max_items=30):
+                if len(results) >= max_items:
+                    return
+                if el.role in _interactive_roles:
+                    results.append(el)
+                for child in el.children:
+                    collect_interactive(child, results, max_items)
+
+            interactive_els = []
+            collect_interactive(tree, interactive_els)
+            for el in interactive_els:
+                state = " ".join(el.states) if el.states else ""
+                lines.append(f"  [{el.id}] {el.role} \"{el.name}\" {state}".rstrip())
+            if interactive > len(interactive_els):
+                lines.append(f"  ... and {interactive - len(interactive_els)} more")
+    else:
+        lines.append("No frontmost app detected.")
+        apps_summary = ", ".join(f"{a.name} ({a.pid})" for a in apps[:5])
+        lines.append(f"Running apps: {apps_summary}")
+
+    return "\n".join(lines)
 
 
 # ── Entry point ─────────────────────────────────────────────────────
