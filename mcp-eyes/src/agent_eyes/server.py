@@ -553,6 +553,69 @@ TOOLS = [
             "required": ["pid"],
         },
     ),
+    Tool(
+        name="eyes_hover",
+        description=(
+            "Hover over a UI element to trigger tooltips, dropdown previews, "
+            "or CSS :hover states. Moves the mouse to the element's center."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Element ID from the accessibility tree",
+                },
+                "x": {
+                    "type": "integer",
+                    "description": "Screen X coordinate (alternative to id)",
+                },
+                "y": {
+                    "type": "integer",
+                    "description": "Screen Y coordinate (alternative to id)",
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="eyes_element_at",
+        description=(
+            "Identify the UI element at specific screen coordinates. "
+            "Returns the element with an [id] you can use for click/type. "
+            "Useful after OCR hints to identify what's at a position."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "Screen X coordinate"},
+                "y": {"type": "integer", "description": "Screen Y coordinate"},
+            },
+            "required": ["x", "y"],
+        },
+    ),
+    Tool(
+        name="eyes_app",
+        description=(
+            "Launch, quit, or switch to an application. "
+            "Actions: 'launch' (by name or bundle ID), 'quit', 'focus' (bring to front)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'launch', 'quit', or 'focus'",
+                    "enum": ["launch", "quit", "focus"],
+                },
+                "name": {
+                    "type": "string",
+                    "description": "App name (e.g. 'Safari') or bundle ID (e.g. 'com.apple.Safari')",
+                },
+            },
+            "required": ["action", "name"],
+        },
+    ),
 ]
 
 
@@ -615,6 +678,12 @@ async def _dispatch(name: str, args: dict) -> str:
         return await _handle_fill_form(args)
     elif name == "eyes_get_ocr_hints":
         return _handle_get_ocr_hints(args)
+    elif name == "eyes_hover":
+        return _handle_hover(args)
+    elif name == "eyes_element_at":
+        return _handle_element_at(args)
+    elif name == "eyes_app":
+        return _handle_app(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -1557,6 +1626,108 @@ def _handle_get_ocr_hints(args: dict) -> str:
         )
 
     return "\n".join(lines)
+
+
+# ── New tool handlers ────────────────────────────────────────────────
+
+def _handle_hover(args: dict) -> str:
+    hover_x = args.get("x")
+    hover_y = args.get("y")
+    element_id = args.get("id")
+
+    if hover_x is not None and hover_y is not None:
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            input_backend.move_mouse(hover_x, hover_y)
+            return f"Hovering at ({hover_x}, {hover_y})"
+        return "ERROR: No input backend available."
+
+    if element_id is None:
+        return "ERROR: id or (x, y) is required."
+
+    element = registry.get(element_id)
+    if element is None:
+        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    if element.bounds:
+        x, y, w, h = element.bounds
+        cx, cy = x + w // 2, y + h // 2
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            if element.pid:
+                input_backend.activate_window(element.pid)
+                time.sleep(0.1)
+            input_backend.move_mouse(cx, cy)
+            return f"Hovering over [{element_id}] {element.role} \"{element.name}\" at ({cx}, {cy})"
+
+    return f"ERROR: Element [{element_id}] has no bounds for hover."
+
+
+def _handle_element_at(args: dict) -> str:
+    x = args.get("x")
+    y = args.get("y")
+    if x is None or y is None:
+        return "ERROR: x and y are required."
+
+    if not native_adapter or not hasattr(native_adapter, 'element_at_position'):
+        return "ERROR: element_at_position not supported on this platform."
+
+    element = native_adapter.element_at_position(float(x), float(y))
+    if element is None:
+        return f"No element found at ({x}, {y})."
+
+    registry._elements[element.id] = element
+    return f"Element at ({x}, {y}):\n{element.to_text(max_depth=0)}\n\nUse [{element.id}] with eyes_click or eyes_type."
+
+
+def _handle_app(args: dict) -> str:
+    action = args.get("action", "").lower()
+    name = args.get("name", "")
+    if not action or not name:
+        return "ERROR: action and name are required."
+
+    if sys.platform != "darwin":
+        return "ERROR: eyes_app currently only supports macOS."
+
+    try:
+        from AppKit import NSWorkspace, NSWorkspaceOpenConfiguration
+        ws = NSWorkspace.sharedWorkspace()
+    except ImportError:
+        return "ERROR: AppKit not available."
+
+    if action == "launch":
+        # Try as bundle ID first, then as app name
+        if "." in name:
+            success = ws.launchAppWithBundleIdentifier_options_additionalEventParamDescriptor_launchIdentifier_(
+                name, 0, None, None
+            )
+            if success[0]:
+                return f"Launched app with bundle ID '{name}'."
+        # Try by name
+        success = ws.launchApplication_(name)
+        if success:
+            return f"Launched '{name}'."
+        return f"ERROR: Could not launch '{name}'. Check the app name or bundle ID."
+
+    elif action == "focus":
+        for app in ws.runningApplications():
+            app_name = app.localizedName() or ""
+            bundle_id = app.bundleIdentifier() or ""
+            if name.lower() in app_name.lower() or name.lower() == bundle_id.lower():
+                app.activateWithOptions_(0)
+                return f"Focused '{app_name}' (PID {app.processIdentifier()})."
+        return f"ERROR: App '{name}' not found running."
+
+    elif action == "quit":
+        for app in ws.runningApplications():
+            app_name = app.localizedName() or ""
+            bundle_id = app.bundleIdentifier() or ""
+            if name.lower() in app_name.lower() or name.lower() == bundle_id.lower():
+                app.terminate()
+                return f"Quit '{app_name}'."
+        return f"ERROR: App '{name}' not found running."
+
+    return f"ERROR: Unknown action '{action}'. Use 'launch', 'quit', or 'focus'."
 
 
 # ── Entry point ─────────────────────────────────────────────────────

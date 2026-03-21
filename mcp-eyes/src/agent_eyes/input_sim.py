@@ -71,6 +71,10 @@ class InputBackend(abc.ABC):
         """Bring a window to the foreground by PID."""
         ...
 
+    def move_mouse(self, x: int, y: int) -> bool:
+        """Move mouse to absolute screen coordinates without clicking."""
+        return False
+
     def paste_text(self, text: str) -> bool:
         """Paste text via clipboard. Override per platform."""
         return False
@@ -277,6 +281,17 @@ class MacOSInputBackend(InputBackend):
             return True
         except Exception as e:
             logger.error("macOS scroll failed: %s", e)
+            return False
+
+    def move_mouse(self, x: int, y: int) -> bool:
+        self._load()
+        Q = self._quartz
+        try:
+            event = Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, Q.CGPointMake(x, y), 0)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            return True
+        except Exception as e:
+            logger.error("macOS move_mouse failed: %s", e)
             return False
 
     def paste_text(self, text: str) -> bool:

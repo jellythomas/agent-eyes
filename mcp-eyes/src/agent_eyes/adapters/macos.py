@@ -415,6 +415,61 @@ class MacOSAdapter(BaseAdapter):
         )
         return err == 0
 
+    def element_at_position(self, x: float, y: float) -> UIElement | None:
+        """Get the UI element at the given screen coordinates."""
+        self._load()
+        system_wide = self._ax.AXUIElementCreateSystemWide()
+        err, ax_el = self._ax.AXUIElementCopyElementAtPosition(system_wide, float(x), float(y), None)
+        if err != 0 or ax_el is None:
+            return None
+
+        # Read basic attributes
+        attrs = self._batch_read_attrs(ax_el)
+        role_raw = attrs.get("AXRole") or ""
+        role = str(role_raw).replace("AX", "").lower() if role_raw else "unknown"
+
+        name = str(attrs.get("AXTitle") or "")
+        if not name:
+            name = str(attrs.get("AXDescription") or "")
+        if not name:
+            name = str(attrs.get("AXPlaceholderValue") or "")
+        if not name:
+            name = str(attrs.get("AXRoleDescription") or "")
+
+        value_raw = attrs.get("AXValue")
+        value = str(value_raw)[:200] if value_raw is not None else ""
+
+        bounds = None
+        pos = attrs.get("AXPosition")
+        size = attrs.get("AXSize")
+        if pos is not None and size is not None:
+            try:
+                bounds = self._parse_bounds(pos, size)
+            except Exception:
+                pass
+
+        actions = []
+        err2, action_names = self._ax.AXUIElementCopyActionNames(ax_el, None)
+        if err2 == 0 and action_names:
+            actions = [str(a).replace("AX", "").lower() for a in action_names]
+
+        # Get owning PID
+        err3, pid = self._ax.AXUIElementGetPid(ax_el, None)
+        element_pid = pid if err3 == 0 else 0
+
+        element = UIElement(
+            id=self._next_id(),
+            role=role,
+            name=name,
+            value=value,
+            actions=actions,
+            bounds=bounds,
+            platform_ref=ax_el,
+            source="native",
+            pid=element_pid,
+        )
+        return element
+
     def get_focused_element(self) -> UIElement | None:
         self._load()
         self.reset_ids()
