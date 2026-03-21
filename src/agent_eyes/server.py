@@ -815,6 +815,54 @@ TOOLS = [
             "required": ["action"],
         },
     ),
+    # ── Setup Tools ─────────────────────────────────────────────────
+    Tool(
+        name="eyes_setup",
+        description=(
+            "Smart scan: detect all AI coding tools on this machine and find competing "
+            "browser/desktop/vision MCP servers that agent-eyes can replace. "
+            "Returns a structured report — does NOT make any changes. "
+            "Call this first, then use eyes_setup_apply to act on the results."
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
+    Tool(
+        name="eyes_setup_apply",
+        description=(
+            "Apply agent-eyes configuration to selected AI tools. "
+            "Call eyes_setup first to get the scan report, then present options to the user. "
+            "Pass the user's selections here to make changes. "
+            "Creates backups before any modification. Only changes what's selected."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "replace_competitors": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "List of competitor IDs to replace "
+                        "(e.g., ['playwright-mcp', 'puppeteer-mcp'])"
+                    ),
+                },
+                "configure_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "List of AI tool IDs to configure "
+                        "(e.g., ['claude-code', 'cursor'])"
+                    ),
+                },
+                "level": {
+                    "type": "string",
+                    "enum": ["global", "project"],
+                    "description": "Installation level: 'global' (user-wide) or 'project' (current directory)",
+                    "default": "global",
+                },
+            },
+            "required": ["replace_competitors", "configure_tools"],
+        },
+    ),
 ]
 
 
@@ -891,6 +939,10 @@ async def _dispatch(name: str, args: dict) -> str:
         return _handle_context(args)
     elif name == "eyes_shadow":
         return _handle_shadow(args)
+    elif name == "eyes_setup":
+        return _handle_setup()
+    elif name == "eyes_setup_apply":
+        return _handle_setup_apply(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -918,6 +970,20 @@ def _handle_status() -> str:
         lines.append(f"AppleScript fallback: {'available' if _as.is_available() else 'unavailable (Chrome not running?)'}")
     elif sys.platform != "darwin":
         lines.append("AppleScript fallback: N/A (macOS only) — CDP required for browser tabs")
+
+    # First-run detection
+    try:
+        from .setup.state import is_first_run, needs_rescan
+        if is_first_run():
+            lines.append("")
+            lines.append(">>> FIRST RUN DETECTED <<<")
+            lines.append("Run eyes_setup to scan your AI tools and discover competing")
+            lines.append("browser/desktop automation MCP servers that agent-eyes can replace.")
+        elif needs_rescan("0.2.3"):
+            lines.append("")
+            lines.append(">>> NEW VERSION — run eyes_setup to check for updates <<<")
+    except Exception:
+        pass  # Setup module not critical for status
 
     return "\n".join(lines)
 
@@ -2280,6 +2346,20 @@ def _handle_shadow(args: dict) -> str:
         return "ERROR: JavaScript execution failed."
 
     return f"ERROR: Unknown action '{action}'."
+
+
+# ── Setup handlers ──────────────────────────────────────────────────
+
+def _handle_setup() -> str:
+    """Scan for AI tools and competing MCP servers."""
+    from .setup.handlers import handle_setup
+    return handle_setup()
+
+
+def _handle_setup_apply(args: dict) -> str:
+    """Apply agent-eyes configuration based on user selections."""
+    from .setup.handlers import handle_setup_apply
+    return handle_setup_apply(args)
 
 
 # ── Entry point ─────────────────────────────────────────────────────
