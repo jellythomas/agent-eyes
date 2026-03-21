@@ -46,7 +46,7 @@ def _maybe_auto_setup() -> str | None:
     _setup_checked = True
     try:
         from .setup.state import is_first_run, needs_rescan
-        if is_first_run() or needs_rescan("0.3.1"):
+        if is_first_run() or needs_rescan("0.3.2"):
             from .setup.handlers import handle_setup
             return handle_setup()
     except Exception as e:
