@@ -34,24 +34,93 @@ else:
 logger = logging.getLogger("agent-eyes")
 
 # ── Platform detection ──────────────────────────────────────────────
-def _get_native_adapter() -> BaseAdapter | None:
-    """Auto-detect and return the platform adapter."""
+def _auto_install_platform_deps() -> None:
+    """Install missing platform-specific dependencies at runtime.
+
+    When installed via ``uvx agent-eyes`` from a PyPI version that predates
+    the platform-conditional dependencies, the native adapter packages may
+    be absent.  This function detects the gap and installs them into the
+    running environment so a server restart is not required.
+
+    Supports both ``uv``-managed environments (uvx) and plain pip.
+    """
+    import shutil
+    import subprocess
+
+    def _pip_install(packages: list[str]) -> None:
+        """Install packages, preferring ``uv pip`` (works in uvx envs)."""
+        uv = shutil.which("uv")
+        if uv:
+            subprocess.check_call(
+                [uv, "pip", "install", "--python", sys.executable, *packages],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", *packages],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
     if sys.platform == "darwin":
-        from .adapters.macos import MacOSAdapter
-        adapter = MacOSAdapter()
-        if adapter.is_available():
-            return adapter
+        needed: list[str] = []
+        for mod, pkg in [
+            ("ApplicationServices", "pyobjc-framework-ApplicationServices"),
+            ("Quartz", "pyobjc-framework-Quartz"),
+            ("Cocoa", "pyobjc-framework-Cocoa"),
+        ]:
+            try:
+                __import__(mod)
+            except ImportError:
+                needed.append(pkg)
+        if needed:
+            logger.info("Auto-installing macOS native deps: %s", ", ".join(needed))
+            _pip_install(needed)
     elif sys.platform == "win32":
-        from .adapters.windows import WindowsAdapter
-        adapter = WindowsAdapter()
-        if adapter.is_available():
-            return adapter
-    elif sys.platform == "linux":
-        from .adapters.linux import LinuxAdapter
-        adapter = LinuxAdapter()
-        if adapter.is_available():
-            return adapter
-    return None
+        try:
+            __import__("pywinauto")
+        except ImportError:
+            logger.info("Auto-installing Windows native dep: pywinauto")
+            _pip_install(["pywinauto"])
+
+
+def _get_native_adapter() -> BaseAdapter | None:
+    """Auto-detect and return the platform adapter.
+
+    Attempts to load the native adapter first; if dependencies are missing,
+    auto-installs them and retries once.
+    """
+    def _try_load() -> BaseAdapter | None:
+        if sys.platform == "darwin":
+            from .adapters.macos import MacOSAdapter
+            adapter = MacOSAdapter()
+            if adapter.is_available():
+                return adapter
+        elif sys.platform == "win32":
+            from .adapters.windows import WindowsAdapter
+            adapter = WindowsAdapter()
+            if adapter.is_available():
+                return adapter
+        elif sys.platform == "linux":
+            from .adapters.linux import LinuxAdapter
+            adapter = LinuxAdapter()
+            if adapter.is_available():
+                return adapter
+        return None
+
+    adapter = _try_load()
+    if adapter is not None:
+        return adapter
+
+    # Dependencies missing — try to install and retry
+    try:
+        _auto_install_platform_deps()
+    except Exception as exc:
+        logger.warning("Auto-install of platform deps failed: %s", exc)
+        return None
+
+    return _try_load()
 
 
 # ── Server setup ────────────────────────────────────────────────────
