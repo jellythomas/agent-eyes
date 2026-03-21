@@ -22,6 +22,7 @@ class MacOSAdapter(BaseAdapter):
 
     def reset_ids(self):
         self._id_counter = 0
+        self._in_web_area = False
 
     def is_available(self) -> bool:
         if sys.platform != "darwin":
@@ -126,15 +127,17 @@ class MacOSAdapter(BaseAdapter):
             return True
         if role in self._WEB_STRUCTURAL_ROLES and name:
             return True
-        # Keep groups/static text only if they have actions (clickable divs)
-        if role in self._WEB_SKIP_ROLES and actions:
+        # Only count meaningful actions (press, click, confirm).
+        # scrolltovisible/showmenu are Chrome defaults on every DOM element — not real interactivity.
+        meaningful_actions = [a for a in actions if a not in ("scrolltovisible", "showmenu")]
+        if role in self._WEB_SKIP_ROLES and meaningful_actions:
             return True
         return False
 
     # Attributes to batch-read per element (single IPC call instead of 10+)
     _BATCH_ATTRS = [
         "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXRoleDescription",
-        "AXValue", "AXFocused", "AXEnabled", "AXSelected",
+        "AXValue", "AXPlaceholderValue", "AXFocused", "AXEnabled", "AXSelected",
         "AXPosition", "AXSize", "AXChildren",
     ]
 
@@ -165,6 +168,7 @@ class MacOSAdapter(BaseAdapter):
 
     # Hard cap on elements to prevent runaway traversal on complex pages
     _MAX_ELEMENTS = 1000
+    _WEB_MAX_ELEMENTS = 3000
 
     def _element_to_ui(self, ax_el, depth: int, max_depth: int,
                        in_web_area: bool = False) -> UIElement | None:
@@ -175,7 +179,8 @@ class MacOSAdapter(BaseAdapter):
         """
         if depth > max_depth:
             return None
-        if self._id_counter >= self._MAX_ELEMENTS:
+        cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
+        if self._id_counter >= cap:
             return None
 
         # Single IPC call for all attributes (~1.3ms vs ~11ms for individual calls)
@@ -191,13 +196,16 @@ class MacOSAdapter(BaseAdapter):
         # Detect entry into web content — dynamically extend depth
         if role == "webarea":
             in_web_area = True
-            # Web content needs deeper traversal. Extend depth budget by 10
+            self._in_web_area = True
+            # Web content needs deeper traversal. Extend depth budget by 20
             # from current position (buttons are 3-5 levels below AXWebArea).
-            max_depth = max(max_depth, depth + 10)
+            max_depth = max(max_depth, depth + 20)
 
         name = str(attrs.get("AXTitle") or "")
         if not name:
             name = str(attrs.get("AXDescription") or "")
+        if not name:
+            name = str(attrs.get("AXPlaceholderValue") or "")
         if not name:
             name = str(attrs.get("AXRoleDescription") or "")
 

@@ -62,9 +62,18 @@ class InputBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
+        """Scroll at absolute screen coordinates. delta_y negative = down, positive = up."""
+        ...
+
+    @abc.abstractmethod
     def activate_window(self, pid: int) -> bool:
         """Bring a window to the foreground by PID."""
         ...
+
+    def paste_text(self, text: str) -> bool:
+        """Paste text via clipboard. Override per platform."""
+        return False
 
     def select_all(self) -> bool:
         """Select all text in the focused element (Cmd+A / Ctrl+A)."""
@@ -252,6 +261,60 @@ class MacOSInputBackend(InputBackend):
             return True
         except Exception as e:
             logger.error("macOS click failed: %s", e)
+            return False
+
+    def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
+        self._load()
+        Q = self._quartz
+        try:
+            # Move mouse to position first
+            move = Q.CGEventCreateMouseEvent(None, Q.kCGEventMouseMoved, Q.CGPointMake(x, y), 0)
+            Q.CGEventPost(Q.kCGHIDEventTap, move)
+            time.sleep(0.05)
+            # Create scroll event
+            event = Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitLine, 2, delta_y, delta_x)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            return True
+        except Exception as e:
+            logger.error("macOS scroll failed: %s", e)
+            return False
+
+    def paste_text(self, text: str) -> bool:
+        """Paste text via clipboard (Cmd+V). 100x faster than char-by-char typing.
+        Saves and restores the user's clipboard contents.
+        """
+        try:
+            from AppKit import NSPasteboard, NSStringPboardType
+            pb = NSPasteboard.generalPasteboard()
+
+            # Save current clipboard
+            old_types = pb.types()
+            old_data = {}
+            for t in old_types:
+                d = pb.dataForType_(t)
+                if d:
+                    old_data[t] = d
+
+            # Set our text
+            pb.clearContents()
+            pb.setString_forType_(text, NSStringPboardType)
+
+            # Cmd+V
+            time.sleep(0.05)
+            self.hotkey("command", "v")
+            time.sleep(0.1)
+
+            # Restore clipboard
+            pb.clearContents()
+            for t, d in old_data.items():
+                try:
+                    pb.setData_forType_(d, t)
+                except Exception:
+                    pass
+
+            return True
+        except Exception as e:
+            logger.error("macOS paste_text failed: %s", e)
             return False
 
     def activate_window(self, pid: int) -> bool:
@@ -484,6 +547,10 @@ class LinuxInputBackend(InputBackend):
         except Exception as e:
             logger.error("Linux click failed: %s", e)
             return False
+
+    def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
+        # TODO: implement platform-specific scroll
+        return False
 
     def activate_window(self, pid: int) -> bool:
         self._detect()
@@ -746,6 +813,10 @@ class WindowsInputBackend(InputBackend):
             logger.error("Windows click failed: %s", e)
             return False
 
+    def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
+        # TODO: implement platform-specific scroll
+        return False
+
     def activate_window(self, pid: int) -> bool:
         self._load()
         try:
@@ -857,6 +928,9 @@ class AppleScriptInputBackend(InputBackend):
         # AppleScript can't easily do coordinate clicks; not supported
         return False
 
+    def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
+        return False
+
     def activate_window(self, pid: int) -> bool:
         try:
             subprocess.run(
@@ -923,6 +997,8 @@ class _NoOpBackend(InputBackend):
     def hotkey(self, *keys) -> bool:
         return False
     def click(self, x, y, button="left") -> bool:
+        return False
+    def scroll(self, x, y, delta_x=0, delta_y=-3) -> bool:
         return False
     def activate_window(self, pid) -> bool:
         return False

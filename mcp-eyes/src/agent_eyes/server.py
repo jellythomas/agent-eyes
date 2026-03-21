@@ -472,6 +472,10 @@ TOOLS = [
                     "description": "Tab index (default 0)",
                     "default": 0,
                 },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID of a native app to scroll in (omit for browser tabs).",
+                },
             },
             "required": [],
         },
@@ -1378,17 +1382,34 @@ async def _handle_file_upload(args: dict) -> str:
 
 
 async def _handle_scroll(args: dict) -> str:
+    x = args.get("x", 400)
+    y = args.get("y", 400)
+    delta_x = args.get("delta_x", 0)
+    delta_y = args.get("delta_y", 300)
+    pid = args.get("pid")
+
+    # ── Native path: use OS-level scroll events for non-browser apps
+    if pid is not None:
+        input_backend = get_input_backend()
+        if input_backend.is_available():
+            # Convert from CDP convention (positive=down) to CGEvent convention (negative=down)
+            native_delta_y = -delta_y if delta_y != 0 else 0
+            native_delta_x = -delta_x if delta_x != 0 else 0
+            success = input_backend.scroll(x, y, delta_x=native_delta_x, delta_y=native_delta_y)
+            if success:
+                direction = "down" if delta_y > 0 else "up" if delta_y < 0 else ""
+                if delta_x:
+                    direction += (" + right" if delta_x > 0 else " + left")
+                return f"Scrolled {direction} by ({delta_x}, {delta_y}) in native app (pid={pid})"
+        return "ERROR: Native scroll failed or no input backend available."
+
+    # ── CDP path: scroll in browser tab
     err = await _ensure_tabs()
     if err:
         return err
     tab, err = _get_tab(args)
     if err:
         return err
-
-    x = args.get("x", 400)
-    y = args.get("y", 400)
-    delta_x = args.get("delta_x", 0)
-    delta_y = args.get("delta_y", 300)
 
     success = await cdp_client.scroll(tab, x, y, delta_x, delta_y)
     if success:
