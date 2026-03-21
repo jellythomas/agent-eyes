@@ -1,0 +1,9 @@
+{
+  "eval_id": 2,
+  "eval_name": "navigate-github-tab",
+  "variant": "with_skill",
+  "expectations": [
+    {"text": "checks-context-or-lists-tabs", "passed": true, "evidence": "Step 1: eyes_context, Step 2: eyes_list_chrome_tabs — both before navigate in Step 3"},
+    {"text": "targets-correct-tab", "passed": true, "evidence": "Step 2 finds GitHub tab by title/URL match, Step 3 uses verified tab_index"}
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "eval_id": 3,
+  "eval_name": "close-all-except-current",
+  "prompt": "i have too many tabs open, close everything except the tab im currently reading",
+  "assertions": [
+    {
+      "name": "lists-tabs-first",
+      "description": "Claude calls eyes_list_chrome_tabs before any close operations",
+      "type": "tool_order",
+      "check": "Plan starts with eyes_list_chrome_tabs to see all tabs"
+    },
+    {
+      "name": "identifies-current-tab",
+      "description": "Claude calls eyes_context or asks which tab the user is reading before closing",
+      "type": "tool_param",
+      "check": "Plan uses eyes_context to determine active/focused tab, or asks user"
+    },
+    {
+      "name": "aware-of-index-shift",
+      "description": "Claude handles index shifting when closing multiple tabs",
+      "type": "behavior",
+      "check": "Plan either: closes from highest index first, re-lists tabs between closes, or uses title matching"
+    }
+  ]
+}
