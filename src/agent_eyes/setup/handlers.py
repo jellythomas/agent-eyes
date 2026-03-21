@@ -128,10 +128,44 @@ def handle_setup() -> str:
     lines.append("  Quick Setup")
     lines.append("=" * 60)
     lines.append("")
-    lines.append("Present ONE compact prompt to the user with these choices.")
-    lines.append("Show defaults with [brackets]. User just confirms or changes.")
+    lines.append("IMPORTANT: Present setup choices to the user using the BEST available UI.")
     lines.append("")
-    lines.append("FORMAT TO PRESENT (copy this style exactly):")
+    lines.append("OPTION 1 — Native multi-choice (Claude Code):")
+    lines.append("If the AskUserQuestion tool is available, use it to present 3 questions:")
+    lines.append("")
+    lines.append("  Question 1: \"Which competing MCP servers should agent-eyes replace?\"")
+    lines.append("    Header: \"Replace\"")
+    lines.append("    Options:")
+
+    # Build replace options dynamically
+    if len(competitor_list) == 1:
+        # Single competitor: All replaces just that one, so show specific options
+        lines.append(f"      - \"{competitor_list[0]['name']} (Recommended)\" → replace just this one")
+        lines.append(f"      - \"None\" → keep existing, just add agent-eyes")
+    else:
+        lines.append(f"      - \"All ({total} servers) (Recommended)\" → replace all competitors")
+        for c in competitor_list[:3]:  # Cap at 3 to fit AskUserQuestion's 4-option limit
+            lines.append(f"      - \"{c['name']} only\" → replace only this one")
+
+    lines.append("")
+    lines.append("  Question 2: \"Which AI tools should agent-eyes be configured in?\"")
+    lines.append("    Header: \"Tools\"")
+    lines.append("    Options:")
+    lines.append(f"      - \"All ({len(ai_tools)} tools) (Recommended)\" → " + ", ".join(
+        [t["name"] for t in ai_tools]
+    ))
+    if len(ai_tools) > 1:
+        for t in ai_tools[:3]:
+            lines.append(f"      - \"{t['name']} only\"")
+    lines.append("")
+    lines.append("  Question 3: \"What scope should the configuration be applied at?\"")
+    lines.append("    Header: \"Level\"")
+    lines.append("    Options:")
+    lines.append("      - \"Global (Recommended)\" → available in all projects")
+    lines.append("      - \"Project\" → only current project")
+    lines.append("")
+    lines.append("OPTION 2 — Text fallback (other AI tools):")
+    lines.append("If AskUserQuestion is NOT available, present as compact text:")
     lines.append("─────────────────────────────────────────────")
     lines.append(f"  Replace competitors?  [{all_letter}] " + " / ".join(
         [f"({c['option']}) {c['name']}" for c in competitor_list]
@@ -142,7 +176,6 @@ def handle_setup() -> str:
     ))
     lines.append(f"  Level?                [global] / project")
     lines.append("─────────────────────────────────────────────")
-    lines.append(f"  Press Enter to accept defaults, or type changes.")
     lines.append("")
     lines.append("After user responds, call eyes_setup_apply with their choices.")
     lines.append("All changes are backed up automatically.")
