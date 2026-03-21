@@ -65,6 +65,7 @@ def _auto_install_platform_deps() -> None:
 
     if sys.platform == "darwin":
         needed: list[str] = []
+        failed_mods: list[str] = []
         for mod, pkg in [
             ("ApplicationServices", "pyobjc-framework-ApplicationServices"),
             ("Quartz", "pyobjc-framework-Quartz"),
@@ -74,15 +75,21 @@ def _auto_install_platform_deps() -> None:
                 __import__(mod)
             except ImportError:
                 needed.append(pkg)
+                failed_mods.append(mod)
         if needed:
             logger.info("Auto-installing macOS native deps: %s", ", ".join(needed))
             _pip_install(needed)
+            # Remove failed-import sentinels from sys.modules so
+            # the retry import can actually find the new packages.
+            for mod in failed_mods:
+                sys.modules.pop(mod, None)
     elif sys.platform == "win32":
         try:
             __import__("pywinauto")
         except ImportError:
             logger.info("Auto-installing Windows native dep: pywinauto")
             _pip_install(["pywinauto"])
+            sys.modules.pop("pywinauto", None)
 
 
 def _get_native_adapter() -> BaseAdapter | None:
@@ -119,6 +126,12 @@ def _get_native_adapter() -> BaseAdapter | None:
     except Exception as exc:
         logger.warning("Auto-install of platform deps failed: %s", exc)
         return None
+
+    # After installing new packages via subprocess, Python's import
+    # machinery won't find them until we invalidate the finder caches.
+    # Without this, the retry below fails even though packages exist on disk.
+    import importlib
+    importlib.invalidate_caches()
 
     return _try_load()
 
