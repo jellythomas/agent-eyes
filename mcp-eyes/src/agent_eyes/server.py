@@ -352,6 +352,10 @@ TOOLS = [
                     "description": "Tab index (default 0)",
                     "default": 0,
                 },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID for native app polling (alternative to Chrome tab)",
+                },
             },
             "required": [],
         },
@@ -616,6 +620,29 @@ TOOLS = [
             "required": ["action", "name"],
         },
     ),
+    Tool(
+        name="eyes_get_subtree",
+        description=(
+            "Get the accessibility subtree rooted at a specific element. "
+            "Use to drill into complex UIs without loading the entire tree. "
+            "Much more efficient than re-fetching the full tree with higher depth."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Element ID to expand (from a previous eyes_get_tree)",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "How many levels deep to expand (default 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["id"],
+        },
+    ),
 ]
 
 
@@ -684,6 +711,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return _handle_element_at(args)
     elif name == "eyes_app":
         return _handle_app(args)
+    elif name == "eyes_get_subtree":
+        return _handle_get_subtree(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -1346,6 +1375,25 @@ async def _handle_wait_for(args: dict) -> str:
     if not role and not name:
         return "ERROR: Specify at least one of: role, name"
 
+    pid = args.get("pid")
+    if pid is not None and native_adapter:
+        # Native app polling — check for element appearance
+        start = time.time()
+        while time.time() - start < timeout:
+            if role or name:
+                elements = native_adapter.find_elements(pid, role=role, name=name)
+                if elements:
+                    # Register found elements
+                    for el in elements:
+                        registry._elements[el.id] = el
+                    el = elements[0]
+                    return (
+                        f"Found [{el.id}] {el.role} \"{el.name}\" "
+                        f"after {time.time() - start:.1f}s"
+                    )
+            await asyncio.sleep(0.5)
+        return f"Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
+
     err = await _ensure_tabs()
     if err:
         return err
@@ -1728,6 +1776,42 @@ def _handle_app(args: dict) -> str:
         return f"ERROR: App '{name}' not found running."
 
     return f"ERROR: Unknown action '{action}'. Use 'launch', 'quit', or 'focus'."
+
+
+def _handle_get_subtree(args: dict) -> str:
+    element_id = args.get("id")
+    max_depth = min(args.get("max_depth", 5), 15)
+    if element_id is None:
+        return "ERROR: id is required."
+
+    element = registry.get(element_id)
+    if element is None:
+        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    # Validate element is still alive
+    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+        if not native_adapter.is_element_valid(element):
+            return f"ERROR: Element [{element_id}] is stale. Call eyes_get_tree to refresh."
+
+    # Re-traverse from this element's platform_ref
+    if element.platform_ref is None:
+        return f"ERROR: Element [{element_id}] has no native reference for subtree expansion."
+
+    subtree = native_adapter._element_to_ui(element.platform_ref, 0, max_depth)
+    if subtree is None:
+        return f"ERROR: Could not expand subtree for [{element_id}]."
+
+    registry.register_tree(subtree, pid=element.pid)
+    text = subtree.to_text(max_depth=max_depth)
+
+    return (
+        f"Subtree of [{element_id}] ({_count_interactive(subtree)} interactive elements):\n\n"
+        f"{text}\n\n"
+        f"Use [id] numbers with eyes_click or eyes_type to interact."
+    )
 
 
 # ── Entry point ─────────────────────────────────────────────────────

@@ -71,6 +71,10 @@ class InputBackend(abc.ABC):
         """Bring a window to the foreground by PID."""
         ...
 
+    def double_click(self, x: int, y: int) -> bool:
+        """Double-click at absolute screen coordinates."""
+        return False
+
     def move_mouse(self, x: int, y: int) -> bool:
         """Move mouse to absolute screen coordinates without clicking."""
         return False
@@ -265,6 +269,31 @@ class MacOSInputBackend(InputBackend):
             return True
         except Exception as e:
             logger.error("macOS click failed: %s", e)
+            return False
+
+    def double_click(self, x: int, y: int) -> bool:
+        self._load()
+        Q = self._quartz
+        try:
+            point = Q.CGPointMake(x, y)
+            # Click 1
+            event = Q.CGEventCreateMouseEvent(None, Q.kCGEventLeftMouseDown, point, 0)
+            Q.CGEventSetIntegerValueField(event, Q.kCGMouseEventClickState, 1)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            event = Q.CGEventCreateMouseEvent(None, Q.kCGEventLeftMouseUp, point, 0)
+            Q.CGEventSetIntegerValueField(event, Q.kCGMouseEventClickState, 1)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            time.sleep(0.02)
+            # Click 2
+            event = Q.CGEventCreateMouseEvent(None, Q.kCGEventLeftMouseDown, point, 0)
+            Q.CGEventSetIntegerValueField(event, Q.kCGMouseEventClickState, 2)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            event = Q.CGEventCreateMouseEvent(None, Q.kCGEventLeftMouseUp, point, 0)
+            Q.CGEventSetIntegerValueField(event, Q.kCGMouseEventClickState, 2)
+            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            return True
+        except Exception as e:
+            logger.error("macOS double_click failed: %s", e)
             return False
 
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
