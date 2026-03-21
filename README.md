@@ -16,28 +16,17 @@ Instead of pixel-based screen capture, agent-eyes reads the OS accessibility tre
 
 ## Installation
 
-```bash
-uv pip install agent-eyes
-```
-
-### Platform extras
-
-```bash
-# macOS (recommended)
-uv pip install agent-eyes[macos]
-
-# Windows
-uv pip install agent-eyes[windows]
-
-# Linux — install AT-SPI2 via system package manager
-# apt install python3-pyatspi   (Debian/Ubuntu)
-# dnf install python3-pyatspi   (Fedora)
-```
-
-Or run directly without installing:
+Run directly via `uvx` (no install needed):
 
 ```bash
 uvx agent-eyes
+```
+
+### Linux only — install AT-SPI2 via system package manager
+
+```bash
+apt install python3-pyatspi   # Debian/Ubuntu
+dnf install python3-pyatspi   # Fedora
 ```
 
 **Requirements:** Python 3.10+ &bull; Chrome with `--remote-debugging-port=9222` for web tools
@@ -46,7 +35,7 @@ uvx agent-eyes
 
 ### As an MCP server
 
-Add to your Claude Code config (`~/.claude/settings.json`):
+Add to your Claude Code config (`~/.claude.json`):
 
 ```json
 {
