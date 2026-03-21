@@ -1109,8 +1109,20 @@ async def _handle_type(args: dict) -> str:
         if native_adapter.focus_element(element):
             time.sleep(0.1)
             if input_backend.clear_and_type(text):
-                # Verify the text actually landed — some apps (e.g. Jamf, secure input)
-                # silently ignore CGEvent keystrokes while AX set_value works.
+                # For web elements (React, Vue, Angular): SKIP verification.
+                # Web frameworks update AXValue asynchronously — reading it back
+                # at 0.15s falsely reports empty. And set_value fallback is WORSE
+                # for web apps (doesn't trigger framework state/event handlers).
+                # Keyboard injection IS the correct approach for web elements.
+                if is_web:
+                    return (
+                        f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" "
+                        f"(focus + keyboard injection)"
+                    )
+
+                # For native elements: verify the text actually landed.
+                # Some apps (e.g. Jamf, secure input) silently ignore CGEvent
+                # keystrokes while AX set_value works.
                 time.sleep(0.15)
                 verified = False
                 if element.platform_ref and hasattr(native_adapter, '_read_attr'):
