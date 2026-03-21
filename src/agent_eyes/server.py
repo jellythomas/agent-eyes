@@ -23,6 +23,7 @@ from .adapters.base import BaseAdapter, UIElement
 from .cdp import CDPClient
 from .registry import ElementRegistry
 from . import platform_utils as _pu
+from .__init__ import __version__
 from .input_sim import get_input_backend
 
 # AppleScript is macOS-only — import conditionally
@@ -46,7 +47,7 @@ def _maybe_auto_setup() -> str | None:
     _setup_checked = True
     try:
         from .setup.state import is_first_run, needs_rescan
-        if is_first_run() or needs_rescan("0.3.2"):
+        if is_first_run() or needs_rescan(__version__):
             from .setup.handlers import handle_setup
             return handle_setup()
     except Exception as e:

@@ -1,6 +1,6 @@
 [project]
 name = "agent-eyes"
-version = "0.3.2"
+dynamic = ["version"]
 description = "Accessibility-tree vision for AI agents — see and interact with ANY application without screenshots"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -60,6 +60,9 @@ agent-eyes = "agent_eyes.server:main"
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_eyes.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
