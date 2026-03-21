@@ -33,6 +33,26 @@ else:
 
 logger = logging.getLogger("agent-eyes")
 
+# ── First-run auto-setup (once per process) ─────────────────────────
+_setup_checked = False
+
+
+def _maybe_auto_setup() -> str | None:
+    """Run setup scan on first-ever run or version upgrade. Returns setup
+    result text if triggered, None otherwise. Runs at most once per process."""
+    global _setup_checked
+    if _setup_checked:
+        return None
+    _setup_checked = True
+    try:
+        from .setup.state import is_first_run, needs_rescan
+        if is_first_run() or needs_rescan("0.3.1"):
+            from .setup.handlers import handle_setup
+            return handle_setup()
+    except Exception as e:
+        logger.debug("Auto-setup skipped: %s", e)
+    return None
+
 # ── Platform detection ──────────────────────────────────────────────
 def _auto_install_platform_deps() -> None:
     """Install missing platform-specific dependencies at runtime.
@@ -874,7 +894,11 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
+        # Auto-setup on first tool call (first run or version upgrade only)
+        setup_msg = _maybe_auto_setup()
         result = await _dispatch(name, arguments)
+        if setup_msg:
+            result = f"{setup_msg}\n\n---\n\n{result}"
         return [TextContent(type="text", text=result)]
     except Exception as e:
         import traceback
@@ -971,22 +995,7 @@ def _handle_status() -> str:
     elif sys.platform != "darwin":
         lines.append("AppleScript fallback: N/A (macOS only) — CDP required for browser tabs")
 
-    # First-run detection — auto-trigger setup scan
-    try:
-        from .setup.state import is_first_run, needs_rescan
-        if is_first_run() or needs_rescan("0.3.1"):
-            lines.append("")
-            lines.append(">>> FIRST RUN — auto-scanning... <<<")
-            lines.append("")
-            try:
-                from .setup.handlers import handle_setup
-                setup_result = handle_setup()
-                lines.append(setup_result)
-            except Exception as e:
-                lines.append(f"Setup scan failed: {e}")
-                lines.append("Run eyes_setup manually to retry.")
-    except Exception:
-        pass  # Setup module not critical for status
+    # First-run auto-setup is now handled globally in call_tool()
 
     return "\n".join(lines)
 
