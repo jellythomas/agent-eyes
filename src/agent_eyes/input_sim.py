@@ -88,6 +88,10 @@ class InputBackend(abc.ABC):
         mod = "command" if sys.platform == "darwin" else "control"
         return self.hotkey(mod, "a")
 
+    def is_frontmost(self, pid: int) -> bool:
+        """Check if a given PID is the frontmost application."""
+        return False  # Override per platform
+
     def clear_field(self) -> bool:
         """Clear a text field like a human: select all, then delete."""
         if not self.select_all():
@@ -195,11 +199,17 @@ class MacOSInputBackend(InputBackend):
             logger.error("Unknown key: %s", key)
             return False
         try:
-            event = Q.CGEventCreateKeyboardEvent(None, key_code, True)
-            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            # Use kCGSessionEventTap (not kCGHIDEventTap) to target the
+            # frontmost app's session instead of broadcasting system-wide.
+            # kCGHIDEventTap posts at HID level where keys like Escape get
+            # intercepted by terminal emulators / Claude Code before reaching
+            # the target app.
+            source = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
+            event = Q.CGEventCreateKeyboardEvent(source, key_code, True)
+            Q.CGEventPost(Q.kCGSessionEventTap, event)
             time.sleep(0.01)
-            event = Q.CGEventCreateKeyboardEvent(None, key_code, False)
-            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            event = Q.CGEventCreateKeyboardEvent(source, key_code, False)
+            Q.CGEventPost(Q.kCGSessionEventTap, event)
             return True
         except Exception as e:
             logger.error("macOS press_key failed: %s", e)
@@ -228,18 +238,21 @@ class MacOSInputBackend(InputBackend):
             if key_code is None:
                 return False
 
+            # Use kCGSessionEventTap to target frontmost app (see press_key)
+            source = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
+
             # Key down with modifiers
-            event = Q.CGEventCreateKeyboardEvent(None, key_code, True)
+            event = Q.CGEventCreateKeyboardEvent(source, key_code, True)
             if flags:
                 Q.CGEventSetFlags(event, flags)
-            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            Q.CGEventPost(Q.kCGSessionEventTap, event)
             time.sleep(0.01)
 
             # Key up
-            event = Q.CGEventCreateKeyboardEvent(None, key_code, False)
+            event = Q.CGEventCreateKeyboardEvent(source, key_code, False)
             if flags:
                 Q.CGEventSetFlags(event, flags)
-            Q.CGEventPost(Q.kCGHIDEventTap, event)
+            Q.CGEventPost(Q.kCGSessionEventTap, event)
             return True
         except Exception as e:
             logger.error("macOS hotkey failed: %s", e)
@@ -359,6 +372,15 @@ class MacOSInputBackend(InputBackend):
             return True
         except Exception as e:
             logger.error("macOS paste_text failed: %s", e)
+            return False
+
+    def is_frontmost(self, pid: int) -> bool:
+        """Check if a given PID is the frontmost application."""
+        try:
+            from AppKit import NSWorkspace
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return front is not None and front.processIdentifier() == pid
+        except Exception:
             return False
 
     def activate_window(self, pid: int) -> bool:
