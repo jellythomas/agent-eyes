@@ -171,7 +171,7 @@ def handle_setup_apply(args: dict) -> str:
 
     # Mark as initialized
     mark_initialized(
-        version="0.2.3",
+        version="0.3.0",
         tools_configured=configure_tools,
         competitors_replaced=replace_competitors,
     )

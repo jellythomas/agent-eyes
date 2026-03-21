@@ -979,7 +979,7 @@ def _handle_status() -> str:
             lines.append(">>> FIRST RUN DETECTED <<<")
             lines.append("Run eyes_setup to scan your AI tools and discover competing")
             lines.append("browser/desktop automation MCP servers that agent-eyes can replace.")
-        elif needs_rescan("0.2.3"):
+        elif needs_rescan("0.3.0"):
             lines.append("")
             lines.append(">>> NEW VERSION — run eyes_setup to check for updates <<<")
     except Exception:
