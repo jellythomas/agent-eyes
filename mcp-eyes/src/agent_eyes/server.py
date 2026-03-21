@@ -101,7 +101,8 @@ TOOLS = [
             "This is the PRIMARY way to 'see' an application — no screenshot needed. "
             "For Chrome/Chromium browsers, automatically includes web page content "
             "(headings, buttons, inputs, links, chat items) via AppleScript on macOS "
-            "or CDP on all platforms (macOS/Linux/Windows)."
+            "or CDP on all platforms (macOS/Linux/Windows). "
+            "For large apps, use eyes_get_subtree to drill into specific sections."
         ),
         inputSchema={
             "type": "object",
@@ -144,6 +145,12 @@ TOOLS = [
                 "value": {
                     "type": "string",
                     "description": "Element value to match (partial, case-insensitive)",
+                },
+                "match": {
+                    "type": "string",
+                    "description": "Match type: 'contains' (default), 'exact', 'regex', 'prefix', 'suffix'",
+                    "default": "contains",
+                    "enum": ["contains", "exact", "regex", "prefix", "suffix"],
                 },
             },
             "required": [],
@@ -643,6 +650,32 @@ TOOLS = [
             "required": ["id"],
         },
     ),
+    Tool(
+        name="eyes_window",
+        description=(
+            "Manage application windows. Actions: 'list' (all windows with positions), "
+            "'focus' (bring to front), 'minimize', 'close', 'move' (x,y), 'resize' (w,h)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Action: 'list', 'focus', 'minimize', 'close', 'move', 'resize'",
+                    "enum": ["list", "focus", "minimize", "close", "move", "resize"],
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID (required for all actions except 'list')",
+                },
+                "x": {"type": "integer", "description": "X position for 'move' action"},
+                "y": {"type": "integer", "description": "Y position for 'move' action"},
+                "width": {"type": "integer", "description": "Width for 'resize' action"},
+                "height": {"type": "integer", "description": "Height for 'resize' action"},
+            },
+            "required": ["action"],
+        },
+    ),
 ]
 
 
@@ -713,6 +746,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return _handle_app(args)
     elif name == "eyes_get_subtree":
         return _handle_get_subtree(args)
+    elif name == "eyes_window":
+        return _handle_window(args)
     else:
         return f"Unknown tool: {name}"
 
@@ -864,11 +899,34 @@ def _count_interactive(element, _interactive_roles=frozenset({
     return count
 
 
+def _match_text(query: str, text: str, match_type: str = "contains") -> bool:
+    """Match text using the specified strategy."""
+    if not query:
+        return True
+    text_lower = text.lower()
+    query_lower = query.lower()
+    if match_type == "exact":
+        return text_lower == query_lower
+    elif match_type == "prefix":
+        return text_lower.startswith(query_lower)
+    elif match_type == "suffix":
+        return text_lower.endswith(query_lower)
+    elif match_type == "regex":
+        import re
+        try:
+            return bool(re.search(query, text, re.IGNORECASE))
+        except re.error:
+            return False
+    else:  # contains (default)
+        return query_lower in text_lower
+
+
 def _handle_find(args: dict) -> str:
     pid = args.get("pid")
     role = args.get("role", "")
     name = args.get("name", "")
     value = args.get("value", "")
+    match_type = args.get("match", "contains")
 
     if not role and not name and not value:
         return "ERROR: Specify at least one of: role, name, value"
@@ -878,8 +936,26 @@ def _handle_find(args: dict) -> str:
         # Re-register found elements
         for el in elements:
             registry._elements[el.id] = el
+        # Apply match-type filtering on name and value (find_elements uses contains)
+        if match_type != "contains":
+            elements = [
+                el for el in elements
+                if (not name or _match_text(name, el.name, match_type))
+                and (not value or _match_text(value, el.value, match_type))
+            ]
     else:
-        elements = registry.find(role, name, value)
+        # Filter from registry using _match_text
+        all_elements = list(registry._elements.values())
+        elements = []
+        for el in all_elements:
+            if role and role.lower() not in el.role.lower():
+                continue
+            if name and not _match_text(name, el.name, match_type):
+                continue
+            if value and not _match_text(value, el.value, match_type):
+                continue
+            if role or name or value:
+                elements.append(el)
 
     if not elements:
         return "No matching elements found."
@@ -1812,6 +1888,111 @@ def _handle_get_subtree(args: dict) -> str:
         f"{text}\n\n"
         f"Use [id] numbers with eyes_click or eyes_type to interact."
     )
+
+
+def _handle_window(args: dict) -> str:
+    action = args.get("action", "").lower()
+    pid = args.get("pid")
+
+    if action == "list":
+        if sys.platform != "darwin":
+            return "ERROR: Window listing currently supports macOS only."
+        try:
+            import Quartz
+            window_list = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            )
+            lines = ["Windows on screen:\n"]
+            for win in window_list:
+                layer = win.get(Quartz.kCGWindowLayer, 999)
+                if layer != 0:
+                    continue
+                w_pid = win.get(Quartz.kCGWindowOwnerPID, 0)
+                w_name = win.get(Quartz.kCGWindowOwnerName, "")
+                w_title = win.get(Quartz.kCGWindowName, "")
+                bounds = win.get(Quartz.kCGWindowBounds, {})
+                x = int(bounds.get("X", 0))
+                y = int(bounds.get("Y", 0))
+                w = int(bounds.get("Width", 0))
+                h = int(bounds.get("Height", 0))
+                lines.append(f"  PID {w_pid} | {w_name} | \"{w_title}\" | pos=({x},{y}) size={w}x{h}")
+            return "\n".join(lines) if len(lines) > 1 else "No windows found."
+        except ImportError:
+            return "ERROR: Quartz not available."
+
+    if pid is None:
+        return "ERROR: pid is required for this action."
+    if not native_adapter:
+        return "ERROR: No native adapter available."
+
+    # Get the app's window via AX
+    try:
+        from ApplicationServices import AXUIElementCreateApplication, AXValueCreate, kAXValueCGPointType, kAXValueCGSizeType
+        from Quartz import CGPoint, CGSize
+        ax_app = native_adapter._ax.AXUIElementCreateApplication(pid)
+        window = native_adapter._read_attr(ax_app, "AXFocusedWindow")
+        if window is None:
+            windows = native_adapter._read_attr(ax_app, "AXWindows")
+            if windows and len(windows) > 0:
+                window = windows[0]
+        if window is None:
+            return f"ERROR: No window found for PID {pid}."
+    except Exception as e:
+        return f"ERROR: Could not access window: {e}"
+
+    if action == "focus":
+        try:
+            native_adapter._ax.AXUIElementPerformAction(window, "AXRaise")
+            input_backend = get_input_backend()
+            if input_backend.is_available():
+                input_backend.activate_window(pid)
+            return f"Focused window for PID {pid}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "minimize":
+        try:
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXMinimized", True)
+            return f"Minimized window for PID {pid}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "close":
+        try:
+            close_button = native_adapter._read_attr(window, "AXCloseButton")
+            if close_button:
+                native_adapter._ax.AXUIElementPerformAction(close_button, "AXPress")
+                return f"Closed window for PID {pid}."
+            return "ERROR: No close button found."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "move":
+        x = args.get("x")
+        y = args.get("y")
+        if x is None or y is None:
+            return "ERROR: x and y are required for move."
+        try:
+            new_pos = AXValueCreate(kAXValueCGPointType, CGPoint(float(x), float(y)))
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXPosition", new_pos)
+            return f"Moved window to ({x}, {y})."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    elif action == "resize":
+        width = args.get("width")
+        height = args.get("height")
+        if width is None or height is None:
+            return "ERROR: width and height are required for resize."
+        try:
+            new_size = AXValueCreate(kAXValueCGSizeType, CGSize(float(width), float(height)))
+            native_adapter._ax.AXUIElementSetAttributeValue(window, "AXSize", new_size)
+            return f"Resized window to {width}x{height}."
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    return f"ERROR: Unknown action '{action}'."
 
 
 # ── Entry point ─────────────────────────────────────────────────────
