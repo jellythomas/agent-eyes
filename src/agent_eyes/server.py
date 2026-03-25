@@ -1024,14 +1024,22 @@ def _handle_status() -> str:
         ConnectionTier.NATIVE: "Tier 3 — Native AX + AppleScript (CDP not connected)",
     }.get(active_tier, str(active_tier))
 
+    ext_available = tier_manager.is_available(ConnectionTier.EXTENSION)
+    cdp_available = tier_manager.is_available(ConnectionTier.CDP)
+
     lines = [
         "=== agent-eyes status ===",
         f"Platform: {sys.platform}",
         _platform_status(),
         "",
         f"Active tier: {tier_label}",
-        f"Persistent CDP connected: {'yes' if cdp_pool.is_connected else 'no'} "
-        f"(port {cdp_pool.active_port}, {len(cdp_pool.list_tabs())} tab(s) tracked)",
+        "",
+        "Connection tiers:",
+        f"  Tier 1 — Chrome Extension Bridge: {'available' if ext_available else 'not connected'}"
+        " (no flags needed, cross-platform)",
+        f"  Tier 2 — CDP Persistent Connection: {'connected' if cdp_available else 'not connected'}"
+        f" (port {cdp_pool.active_port}, {len(cdp_pool.list_tabs())} tab(s) tracked)",
+        "  Tier 3 — Native Fallback: available (always)",
         "",
         f"Input backend: {input_backend.__class__.__name__} "
         f"({'available' if input_backend.is_available() else 'NOT available'})",
