@@ -21,6 +21,8 @@ from mcp.types import Tool, TextContent
 
 from .adapters.base import BaseAdapter, UIElement
 from .cdp import CDPClient
+from .cdp_persistent import CDPConnection as PersistentCDP
+from .tiers import TierManager, ConnectionTier
 from .registry import ElementRegistry
 from . import platform_utils as _pu
 from .__init__ import __version__
@@ -172,6 +174,8 @@ app = Server("agent-eyes")
 registry = ElementRegistry()
 native_adapter = _get_native_adapter()
 cdp_client = CDPClient()
+tier_manager = TierManager()
+cdp_pool = PersistentCDP()
 
 
 def _platform_status() -> str:
@@ -1424,6 +1428,45 @@ _cached_tabs: list = []
 _cached_tabs_time: float = 0
 
 
+async def _get_cdp_session(args: dict) -> tuple:
+    """Try to get a Tier 2 CDPSession for the requested tab.
+
+    Tries cdp_pool.ensure_connected() (Tier 2 persistent WebSocket) first.
+    Falls back to legacy cdp_client (Tier 3 per-request WebSocket) when the
+    persistent connection is unavailable.
+
+    Returns:
+        (session_or_None, tab_or_None, error_string)
+        - If Tier 2 succeeds: (CDPSession, ChromeTab, "")
+        - If Tier 2 fails and Tier 3 available: (None, ChromeTab, "")
+        - If both fail: (None, None, error_string)
+    """
+    tab_index = args.get("tab_index", 0)
+
+    # ── Tier 2: persistent WebSocket ──
+    try:
+        await cdp_pool.ensure_connected()
+        tabs = cdp_pool.list_tabs()
+        if tabs and tab_index < len(tabs):
+            session = cdp_pool.get_session_for_tab(tab_index)
+            if session is not None:
+                tier_manager.set_available(ConnectionTier.CDP, True)
+                return session, tabs[tab_index], ""
+    except Exception as exc:
+        logger.debug("_get_cdp_session: Tier 2 unavailable: %s", exc)
+
+    # ── Tier 3 fallback: legacy cdp_client ──
+    # _ensure_tabs / cdp_client are still used for all other handlers
+    err = await _ensure_tabs()
+    if not err:
+        tab, err = _get_tab(args)
+        if not err:
+            return None, tab, ""
+        return None, None, err
+
+    return None, None, err
+
+
 async def _handle_list_chrome_tabs() -> str:
     global _cached_tabs
 
@@ -1481,27 +1524,54 @@ async def _handle_get_web_tree(args: dict) -> str:
     tab_index = args.get("tab_index", 0)
     max_depth = min(args.get("max_depth", 5), 10)
 
-    if not _cached_tabs:
-        # Auto-fetch tabs via CDP
+    # Try Tier 2 (persistent CDP) then Tier 3 (legacy CDP)
+    session, tab, cdp_err = await _get_cdp_session(args)
+
+    if session is not None and tab is not None:
+        # Tier 2: get accessibility tree via persistent session
+        try:
+            await session.enable_domain("Accessibility")
+            result = await session.send(
+                "Accessibility.getFullAXTree", {"depth": max_depth}
+            )
+            nodes = result.get("nodes", [])
+            if nodes:
+                # Build tree using the legacy CDPClient helper (reuse parsing logic)
+                tree = cdp_client._build_tree(nodes)
+                if tree is not None:
+                    registry.register_tree(tree, pid=0)
+                    text = tree.to_text(max_depth=max_depth)
+                    return (
+                        f"Web accessibility tree for: {tab.title}\n"
+                        f"URL: {tab.url}\n"
+                        f"Elements: {registry.count()}\n\n"
+                        f"{text}\n\n"
+                        f"Use [id] numbers with eyes_click or eyes_type to interact."
+                    )
+        except Exception as exc:
+            logger.debug("_handle_get_web_tree: Tier 2 failed: %s", exc)
+            # Fall through to Tier 3
+
+    # Tier 3: legacy cdp_client (per-request WebSocket)
+    if tab is None:
+        # Auto-fetch tabs via legacy CDP if not yet available
         available = await cdp_client.is_available()
         if available:
             tabs = await cdp_client.list_tabs()
             _cached_tabs.extend(tabs)
 
-    # CDP path
     if _cached_tabs:
         if tab_index >= len(_cached_tabs):
             return f"ERROR: Tab index {tab_index} out of range. Only {len(_cached_tabs)} tabs available."
 
-        tab = _cached_tabs[tab_index]
-
-        tree = await cdp_client.get_accessibility_tree(tab, max_depth)
+        legacy_tab = _cached_tabs[tab_index]
+        tree = await cdp_client.get_accessibility_tree(legacy_tab, max_depth)
         if tree is not None:
             registry.register_tree(tree, pid=0)  # CDP elements don't have a native PID
             text = tree.to_text(max_depth=max_depth)
             return (
-                f"Web accessibility tree for: {tab.title}\n"
-                f"URL: {tab.url}\n"
+                f"Web accessibility tree for: {legacy_tab.title}\n"
+                f"URL: {legacy_tab.url}\n"
                 f"Elements: {registry.count()}\n\n"
                 f"{text}\n\n"
                 f"Use [id] numbers with eyes_click or eyes_type to interact."
@@ -1572,15 +1642,27 @@ async def _handle_navigate(args: dict) -> str:
     if not url:
         return "ERROR: url is required."
 
-    # Try CDP first
-    available = await cdp_client.is_available()
-    if available:
-        err = await _ensure_tabs(force=True)
-        if err:
-            return err
-        tab, err = _get_tab(args)
-        if err:
-            return err
+    # Try Tier 2 (persistent CDP) then Tier 3 (legacy CDP)
+    session, tab, cdp_err = await _get_cdp_session(args)
+
+    if tab is not None:
+        if session is not None:
+            # Tier 2: persistent WebSocket path
+            try:
+                await session.send("Page.navigate", {"url": url})
+                # Give the page a moment to start loading
+                await asyncio.sleep(0.3)
+                result = await session.send("Target.getTargetInfo", {"targetId": tab.id})
+                target_info = result.get("targetInfo", {})
+                return (
+                    f"Navigated to: {target_info.get('url', url)}\n"
+                    f"Title: {target_info.get('title', '(loading)')}"
+                )
+            except Exception as exc:
+                logger.debug("_handle_navigate: Tier 2 failed: %s", exc)
+                # Fall through to Tier 3
+
+        # Tier 3: legacy cdp_client
         result = await cdp_client.navigate(tab, url)
         if "error" in result:
             return f"ERROR: Navigation failed: {result['error']}"
@@ -1615,25 +1697,42 @@ async def _handle_evaluate(args: dict) -> str:
     if not expression:
         return "ERROR: expression is required."
 
-    # Try CDP first
     cdp_error = None
-    available = await cdp_client.is_available()
-    if available:
-        err = await _ensure_tabs()
-        if not err:
-            tab, err = _get_tab(args)
-            if not err:
-                result = await cdp_client.evaluate(tab, expression)
-                if "error" not in result:
-                    value = result.get("value")
-                    if value is None:
-                        return "Result: undefined"
-                    return f"Result: {json.dumps(value, indent=2, default=str) if not isinstance(value, str) else value}"
-                cdp_error = result.get("error", "unknown")
+
+    # Try Tier 2 (persistent CDP) then Tier 3 (legacy CDP)
+    session, tab, tier_err = await _get_cdp_session(args)
+
+    if session is not None:
+        # Tier 2: evaluate via persistent session
+        try:
+            await session.enable_domain("Runtime")
+            result = await session.send(
+                "Runtime.evaluate",
+                {"expression": expression, "returnByValue": True},
+            )
+            exc_details = result.get("exceptionDetails")
+            if exc_details:
+                cdp_error = exc_details.get("text", "runtime exception")
             else:
-                cdp_error = err
-        else:
-            cdp_error = err
+                value = result.get("result", {}).get("value")
+                if value is None:
+                    return "Result: undefined"
+                return f"Result: {json.dumps(value, indent=2, default=str) if not isinstance(value, str) else value}"
+        except Exception as exc:
+            logger.debug("_handle_evaluate: Tier 2 failed: %s", exc)
+            cdp_error = str(exc)
+
+    elif tab is not None:
+        # Tier 3: legacy cdp_client
+        result = await cdp_client.evaluate(tab, expression)
+        if "error" not in result:
+            value = result.get("value")
+            if value is None:
+                return "Result: undefined"
+            return f"Result: {json.dumps(value, indent=2, default=str) if not isinstance(value, str) else value}"
+        cdp_error = result.get("error", "unknown")
+    else:
+        cdp_error = tier_err
 
     # Fallback: AppleScript JS execution (macOS, no CDP needed)
     if _as is not None:
