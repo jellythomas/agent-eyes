@@ -29,7 +29,7 @@ apt install python3-pyatspi   # Debian/Ubuntu
 dnf install python3-pyatspi   # Fedora
 ```
 
-**Requirements:** Python 3.10+ &bull; Chrome with `--remote-debugging-port=9222` for web tools
+**Requirements:** Python 3.10+ &bull; Chrome Extension (recommended) or Chrome with `--remote-debugging-port=9222` for web tools
 
 ## Quick Start
 
@@ -132,25 +132,41 @@ This scans your machine for AI coding tools and competing MCP servers, then pres
 AI Agent
   ↓ MCP
 agent-eyes server
-  ├── Native Adapter (macOS / Windows / Linux)
-  │     └── OS Accessibility API → structured UI tree
-  ├── CDP Client (Chrome DevTools Protocol)
-  │     └── Chrome tabs → web accessibility tree + JS execution
-  └── Input Simulator
-        └── Real keyboard/mouse events → human-like interaction
+  ├── Tier 1: Chrome Extension Bridge (best — no flags, cross-platform)
+  │     └── chrome.scripting / chrome.tabs → fast web automation
+  ├── Tier 2: CDP Persistent Connection (fast — needs debugging port)
+  │     └── Single WebSocket + flat sessions → Chrome accessibility tree
+  ├── Tier 3: Native Fallback (always available)
+  │     ├── OS Accessibility API → structured UI tree
+  │     ├── AppleScript JS injection → web interaction (macOS)
+  │     └── Input Simulator → real keyboard/mouse events
+  └── Desktop/Native Apps
+        └── Always uses native accessibility (unchanged)
 ```
 
 1. **Read** — `eyes_get_tree` returns every button, text field, heading, link, etc. as a numbered tree
 2. **Find** — `eyes_find` searches by role/name/value, or `eyes_element_at` for coordinate lookup
 3. **Act** — `eyes_click`, `eyes_type`, `eyes_press_key` target elements by their `[id]`
 
+## Connection Tiers
+
+agent-eyes automatically selects the best available connection method:
+
+| Tier | Method | Setup Required | Performance | Cross-Platform |
+|------|--------|---------------|-------------|----------------|
+| 1 | Chrome Extension Bridge | Install extension | Fastest | Yes |
+| 2 | CDP Persistent Connection | `--remote-debugging-port=9222` flag | Fast | Yes |
+| 3 | Native Fallback | None | Good | Yes |
+
+Use `eyes_status` to see which tier is currently active.
+
 ## Supported Platforms
 
 | Platform | Native Adapter | Web (Chrome) | Shadow Mode |
 |----------|---------------|-------------|-------------|
-| macOS | AXUIElement + pyobjc | CDP + AppleScript fallback | Yes |
-| Windows | UI Automation + pywinauto | CDP | Yes |
-| Linux | AT-SPI2 + pyatspi | CDP | Yes |
+| macOS | AXUIElement + pyobjc (Tier 3) | Extension Bridge (Tier 1) or CDP (Tier 2) | Yes |
+| Windows | UI Automation + pywinauto (Tier 3) | Extension Bridge (Tier 1) or CDP (Tier 2) | Yes |
+| Linux | AT-SPI2 + pyatspi (Tier 3) | Extension Bridge (Tier 1) or CDP (Tier 2) | Yes |
 
 ## License
 

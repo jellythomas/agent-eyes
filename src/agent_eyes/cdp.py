@@ -220,7 +220,17 @@ class CDPClient:
 
         Enriches up to `limit` elements to keep CDP calls bounded.
         Returns number of elements enriched.
+
+        CSS.enable and DOM.enable are called once here before the walk,
+        not per-element inside _get_visual_summary / _get_box_model.
         """
+        # Enable domains once before walking the tree
+        await self._send(ws, "DOM.enable")
+        await self._send(ws, "CSS.enable")
+        return await self._enrich_subtree(ws, element, limit)
+
+    async def _enrich_subtree(self, ws, element: UIElement, limit: int) -> int:
+        """Recursive helper for _enrich_tree (domains already enabled)."""
         enriched = 0
         if enriched >= limit:
             return enriched
@@ -242,7 +252,7 @@ class CDPClient:
         for child in element.children:
             if enriched >= limit:
                 break
-            enriched += await self._enrich_tree(ws, child, limit - enriched)
+            enriched += await self._enrich_subtree(ws, child, limit - enriched)
 
         return enriched
 
@@ -276,9 +286,6 @@ class CDPClient:
             node_id = desc.get("node", {}).get("nodeId")
             if not node_id:
                 return ""
-
-            # Enable CSS domain if needed (idempotent)
-            await self._send(ws, "CSS.enable")
 
             result = await self._send(ws, "CSS.getComputedStyleForNode", {
                 "nodeId": node_id,
@@ -629,7 +636,12 @@ class CDPClient:
         return None
 
     async def new_tab(self, url: str = "about:blank") -> ChromeTab | None:
-        """Open a new browser tab via Target.createTarget and return it."""
+        """Open a new browser tab via Target.createTarget and return it.
+
+        For non-blank URLs, opens a WebSocket to the new tab and waits for
+        Page.loadEventFired or Page.domContentEventFired (up to 10s), then
+        fetches the actual page title — matching the behaviour of navigate().
+        """
         import websockets
 
         # Need an existing tab's WS URL to issue the browser-level command
@@ -648,10 +660,53 @@ class CDPClient:
 
             # Fetch the new tab's metadata from the JSON endpoint
             new_tabs = await self.list_tabs()
+            new_tab: ChromeTab | None = None
             for t in new_tabs:
                 if t.id == target_id:
-                    return t
-            return None
+                    new_tab = t
+                    break
+
+            if new_tab is None:
+                return None
+
+            # For non-blank URLs: wait for the page to load and get the real title
+            if url != "about:blank" and new_tab.ws_url:
+                try:
+                    async with websockets.connect(new_tab.ws_url) as ws:
+                        await self._send(ws, "Page.enable")
+
+                        # Wait for load event (up to 10s)
+                        deadline = time.monotonic() + 10
+                        while time.monotonic() < deadline:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                                msg = json.loads(raw)
+                                if msg.get("method") in (
+                                    "Page.loadEventFired",
+                                    "Page.domContentEventFired",
+                                ):
+                                    break
+                            except asyncio.TimeoutError:
+                                continue
+
+                        # Get the real page title after load
+                        doc = await self._send(
+                            ws, "Runtime.evaluate",
+                            {"expression": "document.title", "returnByValue": True},
+                        )
+                        title = doc.get("result", {}).get("value", "")
+                        if title:
+                            new_tab = ChromeTab(
+                                id=new_tab.id,
+                                title=title,
+                                url=url,
+                                ws_url=new_tab.ws_url,
+                            )
+                except Exception as e:
+                    logger.debug("new_tab page load wait failed: %s", e)
+                    # Return tab without title rather than failing entirely
+
+            return new_tab
         except Exception as e:
             logger.error("Failed to create new tab: %s", e)
             return None
