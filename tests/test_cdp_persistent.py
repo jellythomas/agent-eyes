@@ -1,0 +1,646 @@
+"""Tests for CDPConnection and CDPSession — persistent WebSocket CDP client.
+
+All tests mock websockets.connect so they run without a real Chrome instance.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from agent_eyes.cdp_persistent import CDPConnection, CDPSession, ChromeTab
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def make_response(msg_id: int, result: dict, session_id: str = "") -> str:
+    """Build a JSON-encoded CDP response string."""
+    msg: dict[str, Any] = {"id": msg_id, "result": result}
+    if session_id:
+        msg["sessionId"] = session_id
+    return json.dumps(msg)
+
+
+def make_event(method: str, params: dict, session_id: str = "") -> str:
+    """Build a JSON-encoded CDP event string."""
+    msg: dict[str, Any] = {"method": method, "params": params}
+    if session_id:
+        msg["sessionId"] = session_id
+    return json.dumps(msg)
+
+
+def make_attached_event(
+    target_id: str, session_id: str, url: str = "https://example.com", title: str = "Example"
+) -> str:
+    return make_event(
+        "Target.attachedToTarget",
+        {
+            "sessionId": session_id,
+            "targetInfo": {
+                "targetId": target_id,
+                "type": "page",
+                "url": url,
+                "title": title,
+                "webSocketDebuggerUrl": f"ws://127.0.0.1:9222/devtools/page/{target_id}",
+            },
+        },
+    )
+
+
+def make_detached_event(target_id: str, session_id: str) -> str:
+    return make_event(
+        "Target.detachedFromTarget",
+        {"sessionId": session_id, "targetId": target_id},
+    )
+
+
+class FakeWebSocket:
+    """Minimal WebSocket stub that lets tests inject messages."""
+
+    def __init__(self, messages: list[str] | None = None) -> None:
+        self._messages = list(messages or [])
+        self.sent: list[str] = []
+        self._closed = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+        for m in self._messages:
+            self._queue.put_nowait(m)
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self._closed = True
+
+    def push(self, message: str) -> None:
+        """Inject a message that the read loop will receive."""
+        self._queue.put_nowait(message)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        # Block until a message arrives or the queue is drained
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            raise StopAsyncIteration
+
+
+# ── ChromeTab ─────────────────────────────────────────────────────────────────
+
+
+class TestChromeTab:
+    def test_fields(self):
+        tab = ChromeTab(
+            id="abc",
+            title="My Tab",
+            url="https://example.com",
+            ws_url="ws://127.0.0.1:9222/devtools/page/abc",
+            session_id="sess1",
+        )
+        assert tab.id == "abc"
+        assert tab.title == "My Tab"
+        assert tab.url == "https://example.com"
+        assert tab.ws_url == "ws://127.0.0.1:9222/devtools/page/abc"
+        assert tab.session_id == "sess1"
+
+    def test_default_session_id_empty(self):
+        tab = ChromeTab(id="x", title="", url="", ws_url="")
+        assert tab.session_id == ""
+
+
+# ── CDPSession ────────────────────────────────────────────────────────────────
+
+
+class TestCDPSessionMessageRouting:
+    def _make_session(self) -> tuple[CDPSession, MagicMock]:
+        conn = MagicMock()
+        conn._next_id = AsyncMock(return_value=1)
+        conn._send_raw = AsyncMock()
+        session = CDPSession("sess-abc", conn)
+        return session, conn
+
+    def test_response_resolves_pending_future(self):
+        session, _ = self._make_session()
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            session._pending[42] = future
+            session._on_message({"id": 42, "result": {"value": 7}})
+            return await future
+
+        result = loop.run_until_complete(run())
+        loop.close()
+        assert result == {"id": 42, "result": {"value": 7}}
+
+    def test_unknown_response_id_is_ignored(self):
+        session, _ = self._make_session()
+        # Should not raise
+        session._on_message({"id": 999, "result": {}})
+
+    def test_event_dispatched_to_handler(self):
+        session, _ = self._make_session()
+        received = []
+        session.on_event("Page.loadEventFired", lambda p: received.append(p))
+        session._on_message({"method": "Page.loadEventFired", "params": {"timestamp": 1.0}})
+        assert received == [{"timestamp": 1.0}]
+
+    def test_event_no_handler_is_ignored(self):
+        session, _ = self._make_session()
+        # No handler registered — should not raise
+        session._on_message({"method": "Page.someUnknownEvent", "params": {}})
+
+    def test_multiple_handlers_for_same_event(self):
+        session, _ = self._make_session()
+        results = []
+        session.on_event("Network.responseReceived", lambda p: results.append("A"))
+        session.on_event("Network.responseReceived", lambda p: results.append("B"))
+        session._on_message({"method": "Network.responseReceived", "params": {}})
+        assert results == ["A", "B"]
+
+    def test_done_future_is_not_set_again(self):
+        session, _ = self._make_session()
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            future.set_result("already done")
+            session._pending[1] = future
+            # Should not raise InvalidStateError
+            session._on_message({"id": 1, "result": {}})
+
+        loop.run_until_complete(run())
+        loop.close()
+
+
+class TestCDPSessionDomainCaching:
+    def _make_session(self, send_result: dict | None = None) -> CDPSession:
+        conn = MagicMock()
+        conn._next_id = AsyncMock(side_effect=lambda: asyncio.get_event_loop().run_until_complete(
+            asyncio.coroutine(lambda: 1)()
+        ))
+        send_mock = AsyncMock(return_value=send_result or {})
+        session = CDPSession("sess-xyz", conn)
+        session.send = send_mock
+        return session
+
+    def test_enable_domain_calls_send_once(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            session = CDPSession("s1", MagicMock())
+            session.send = AsyncMock(return_value={})
+            await session.enable_domain("DOM")
+            await session.enable_domain("DOM")  # second call — must NOT resend
+            assert session.send.call_count == 1
+            session.send.assert_called_once_with("DOM.enable")
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_different_domains_each_enabled_once(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            session = CDPSession("s2", MagicMock())
+            session.send = AsyncMock(return_value={})
+            await session.enable_domain("DOM")
+            await session.enable_domain("CSS")
+            await session.enable_domain("DOM")
+            await session.enable_domain("CSS")
+            assert session.send.call_count == 2
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_enabled_domains_tracked(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            session = CDPSession("s3", MagicMock())
+            session.send = AsyncMock(return_value={})
+            await session.enable_domain("Accessibility")
+            assert "Accessibility" in session._enabled_domains
+
+        loop.run_until_complete(run())
+        loop.close()
+
+
+# ── CDPConnection state management ───────────────────────────────────────────
+
+
+class TestCDPConnectionDefaults:
+    def test_not_connected_by_default(self):
+        conn = CDPConnection()
+        assert conn.is_connected is False
+
+    def test_default_port(self):
+        conn = CDPConnection()
+        assert conn.active_port == 9222
+
+    def test_custom_port(self):
+        conn = CDPConnection(port=9333)
+        assert conn.active_port == 9333
+
+    def test_no_tabs_initially(self):
+        conn = CDPConnection()
+        assert conn.list_tabs() == []
+
+    def test_no_sessions_initially(self):
+        conn = CDPConnection()
+        assert conn._sessions == {}
+
+
+class TestCDPConnectionOnAttached:
+    def test_attaches_page_target(self):
+        conn = CDPConnection()
+        conn._on_attached({
+            "sessionId": "sess-1",
+            "targetInfo": {
+                "targetId": "target-1",
+                "type": "page",
+                "url": "https://example.com",
+                "title": "Example",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/target-1",
+            },
+        })
+        assert len(conn._tabs) == 1
+        assert len(conn._sessions) == 1
+        tab = conn._tabs[0]
+        assert tab.id == "target-1"
+        assert tab.session_id == "sess-1"
+        assert tab.url == "https://example.com"
+        assert "sess-1" in conn._sessions
+
+    def test_ignores_non_page_target(self):
+        conn = CDPConnection()
+        conn._on_attached({
+            "sessionId": "sess-sw",
+            "targetInfo": {
+                "targetId": "sw-1",
+                "type": "service_worker",
+                "url": "https://example.com/sw.js",
+                "title": "",
+                "webSocketDebuggerUrl": "",
+            },
+        })
+        assert conn._tabs == []
+        assert conn._sessions == {}
+
+    def test_ignores_missing_session_id(self):
+        conn = CDPConnection()
+        conn._on_attached({
+            "sessionId": "",
+            "targetInfo": {
+                "targetId": "t1",
+                "type": "page",
+                "url": "https://example.com",
+                "title": "X",
+                "webSocketDebuggerUrl": "",
+            },
+        })
+        assert conn._tabs == []
+
+    def test_multiple_tabs_tracked_in_order(self):
+        conn = CDPConnection()
+        for i in range(3):
+            conn._on_attached({
+                "sessionId": f"sess-{i}",
+                "targetInfo": {
+                    "targetId": f"target-{i}",
+                    "type": "page",
+                    "url": f"https://tab{i}.com",
+                    "title": f"Tab {i}",
+                    "webSocketDebuggerUrl": "",
+                },
+            })
+        assert len(conn._tabs) == 3
+        assert conn._tabs[0].url == "https://tab0.com"
+        assert conn._tabs[2].url == "https://tab2.com"
+
+
+class TestCDPConnectionOnDetached:
+    def _attach(self, conn: CDPConnection, target_id: str, session_id: str) -> None:
+        conn._on_attached({
+            "sessionId": session_id,
+            "targetInfo": {
+                "targetId": target_id,
+                "type": "page",
+                "url": "https://example.com",
+                "title": "Tab",
+                "webSocketDebuggerUrl": "",
+            },
+        })
+
+    def test_detach_removes_session_and_tab(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "s1")
+        conn._on_detached({"sessionId": "s1", "targetId": "t1"})
+        assert conn._tabs == []
+        assert "s1" not in conn._sessions
+        assert "t1" not in conn._tab_by_target
+
+    def test_detach_unknown_target_is_safe(self):
+        conn = CDPConnection()
+        # Should not raise
+        conn._on_detached({"sessionId": "ghost-sess", "targetId": "ghost-target"})
+
+    def test_detach_only_removes_correct_tab(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "s1")
+        self._attach(conn, "t2", "s2")
+        conn._on_detached({"sessionId": "s1", "targetId": "t1"})
+        assert len(conn._tabs) == 1
+        assert conn._tabs[0].id == "t2"
+        assert "s2" in conn._sessions
+
+
+class TestCDPConnectionGetSessionForTab:
+    def _attach(self, conn: CDPConnection, target_id: str, session_id: str) -> None:
+        conn._on_attached({
+            "sessionId": session_id,
+            "targetInfo": {
+                "targetId": target_id,
+                "type": "page",
+                "url": "https://example.com",
+                "title": "Tab",
+                "webSocketDebuggerUrl": "",
+            },
+        })
+
+    def test_returns_session_for_valid_index(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "s1")
+        session = conn.get_session_for_tab(0)
+        assert session is not None
+        assert session.session_id == "s1"
+
+    def test_returns_none_for_out_of_range(self):
+        conn = CDPConnection()
+        assert conn.get_session_for_tab(0) is None
+        assert conn.get_session_for_tab(-1) is None
+
+    def test_returns_correct_session_by_index(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "s1")
+        self._attach(conn, "t2", "s2")
+        s0 = conn.get_session_for_tab(0)
+        s1 = conn.get_session_for_tab(1)
+        assert s0.session_id == "s1"
+        assert s1.session_id == "s2"
+
+
+class TestCDPConnectionMessageIdMonotonicity:
+    def test_ids_are_strictly_increasing(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ids = [await conn._next_id() for _ in range(10)]
+            return ids
+
+        ids = loop.run_until_complete(run())
+        loop.close()
+        assert ids == list(range(1, 11))
+
+    def test_ids_start_at_one(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            return await conn._next_id()
+
+        first = loop.run_until_complete(run())
+        loop.close()
+        assert first == 1
+
+    def test_ids_never_repeat(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ids = [await conn._next_id() for _ in range(100)]
+            return ids
+
+        ids = loop.run_until_complete(run())
+        loop.close()
+        assert len(ids) == len(set(ids))
+
+
+class TestCDPConnectionConnectWithMock:
+    """Integration-style tests using a mocked WebSocket."""
+
+    def _make_fake_ws(self, messages: list[str] | None = None) -> FakeWebSocket:
+        return FakeWebSocket(messages)
+
+    def test_connect_sets_connected(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ws = self._make_fake_ws()
+
+            # Inject a response for Target.setAutoAttach
+            async def fake_connect(url, **kwargs):
+                return ws
+
+            with patch("websockets.connect", new=fake_connect):
+                # Patch _send_browser to avoid timing issues in tests
+                async def fake_send_browser(method, params=None):
+                    return {}
+
+                conn._send_browser = fake_send_browser
+                await conn.connect("ws://127.0.0.1:9222/json/version")
+
+            assert conn.is_connected is True
+            await conn.disconnect()
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_disconnect_sets_not_connected(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ws = self._make_fake_ws()
+
+            async def fake_connect(url, **kwargs):
+                return ws
+
+            async def fake_send_browser(method, params=None):
+                return {}
+
+            conn._send_browser = fake_send_browser
+            with patch("websockets.connect", new=fake_connect):
+                await conn.connect("ws://127.0.0.1:9222/json/version")
+            await conn.disconnect()
+            assert conn.is_connected is False
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_connect_is_idempotent(self):
+        """Calling connect twice should not open a second WebSocket."""
+        loop = asyncio.new_event_loop()
+        call_count = 0
+
+        async def run():
+            nonlocal call_count
+            conn = CDPConnection()
+            ws = self._make_fake_ws()
+
+            async def fake_connect(url, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return ws
+
+            async def fake_send_browser(method, params=None):
+                return {}
+
+            conn._send_browser = fake_send_browser
+            with patch("websockets.connect", new=fake_connect):
+                await conn.connect("ws://127.0.0.1:9222/json/version")
+                await conn.connect("ws://127.0.0.1:9222/json/version")  # second call
+
+            await conn.disconnect()
+
+        loop.run_until_complete(run())
+        loop.close()
+        assert call_count == 1
+
+
+class TestCDPConnectionReadLoop:
+    """Test that the read loop dispatches messages correctly."""
+
+    def test_attached_event_registers_session(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ws = FakeWebSocket()
+            conn._ws = ws
+            conn._connected = True
+
+            # Start read loop
+            task = asyncio.create_task(conn._read_loop())
+
+            # Push an attachedToTarget event
+            ws.push(make_attached_event("t1", "sess-1", url="https://test.com"))
+
+            # Give the loop time to process
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert len(conn._tabs) == 1
+            assert conn._tabs[0].url == "https://test.com"
+            assert "sess-1" in conn._sessions
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_detached_event_removes_session(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            # Pre-populate a tab
+            conn._on_attached({
+                "sessionId": "sess-2",
+                "targetInfo": {
+                    "targetId": "t2",
+                    "type": "page",
+                    "url": "https://bye.com",
+                    "title": "Bye",
+                    "webSocketDebuggerUrl": "",
+                },
+            })
+            assert len(conn._tabs) == 1
+
+            ws = FakeWebSocket()
+            conn._ws = ws
+            conn._connected = True
+            task = asyncio.create_task(conn._read_loop())
+
+            ws.push(make_detached_event("t2", "sess-2"))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert conn._tabs == []
+            assert "sess-2" not in conn._sessions
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_session_message_routed_to_correct_session(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            # Manually register a session so we can check routing
+            session = CDPSession("sess-A", conn)
+            conn._sessions["sess-A"] = session
+            received = []
+            session.on_event("Page.loadEventFired", lambda p: received.append(p))
+
+            ws = FakeWebSocket()
+            conn._ws = ws
+            conn._connected = True
+            task = asyncio.create_task(conn._read_loop())
+
+            # Push an event for sess-A
+            msg = make_event(
+                "Page.loadEventFired",
+                {"timestamp": 42.0},
+                session_id="sess-A",
+            )
+            ws.push(msg)
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert received == [{"timestamp": 42.0}]
+
+        loop.run_until_complete(run())
+        loop.close()
+
+    def test_bad_json_is_skipped(self):
+        loop = asyncio.new_event_loop()
+
+        async def run():
+            conn = CDPConnection()
+            ws = FakeWebSocket()
+            conn._ws = ws
+            conn._connected = True
+            task = asyncio.create_task(conn._read_loop())
+
+            ws.push("{not valid json")
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            # Connection should still be alive (no crash)
+            assert conn._connected is True
+
+        loop.run_until_complete(run())
+        loop.close()
