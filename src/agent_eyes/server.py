@@ -25,6 +25,7 @@ from .registry import ElementRegistry
 from . import platform_utils as _pu
 from .__init__ import __version__
 from .input_sim import get_input_backend
+from .js_bridge import build_ax_tree_script, format_ax_tree
 
 # AppleScript is macOS-only — import conditionally
 if sys.platform == "darwin":
@@ -803,11 +804,21 @@ TOOLS = [
         description=(
             "Get a quick context snapshot: frontmost app, active window, focused element, "
             "and a summary of interactive elements. One call instead of multiple tools. "
-            "Use this to orient yourself before interacting with an app."
+            "Use this to orient yourself before interacting with an app. "
+            "Set fast=True for a lightweight snapshot (app+window+focus only, no tree traversal)."
         ),
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "fast": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return only app name, window title, and focused element "
+                        "(skips full tree traversal — much faster)."
+                    ),
+                    "default": False,
+                },
+            },
             "required": [],
         },
     ),
@@ -1484,34 +1495,60 @@ async def _handle_list_chrome_tabs() -> str:
 
 async def _handle_get_web_tree(args: dict) -> str:
     tab_index = args.get("tab_index", 0)
-
-    if not _cached_tabs:
-        # Auto-fetch tabs
-        available = await cdp_client.is_available()
-        if not available:
-            return "Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
-        tabs = await cdp_client.list_tabs()
-        _cached_tabs.extend(tabs)
-
-    if tab_index >= len(_cached_tabs):
-        return f"ERROR: Tab index {tab_index} out of range. Only {len(_cached_tabs)} tabs available."
-
-    tab = _cached_tabs[tab_index]
     max_depth = min(args.get("max_depth", 5), 10)
 
-    tree = await cdp_client.get_accessibility_tree(tab, max_depth)
-    if tree is None:
-        return f"ERROR: Could not get accessibility tree for tab '{tab.title}'"
+    if not _cached_tabs:
+        # Auto-fetch tabs via CDP
+        available = await cdp_client.is_available()
+        if available:
+            tabs = await cdp_client.list_tabs()
+            _cached_tabs.extend(tabs)
 
-    registry.register_tree(tree, pid=0)  # CDP elements don't have a native PID
-    text = tree.to_text(max_depth=max_depth)
+    # CDP path
+    if _cached_tabs:
+        if tab_index >= len(_cached_tabs):
+            return f"ERROR: Tab index {tab_index} out of range. Only {len(_cached_tabs)} tabs available."
+
+        tab = _cached_tabs[tab_index]
+
+        tree = await cdp_client.get_accessibility_tree(tab, max_depth)
+        if tree is not None:
+            registry.register_tree(tree, pid=0)  # CDP elements don't have a native PID
+            text = tree.to_text(max_depth=max_depth)
+            return (
+                f"Web accessibility tree for: {tab.title}\n"
+                f"URL: {tab.url}\n"
+                f"Elements: {registry.count()}\n\n"
+                f"{text}\n\n"
+                f"Use [id] numbers with eyes_click or eyes_type to interact."
+            )
+
+    # Fallback: AppleScript JS injection (macOS only, no CDP required)
+    if sys.platform == "darwin" and _as is not None and _as.is_available():
+        script = build_ax_tree_script(max_depth=max_depth)
+        raw = _as.execute_javascript(script, tab_index=tab_index)
+        if raw:
+            try:
+                import json as _json
+                tree_dict = _json.loads(raw)
+                text = format_ax_tree(tree_dict)
+                # Get tab info for context
+                as_tabs = _as.list_chrome_tabs()
+                tab_title = as_tabs[tab_index].title if as_tabs and tab_index < len(as_tabs) else "unknown"
+                tab_url = as_tabs[tab_index].url if as_tabs and tab_index < len(as_tabs) else "unknown"
+                return (
+                    f"Web accessibility tree for: {tab_title}\n"
+                    f"URL: {tab_url}\n"
+                    "(via AppleScript JS injection — CDP not available)\n\n"
+                    f"{text}\n\n"
+                    "Note: element [id]s are JS-generated — use eyes_shadow for interaction without CDP."
+                )
+            except Exception as e:
+                logger.debug("AppleScript web tree parse failed: %s", e)
 
     return (
-        f"Web accessibility tree for: {tab.title}\n"
-        f"URL: {tab.url}\n"
-        f"Elements: {registry.count()}\n\n"
-        f"{text}\n\n"
-        f"Use [id] numbers with eyes_click or eyes_type to interact."
+        "ERROR: This feature requires Chrome Extension (Tier 1) or CDP (Tier 2). "
+        "Start Chrome with: --remote-debugging-port=9222"
     )
 
 
@@ -1740,19 +1777,37 @@ async def _handle_wait_for(args: dict) -> str:
         return f"Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
 
     err = await _ensure_tabs()
-    if err:
-        return err
-    tab, err = _get_tab(args)
-    if err:
-        return err
+    if not err:
+        tab, err = _get_tab(args)
+        if not err:
+            element = await cdp_client.wait_for_element(tab, role, name, timeout)
+            if element:
+                registry._elements[element.id] = element
+                return (
+                    f"Found element: [{element.id}] {element.role} \"{element.name}\"\n"
+                    f"Use this [id] with eyes_click or eyes_type."
+                )
+            return f"Timeout: element not found after {timeout}s (role={role!r}, name={name!r})"
 
-    element = await cdp_client.wait_for_element(tab, role, name, timeout)
-    if element:
-        registry._elements[element.id] = element
-        return (
-            f"Found element: [{element.id}] {element.role} \"{element.name}\"\n"
-            f"Use this [id] with eyes_click or eyes_type."
-        )
+    # Fallback: AppleScript shadow_read_interactive polling (macOS only)
+    if sys.platform == "darwin" and _as is not None and _as.is_available():
+        tab_index = args.get("tab_index", 0)
+        start = time.time()
+        while time.time() - start < timeout:
+            content = _as.shadow_read_interactive(tab_index=tab_index)
+            if content:
+                role_match = not role or role.lower() in content.lower()
+                name_match = not name or name.lower() in content.lower()
+                if role_match and name_match:
+                    return (
+                        f"Found element matching role={role!r} name={name!r} "
+                        f"after {time.time() - start:.1f}s "
+                        "(via AppleScript polling — CDP not available)\n"
+                        f"Content snippet:\n{content[:500]}"
+                    )
+            await asyncio.sleep(0.5)
+        return f"Timeout: element not found after {timeout}s (role={role!r}, name={name!r})"
+
     return f"Timeout: element not found after {timeout}s (role={role!r}, name={name!r})"
 
 
@@ -1802,6 +1857,44 @@ async def _handle_close_tab(args: dict) -> str:
     # Always force-refresh tabs for destructive operations
     err = await _ensure_tabs(force=True)
     if err:
+        # Fallback: AppleScript close tab (macOS only)
+        if sys.platform == "darwin" and _as is not None and _as.is_available():
+            title_query = args.get("title")
+            idx = args.get("tab_index", 0)
+
+            # Find tab index by title if provided
+            if title_query:
+                as_tabs = _as.list_chrome_tabs()
+                query_lower = title_query.lower()
+                matches = [(t.index, t) for t in as_tabs if query_lower in t.title.lower()]
+                if not matches:
+                    tab_list = "\n".join(f"  [{t.index}] {t.title}" for t in as_tabs)
+                    return f"ERROR: No tab matching '{title_query}'. Open tabs:\n{tab_list}"
+                if len(matches) > 1:
+                    match_list = "\n".join(f"  [{t.index}] {t.title}" for _, t in matches)
+                    return (
+                        f"ERROR: Multiple tabs match '{title_query}'. "
+                        f"Specify tab_index:\n{match_list}"
+                    )
+                idx, matched_tab = matches[0]
+
+            # Close via AppleScript
+            close_script = f'''
+            tell application "Google Chrome"
+                close tab {idx + 1} of window 1
+            end tell
+            '''
+            import subprocess as _sp
+            result = _sp.run(
+                ["osascript", "-e", close_script],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return (
+                    f"Closed tab [{idx}] (via AppleScript — CDP not available)"
+                )
+            return f"ERROR: AppleScript close tab failed: {result.stderr.strip()}"
+
         return err
 
     title_query = args.get("title")
@@ -1848,19 +1941,23 @@ async def _handle_close_tab(args: dict) -> str:
 
 async def _handle_dialog(args: dict) -> str:
     err = await _ensure_tabs()
-    if err:
-        return err
-    tab, err = _get_tab(args)
-    if err:
-        return err
+    if not err:
+        tab, err = _get_tab(args)
+        if not err:
+            accept = args.get("accept", True)
+            prompt_text = args.get("prompt_text", "")
+            success = await cdp_client.handle_dialog(tab, accept, prompt_text)
+            if success:
+                action = "Accepted" if accept else "Dismissed"
+                return f"{action} dialog."
+            return "ERROR: No dialog to handle or dialog handling failed."
 
-    accept = args.get("accept", True)
-    prompt_text = args.get("prompt_text", "")
-    success = await cdp_client.handle_dialog(tab, accept, prompt_text)
-    if success:
-        action = "Accepted" if accept else "Dismissed"
-        return f"{action} dialog."
-    return "ERROR: No dialog to handle or dialog handling failed."
+    # Limited fallback: JavaScript dialogs block the page event loop so AppleScript
+    # cannot interact with them. CDP is required for reliable dialog handling.
+    return (
+        "ERROR: Handling JavaScript dialogs requires CDP (Chrome DevTools Protocol). "
+        "Start Chrome with --remote-debugging-port=9222 to use this feature."
+    )
 
 
 async def _handle_file_upload(args: dict) -> str:
@@ -1885,19 +1982,25 @@ async def _handle_file_upload(args: dict) -> str:
     if element is None:
         return f"ERROR: Element [{element_id}] not found."
     if element.source != "cdp" or element.platform_ref is None:
-        return f"ERROR: Element [{element_id}] is not a web element."
+        return (
+            "ERROR: File upload requires CDP (Chrome DevTools Protocol). "
+            "Start Chrome with --remote-debugging-port=9222 to use this feature."
+        )
 
     err = await _ensure_tabs()
-    if err:
-        return err
-    tab, err = _get_tab(args)
-    if err:
-        return err
+    if not err:
+        tab, err = _get_tab(args)
+        if not err:
+            success = await cdp_client.set_file_input(tab, element.platform_ref, validated)
+            if success:
+                return f"Uploaded {len(validated)} file(s) to [{element_id}]."
+            return "ERROR: File upload failed."
 
-    success = await cdp_client.set_file_input(tab, element.platform_ref, validated)
-    if success:
-        return f"Uploaded {len(validated)} file(s) to [{element_id}]."
-    return "ERROR: File upload failed."
+    # Limited fallback: DOM.setFileInputFiles requires CDP — no AppleScript equivalent.
+    return (
+        "ERROR: File upload requires CDP (Chrome DevTools Protocol). "
+        "Start Chrome with --remote-debugging-port=9222 to use this feature."
+    )
 
 
 async def _handle_scroll(args: dict) -> str:
@@ -1944,22 +2047,34 @@ async def _handle_drag(args: dict) -> str:
         if args.get(field) is None:
             return f"ERROR: {field} is required."
 
-    err = await _ensure_tabs()
-    if err:
-        return err
-    tab, err = _get_tab(args)
-    if err:
-        return err
+    from_x = args["from_x"]
+    from_y = args["from_y"]
+    to_x = args["to_x"]
+    to_y = args["to_y"]
 
-    success = await cdp_client.drag(
-        tab, args["from_x"], args["from_y"], args["to_x"], args["to_y"]
+    err = await _ensure_tabs()
+    if not err:
+        tab, err = _get_tab(args)
+        if not err:
+            success = await cdp_client.drag(tab, from_x, from_y, to_x, to_y)
+            if success:
+                return f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y})"
+            return "ERROR: Drag failed."
+
+    # Fallback: OS input simulation (works for native apps and browser windows)
+    input_backend = get_input_backend()
+    if input_backend.is_available() and hasattr(input_backend, "drag"):
+        success = input_backend.drag(from_x, from_y, to_x, to_y)
+        if success:
+            return (
+                f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y}) "
+                "(via OS input simulation — CDP not available)"
+            )
+
+    return (
+        "ERROR: This feature requires Chrome Extension (Tier 1) or CDP (Tier 2). "
+        "Start Chrome with: --remote-debugging-port=9222"
     )
-    if success:
-        return (
-            f"Dragged from ({args['from_x']}, {args['from_y']}) "
-            f"to ({args['to_x']}, {args['to_y']})"
-        )
-    return "ERROR: Drag failed."
 
 
 async def _handle_fill_form(args: dict) -> str:
@@ -1968,34 +2083,62 @@ async def _handle_fill_form(args: dict) -> str:
         return "ERROR: fields list is required."
 
     err = await _ensure_tabs()
-    if err:
-        return err
-    tab = _cached_tabs[0]
+    if not err:
+        tab = _cached_tabs[0]
 
-    filled = []
-    errors = []
-    for field in fields:
-        eid = field.get("id")
-        value = field.get("value", "")
-        element = registry.get(eid)
-        if element is None:
-            errors.append(f"[{eid}] not found")
-            continue
-        if element.source != "cdp" or element.platform_ref is None:
-            errors.append(f"[{eid}] not a web element")
-            continue
-        success = await cdp_client.type_text(tab, element.platform_ref, value)
-        if success:
-            filled.append(f"[{eid}] {element.role} \"{element.name}\" = \"{value}\"")
-        else:
-            errors.append(f"[{eid}] type failed")
+        filled = []
+        errors = []
+        for field in fields:
+            eid = field.get("id")
+            value = field.get("value", "")
+            element = registry.get(eid)
+            if element is None:
+                errors.append(f"[{eid}] not found")
+                continue
+            if element.source != "cdp" or element.platform_ref is None:
+                errors.append(f"[{eid}] not a web element")
+                continue
+            success = await cdp_client.type_text(tab, element.platform_ref, value)
+            if success:
+                filled.append(f"[{eid}] {element.role} \"{element.name}\" = \"{value}\"")
+            else:
+                errors.append(f"[{eid}] type failed")
 
-    parts = []
-    if filled:
-        parts.append(f"Filled {len(filled)} field(s):\n" + "\n".join(f"  {f}" for f in filled))
-    if errors:
-        parts.append(f"Errors:\n" + "\n".join(f"  {e}" for e in errors))
-    return "\n".join(parts) or "No fields processed."
+        parts = []
+        if filled:
+            parts.append(f"Filled {len(filled)} field(s):\n" + "\n".join(f"  {f}" for f in filled))
+        if errors:
+            parts.append(f"Errors:\n" + "\n".join(f"  {e}" for e in errors))
+        return "\n".join(parts) or "No fields processed."
+
+    # Fallback: AppleScript shadow_type per field (macOS only)
+    if sys.platform == "darwin" and _as is not None and _as.is_available():
+        tab_index = args.get("tab_index", 0)
+        filled = []
+        errors = []
+        for field in fields:
+            eid = field.get("id")
+            value = field.get("value", "")
+            ok = _as.shadow_type(value, tab_index=tab_index)
+            if ok:
+                filled.append(f"[{eid}] = \"{value}\"")
+            else:
+                errors.append(f"[{eid}] type failed")
+
+        parts = []
+        if filled:
+            parts.append(
+                f"Filled {len(filled)} field(s) (via AppleScript — CDP not available):\n"
+                + "\n".join(f"  {f}" for f in filled)
+            )
+        if errors:
+            parts.append("Errors:\n" + "\n".join(f"  {e}" for e in errors))
+        return "\n".join(parts) or "No fields processed."
+
+    return (
+        "ERROR: This feature requires Chrome Extension (Tier 1) or CDP (Tier 2). "
+        "Start Chrome with: --remote-debugging-port=9222"
+    )
 
 
 def _handle_get_ocr_hints(args: dict) -> str:
@@ -2299,6 +2442,27 @@ def _handle_window(args: dict) -> str:
 def _handle_context(args: dict) -> str:
     if not native_adapter:
         return "ERROR: No native adapter available."
+
+    fast = args.get("fast", False)
+
+    # Fast mode: return only app name + window title + focused element.
+    # Skip full tree traversal for speed.
+    if fast:
+        apps = native_adapter.list_apps()
+        frontmost = next((a for a in apps if a.is_frontmost), None)
+
+        lines = []
+        if frontmost:
+            lines.append(f"Frontmost app: {frontmost.name} (PID {frontmost.pid})")
+            if frontmost.windows:
+                lines.append(f"Active window: \"{frontmost.windows[0]}\"")
+            focused = native_adapter.get_focused_element()
+            if focused:
+                registry._elements[focused.id] = focused
+                lines.append(f"Focused: [{focused.id}] {focused.role} \"{focused.name}\"")
+        else:
+            lines.append("No frontmost app detected.")
+        return "\n".join(lines)
 
     lines = []
 
