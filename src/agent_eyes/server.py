@@ -1013,10 +1013,25 @@ def _handle_status() -> str:
     discovered_port = _pu.discover_cdp_port()
     input_backend = get_input_backend()
 
+    # Determine active tier for status report
+    active_tier = tier_manager.best_tier()
+    if cdp_pool.is_connected:
+        tier_manager.set_available(ConnectionTier.CDP, True)
+        active_tier = tier_manager.best_tier()
+    tier_label = {
+        ConnectionTier.EXTENSION: "Tier 1 — Chrome Extension",
+        ConnectionTier.CDP: "Tier 2 — Persistent CDP WebSocket",
+        ConnectionTier.NATIVE: "Tier 3 — Native AX + AppleScript (CDP not connected)",
+    }.get(active_tier, str(active_tier))
+
     lines = [
         "=== agent-eyes status ===",
         f"Platform: {sys.platform}",
         _platform_status(),
+        "",
+        f"Active tier: {tier_label}",
+        f"Persistent CDP connected: {'yes' if cdp_pool.is_connected else 'no'} "
+        f"(port {cdp_pool.active_port}, {len(cdp_pool.list_tabs())} tab(s) tracked)",
         "",
         f"Input backend: {input_backend.__class__.__name__} "
         f"({'available' if input_backend.is_available() else 'NOT available'})",
@@ -1424,8 +1439,9 @@ def _handle_get_focused() -> str:
 
 
 # ── CDP handlers ────────────────────────────────────────────────────
+# _cached_tabs_time removed — Tier 2 (cdp_pool) tracks tabs via auto-attach;
+# Tier 3 (_ensure_tabs) uses its own 30-second cache window internally.
 _cached_tabs: list = []
-_cached_tabs_time: float = 0
 
 
 async def _get_cdp_session(args: dict) -> tuple:
@@ -1611,19 +1627,22 @@ async def _handle_get_web_tree(args: dict) -> str:
 async def _ensure_tabs(force: bool = False) -> str:
     """Ensure cached tabs are available. Returns error string or empty.
 
+    NOTE: This is the Tier 3 fallback only. Tier 2 (cdp_pool / PersistentCDP)
+    tracks tabs automatically via Target.attachedToTarget and does not use
+    this function. Only handlers that have not yet been migrated to _get_cdp_session
+    should call _ensure_tabs directly.
+
     Args:
         force: Always refresh, ignoring cache age. Use when listing tabs explicitly.
     """
-    global _cached_tabs, _cached_tabs_time
-    cache_age = time.time() - _cached_tabs_time
-    if not force and _cached_tabs and cache_age < 30:
+    global _cached_tabs
+    if not force and _cached_tabs:
         return ""
     available = await cdp_client.is_available()
     if not available:
         return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
     tabs = await cdp_client.list_tabs()
     _cached_tabs = list(tabs)
-    _cached_tabs_time = time.time()
     if not _cached_tabs:
         return "ERROR: No Chrome tabs found."
     return ""
