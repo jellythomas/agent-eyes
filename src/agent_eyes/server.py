@@ -22,6 +22,7 @@ from mcp.types import Tool, TextContent
 from .adapters.base import BaseAdapter, UIElement
 from .cdp import CDPClient
 from .cdp_persistent import CDPConnection as PersistentCDP
+from .extension_bridge import ExtensionBridge
 from .tiers import TierManager, ConnectionTier
 from .registry import ElementRegistry
 from . import platform_utils as _pu
@@ -176,6 +177,7 @@ native_adapter = _get_native_adapter()
 cdp_client = CDPClient()
 tier_manager = TierManager()
 cdp_pool = PersistentCDP()
+ext_bridge = ExtensionBridge()
 
 
 def _platform_status() -> str:
@@ -1014,6 +1016,9 @@ def _handle_status() -> str:
     input_backend = get_input_backend()
 
     # Determine active tier for status report
+    ext_installed = ext_bridge.is_connected
+    if ext_installed:
+        tier_manager.set_available(ConnectionTier.EXTENSION, True)
     active_tier = tier_manager.best_tier()
     if cdp_pool.is_connected:
         tier_manager.set_available(ConnectionTier.CDP, True)
@@ -1035,8 +1040,8 @@ def _handle_status() -> str:
         f"Active tier: {tier_label}",
         "",
         "Connection tiers:",
-        f"  Tier 1 — Chrome Extension Bridge: {'available' if ext_available else 'not connected'}"
-        " (no flags needed, cross-platform)",
+        f"  Tier 1 — Chrome Extension Bridge: {'installed' if ext_installed else 'not installed'}"
+        " (run extension/install.sh to set up)",
         f"  Tier 2 — CDP Persistent Connection: {'connected' if cdp_available else 'not connected'}"
         f" (port {cdp_pool.active_port}, {len(cdp_pool.list_tabs())} tab(s) tracked)",
         "  Tier 3 — Native Fallback: available (always)",
@@ -1453,11 +1458,17 @@ _cached_tabs: list = []
 
 
 async def _get_cdp_session(args: dict) -> tuple:
-    """Try to get a Tier 2 CDPSession for the requested tab.
+    """Try to get the best available CDP session for the requested tab.
 
-    Tries cdp_pool.ensure_connected() (Tier 2 persistent WebSocket) first.
-    Falls back to legacy cdp_client (Tier 3 per-request WebSocket) when the
-    persistent connection is unavailable.
+    Tier fallback chain:
+      Tier 1 — Chrome Extension bridge (ext_bridge): no flags, cross-platform.
+               Checked first via ext_bridge.is_connected (manifest on disk).
+               Full live dispatch is wired in a future milestone; for now we
+               update tier_manager so status reporting is accurate.
+      Tier 2 — Persistent single-WebSocket CDP (cdp_pool): needs
+               --remote-debugging-port. Tried when Tier 1 is unavailable.
+      Tier 3 — Legacy per-request CDP / native AX fallback (cdp_client):
+               always attempted last.
 
     Returns:
         (session_or_None, tab_or_None, error_string)
@@ -1466,6 +1477,12 @@ async def _get_cdp_session(args: dict) -> tuple:
         - If both fail: (None, None, error_string)
     """
     tab_index = args.get("tab_index", 0)
+
+    # ── Tier 1: Chrome Extension bridge ──
+    if ext_bridge.is_connected:
+        tier_manager.set_available(ConnectionTier.EXTENSION, True)
+        # Live dispatch via the extension is wired in a future milestone.
+        # For now, fall through to Tier 2 so existing functionality is unchanged.
 
     # ── Tier 2: persistent WebSocket ──
     try:
