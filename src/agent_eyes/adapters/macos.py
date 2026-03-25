@@ -326,10 +326,11 @@ class MacOSAdapter(BaseAdapter):
         self.reset_ids()
         ax_app = self._ax.AXUIElementCreateApplication(pid)
 
-        # Force ALL apps to enable accessibility tree construction.
-        # Safe no-op on native apps (returns kAXErrorNotImplemented).
-        # Critical for Electron/CEF/WebKit apps that lazily build AX trees.
-        self.force_browser_accessibility(pid)
+        # Force browser accessibility tree construction.
+        # Only needed for Chromium-based apps — skip for native apps.
+        from ..platform_utils import is_browser_pid
+        if is_browser_pid(pid):
+            self.force_browser_accessibility(pid)
 
         # Try focused window first, fall back to first window
         ax_window = self._read_attr(ax_app, "AXFocusedWindow")

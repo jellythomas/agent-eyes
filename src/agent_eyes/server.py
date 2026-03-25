@@ -1064,16 +1064,8 @@ def _handle_get_tree(args: dict) -> str:
     # Universal depth: default 10, max 20.
     max_depth = min(args.get("max_depth", 10), 20)
 
-    # Build tree — pass is_browser for adapters that support it
-    if hasattr(native_adapter, "get_tree"):
-        import inspect
-        sig = inspect.signature(native_adapter.get_tree)
-        if "is_browser" in sig.parameters:
-            tree = native_adapter.get_tree(pid, max_depth, is_browser=is_browser)
-        else:
-            tree = native_adapter.get_tree(pid, max_depth)
-    else:
-        tree = native_adapter.get_tree(pid, max_depth)
+    # Build tree — all adapters accept is_browser
+    tree = native_adapter.get_tree(pid, max_depth, is_browser=is_browser)
 
     if tree is None:
         return f"ERROR: Could not get accessibility tree for PID {pid}. App may not be running or permission denied."
@@ -1085,15 +1077,7 @@ def _handle_get_tree(args: dict) -> str:
     if has_web and interactive_count < 5 and max_depth < 20:
         # Web content exists but not enough interactive elements reached.
         # Retry with max depth to capture deeply nested buttons/inputs.
-        if hasattr(native_adapter, "get_tree"):
-            import inspect
-            sig = inspect.signature(native_adapter.get_tree)
-            if "is_browser" in sig.parameters:
-                tree = native_adapter.get_tree(pid, 20, is_browser=is_browser)
-            else:
-                tree = native_adapter.get_tree(pid, 20)
-        else:
-            tree = native_adapter.get_tree(pid, 20)
+        tree = native_adapter.get_tree(pid, 20, is_browser=is_browser)
         if tree is None:
             return f"ERROR: Could not rebuild accessibility tree for PID {pid}."
         interactive_count = _count_interactive(tree)

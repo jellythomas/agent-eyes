@@ -220,7 +220,17 @@ class CDPClient:
 
         Enriches up to `limit` elements to keep CDP calls bounded.
         Returns number of elements enriched.
+
+        CSS.enable and DOM.enable are called once here before the walk,
+        not per-element inside _get_visual_summary / _get_box_model.
         """
+        # Enable domains once before walking the tree
+        await self._send(ws, "DOM.enable")
+        await self._send(ws, "CSS.enable")
+        return await self._enrich_subtree(ws, element, limit)
+
+    async def _enrich_subtree(self, ws, element: UIElement, limit: int) -> int:
+        """Recursive helper for _enrich_tree (domains already enabled)."""
         enriched = 0
         if enriched >= limit:
             return enriched
@@ -242,7 +252,7 @@ class CDPClient:
         for child in element.children:
             if enriched >= limit:
                 break
-            enriched += await self._enrich_tree(ws, child, limit - enriched)
+            enriched += await self._enrich_subtree(ws, child, limit - enriched)
 
         return enriched
 
@@ -276,9 +286,6 @@ class CDPClient:
             node_id = desc.get("node", {}).get("nodeId")
             if not node_id:
                 return ""
-
-            # Enable CSS domain if needed (idempotent)
-            await self._send(ws, "CSS.enable")
 
             result = await self._send(ws, "CSS.getComputedStyleForNode", {
                 "nodeId": node_id,
