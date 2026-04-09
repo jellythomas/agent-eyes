@@ -1568,12 +1568,26 @@ async def _get_cdp_session(args: dict) -> tuple:
     # ── Tier 1: persistent WebSocket ──
     try:
         await cdp_pool.ensure_connected()
-        tabs = cdp_pool.list_tabs()
-        if tabs and tab_index < len(tabs):
-            session = cdp_pool.get_session_for_tab(tab_index)
-            if session is not None:
-                tier_manager.set_available(ConnectionTier.CDP, True)
-                return session, tabs[tab_index], ""
+        pool_tabs = cdp_pool.list_tabs()
+        if pool_tabs:
+            # If _cached_tabs exists (from /json listing), match by URL
+            # because cdp_pool order (attachment) may differ from /json order (visual).
+            target_tab_idx = None
+            if _cached_tabs and tab_index < len(_cached_tabs):
+                target_url = _cached_tabs[tab_index].url
+                for pi, pt in enumerate(pool_tabs):
+                    if pt.url == target_url:
+                        target_tab_idx = pi
+                        break
+            # Fallback: direct index into pool (when no cached tabs or URL mismatch)
+            if target_tab_idx is None and tab_index < len(pool_tabs):
+                target_tab_idx = tab_index
+
+            if target_tab_idx is not None:
+                session = cdp_pool.get_session_for_tab(target_tab_idx)
+                if session is not None:
+                    tier_manager.set_available(ConnectionTier.CDP, True)
+                    return session, pool_tabs[target_tab_idx], ""
     except Exception as exc:
         logger.debug("_get_cdp_session: Tier 2 unavailable: %s", exc)
 
@@ -1598,7 +1612,11 @@ async def _handle_list_chrome_tabs() -> str:
         pass  # fall through to the non-CDP paths below
 
     # Try CDP first (richer interaction, cross-platform)
-    # Prefer Tier 2 (cdp_pool) — zero network calls when connected
+    # Prefer Tier 2 (cdp_pool) — ensures same tab order as _get_cdp_session
+    try:
+        await cdp_pool.ensure_connected()
+    except Exception:
+        pass
     if cdp_pool.is_connected:
         pool_tabs = cdp_pool.list_tabs()
         if pool_tabs:
@@ -1635,8 +1653,8 @@ async def _handle_list_chrome_tabs() -> str:
         if as_tabs:
             launch_cmd = _pu.get_chrome_launch_cmd()
             lines = ["Chrome tabs (via AppleScript — CDP not available):\n"]
-            for tab in as_tabs:
-                lines.append(f"[{tab.index}] {tab.title}")
+            for global_i, tab in enumerate(as_tabs):
+                lines.append(f"[{global_i}] {tab.title}")
                 lines.append(f"    {tab.url}  (window {tab.window_index})\n")
 
             lines.append(
@@ -1871,15 +1889,18 @@ async def _handle_get_web_tree(args: dict) -> str:
 
     # Fallback: AppleScript JS injection (macOS only, no CDP required)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
+        win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(tab_index)
+        if resolve_err:
+            return resolve_err
         script = build_ax_tree_script(max_depth=max_depth)
-        raw = _as.execute_javascript(script, tab_index=tab_index)
+        raw = _as.execute_javascript(script, tab_index=as_tab_idx, window_index=win_idx)
         if raw:
             try:
                 import json as _json
                 tree_dict = _json.loads(raw)
                 text = format_ax_tree(tree_dict)
                 # Get tab info for context
-                as_tabs = _as.list_chrome_tabs()
+                as_tabs = _get_applescript_tabs()
                 tab_title = as_tabs[tab_index].title if as_tabs and tab_index < len(as_tabs) else "unknown"
                 tab_url = as_tabs[tab_index].url if as_tabs and tab_index < len(as_tabs) else "unknown"
                 return (
@@ -1931,6 +1952,99 @@ def _get_tab(args: dict) -> tuple:
     if not isinstance(idx, int) or idx < 0 or idx >= len(_cached_tabs):
         return None, f"ERROR: Tab index {idx} out of range. {len(_cached_tabs)} tab(s) available."
     return _cached_tabs[idx], ""
+
+
+# ── AppleScript tab resolution ──────────────────────────────────────
+
+_as_tabs_cache: list = []
+_as_tabs_cache_time: float = 0.0
+_AS_CACHE_TTL = 2.0  # seconds
+
+
+def _get_applescript_tabs(force: bool = False) -> list:
+    """Get AppleScript tab list with short-lived cache."""
+    global _as_tabs_cache, _as_tabs_cache_time
+    now = time.time()
+    if not force and _as_tabs_cache and (now - _as_tabs_cache_time) < _AS_CACHE_TTL:
+        return _as_tabs_cache
+    if _as is not None and _as.is_available():
+        _as_tabs_cache = _as.list_chrome_tabs()
+        _as_tabs_cache_time = now
+    return _as_tabs_cache
+
+
+def _invalidate_applescript_tab_cache() -> None:
+    """Force next _get_applescript_tabs() call to refresh."""
+    global _as_tabs_cache_time
+    _as_tabs_cache_time = 0.0
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL for comparison: strip trailing slash, lowercase scheme+host."""
+    url = url.rstrip("/")
+    # Lowercase scheme and host only
+    if "://" in url:
+        scheme_host, _, path = url.partition("://")
+        host, _, rest = path.partition("/")
+        url = f"{scheme_host.lower()}://{host.lower()}" + (f"/{rest}" if rest else "")
+    return url
+
+
+def _resolve_applescript_tab(global_index: int) -> tuple[int, int, str]:
+    """Translate global tab index to AppleScript (window_index, tab_index).
+
+    Strategy:
+    1. Get AppleScript tab list (cached 2s)
+    2. If CDP _cached_tabs exists, match by URL to find the correct AS tab
+    3. If no CDP cache, use flat AppleScript list order as global index
+
+    Returns: (window_index, per_window_tab_index, error_string)
+    """
+    as_tabs = _get_applescript_tabs()
+    if not as_tabs:
+        logger.debug("_resolve_applescript_tab: no AS tabs, falling back to raw index %d", global_index)
+        return 0, global_index, ""  # best-effort fallback
+
+    # Strategy A: CDP cache exists — match by URL
+    if _cached_tabs and global_index < len(_cached_tabs):
+        target_url = _cached_tabs[global_index].url
+        target_title = _cached_tabs[global_index].title
+        target_url_norm = _normalize_url(target_url)
+
+        logger.debug(
+            "_resolve_applescript_tab: looking for [%d] url=%s title=%s in %d AS tabs",
+            global_index, target_url, target_title, len(as_tabs),
+        )
+
+        # Exact URL match
+        for at in as_tabs:
+            if at.url == target_url:
+                logger.debug("_resolve_applescript_tab: exact URL match → win=%d tab=%d", at.window_index, at.index)
+                return at.window_index, at.index, ""
+        # Normalized URL match (trailing slash, case)
+        for at in as_tabs:
+            if _normalize_url(at.url) == target_url_norm:
+                logger.debug("_resolve_applescript_tab: normalized URL match → win=%d tab=%d", at.window_index, at.index)
+                return at.window_index, at.index, ""
+        # Title match
+        for at in as_tabs:
+            if at.title == target_title:
+                logger.debug("_resolve_applescript_tab: title match → win=%d tab=%d", at.window_index, at.index)
+                return at.window_index, at.index, ""
+
+        logger.debug(
+            "_resolve_applescript_tab: NO MATCH for url=%s title=%s. AS URLs: %s",
+            target_url, target_title,
+            [(i, at.url[:60], at.window_index, at.index) for i, at in enumerate(as_tabs[:5])],
+        )
+
+    # Strategy B: No CDP cache — AppleScript flat order IS the global index
+    if global_index < len(as_tabs):
+        at = as_tabs[global_index]
+        logger.debug("_resolve_applescript_tab: Strategy B (flat) → win=%d tab=%d", at.window_index, at.index)
+        return at.window_index, at.index, ""
+
+    return 0, global_index, f"ERROR: Tab index {global_index} out of range ({len(as_tabs)} tabs)"
 
 
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "about", "chrome", "chrome-extension"})
@@ -1992,9 +2106,12 @@ async def _handle_navigate(args: dict) -> str:
     # Fallback: AppleScript (macOS only — can navigate existing tabs)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
         tab_index = args.get("tab_index", 0)
-        result = _as.navigate_tab(url, tab_index=tab_index)
-        if not result.startswith("ERROR"):
-            return f"navigated to {url}"
+        win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(tab_index)
+        if not resolve_err:
+            result = _as.navigate_tab(url, tab_index=as_tab_idx, window_index=win_idx)
+            if not result.startswith("ERROR"):
+                _invalidate_applescript_tab_cache()
+                return f"navigated to {url}"
         # AppleScript failed — fall through to CLI
 
     # Fallback: cross-platform CLI (opens new tab — cannot navigate existing)
@@ -2063,7 +2180,10 @@ async def _handle_evaluate(args: dict) -> str:
     if _as is not None:
         try:
             tab_index = args.get("tab_index", 0)
-            result = _as.execute_javascript(expression, tab_index=tab_index)
+            win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(tab_index)
+            if resolve_err:
+                return resolve_err
+            result = _as.execute_javascript(expression, tab_index=as_tab_idx, window_index=win_idx)
             if result is not None:
                 return f"Result: {result}"
             return "Result: undefined (AppleScript JS — async/Promises not supported)"
@@ -2212,9 +2332,12 @@ async def _handle_wait_for(args: dict) -> str:
     # Fallback: AppleScript shadow_read_interactive polling (macOS only)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
         tab_index = args.get("tab_index", 0)
+        win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(tab_index)
+        if resolve_err:
+            return resolve_err
         start = time.time()
         while time.time() - start < timeout:
-            content = _as.shadow_read_interactive(tab_index=tab_index)
+            content = _as.shadow_read_interactive(tab_index=as_tab_idx, window_index=win_idx)
             if content:
                 role_match = not role or role.lower() in content.lower()
                 name_match = not name or name.lower() in content.lower()
@@ -2249,12 +2372,14 @@ async def _handle_new_tab(args: dict) -> str:
         async with _tabs_lock:
             _cached_tabs.append(tab)
             idx = len(_cached_tabs) - 1
+        _invalidate_applescript_tab_cache()
         return f"New tab [{idx}]: {tab.title}\nURL: {tab.url}"
 
     # Fallback: AppleScript (macOS only — richer interaction)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
         tab = _as.open_new_tab(url)
         if tab is not None:
+            _invalidate_applescript_tab_cache()
             return (
                 f"New tab [{tab.index}]: {tab.title}\n"
                 f"URL: {tab.url}\n"
@@ -2284,30 +2409,35 @@ async def _handle_close_tab(args: dict) -> str:
             title_query = args.get("title")
             idx = args.get("tab_index", 0)
 
-            # Find tab index by title if provided
+            # Find tab by title or resolve global index
             if title_query:
-                as_tabs = _as.list_chrome_tabs()
+                as_tabs = _get_applescript_tabs(force=True)
                 query_lower = title_query.lower()
-                matches = [(t.index, t) for t in as_tabs if query_lower in t.title.lower()]
+                matches = [(i, t) for i, t in enumerate(as_tabs) if query_lower in t.title.lower()]
                 if not matches:
-                    tab_list = "\n".join(f"  [{t.index}] {t.title}" for t in as_tabs)
+                    tab_list = "\n".join(f"  [{i}] {t.title}" for i, t in enumerate(as_tabs))
                     return f"ERROR: No tab matching '{title_query}'. Open tabs:\n{tab_list}"
                 if len(matches) > 1:
-                    match_list = "\n".join(f"  [{t.index}] {t.title}" for _, t in matches)
+                    match_list = "\n".join(f"  [{i}] {t.title}" for i, t in matches)
                     return (
                         f"ERROR: Multiple tabs match '{title_query}'. "
                         f"Specify tab_index:\n{match_list}"
                     )
-                idx, matched_tab = matches[0]
-
-            # Validate idx is a non-negative integer before AppleScript interpolation
-            if not isinstance(idx, int) or idx < 0:
-                return f"ERROR: Invalid tab index: {idx!r}"
+                _, matched_tab = matches[0]
+                as_tab_idx = matched_tab.index
+                win_idx = matched_tab.window_index
+            else:
+                # Validate idx is a non-negative integer before resolution
+                if not isinstance(idx, int) or idx < 0:
+                    return f"ERROR: Invalid tab index: {idx!r}"
+                win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(idx)
+                if resolve_err:
+                    return resolve_err
 
             # Close via AppleScript
             close_script = f'''
             tell application "Google Chrome"
-                close tab {int(idx) + 1} of window 1
+                close tab {int(as_tab_idx) + 1} of window {int(win_idx) + 1}
             end tell
             '''
             import subprocess as _sp
@@ -2316,6 +2446,7 @@ async def _handle_close_tab(args: dict) -> str:
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
+                _invalidate_applescript_tab_cache()
                 return (
                     f"Closed tab [{idx}] (via AppleScript — CDP not available)"
                 )
@@ -2363,6 +2494,7 @@ async def _handle_close_tab(args: dict) -> str:
         async with _tabs_lock:
             if idx < len(_cached_tabs):
                 _cached_tabs.pop(idx)
+        _invalidate_applescript_tab_cache()
         return f"Closed tab [{idx}]: {tab_title}\n  URL: {tab_url}"
     return f"ERROR: Could not close tab [{idx}]: {tab_title} — {tab_url}"
 
@@ -2571,12 +2703,15 @@ async def _handle_fill_form(args: dict) -> str:
     # Fallback: AppleScript shadow_type per field (macOS only)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
         tab_index = args.get("tab_index", 0)
+        win_idx, as_tab_idx, resolve_err = _resolve_applescript_tab(tab_index)
+        if resolve_err:
+            return resolve_err
         filled = []
         errors = []
         for field in fields:
             eid = field.get("id")
             value = field.get("value", "")
-            ok = _as.shadow_type(value, tab_index=tab_index)
+            ok = _as.shadow_type(value, tab_index=as_tab_idx, window_index=win_idx)
             if ok:
                 filled.append(f"[{eid}]")
             else:
@@ -2859,37 +2994,42 @@ def _handle_shadow(args: dict) -> str:
     if not _as.is_available():
         return "ERROR: Chrome is not running."
 
-    # Resolve tab index
+    # Resolve tab index → AppleScript (window_index, tab_index)
     if tab_idx < 0:
         tab_idx = _as.shadow_get_active_tab_index() or 0
+        win_idx = 0  # active tab is in the frontmost window
+    else:
+        win_idx, tab_idx, resolve_err = _resolve_applescript_tab(tab_idx)
+        if resolve_err:
+            return resolve_err
 
     if action == "click":
         if not text and not selector:
             return "ERROR: 'text' or 'selector' required for click."
         if selector:
-            ok = _as.shadow_click(selector, tab_index=tab_idx)
+            ok = _as.shadow_click(selector, tab_index=tab_idx, window_index=win_idx)
             return f"Shadow clicked '{selector}'" if ok else f"ERROR: Element '{selector}' not found."
         else:
-            result = _as.shadow_click_by_text(text, tab_index=tab_idx)
+            result = _as.shadow_click_by_text(text, tab_index=tab_idx, window_index=win_idx)
             return f"Shadow clicked: {result}" if result else f"ERROR: No clickable element with text '{text}' found."
 
     elif action == "type":
         if not text:
             return "ERROR: 'text' required for type."
-        ok = _as.shadow_type(text, selector=selector, tab_index=tab_idx)
+        ok = _as.shadow_type(text, selector=selector, tab_index=tab_idx, window_index=win_idx)
         return f"Shadow typed \"{text}\"" if ok else "ERROR: Could not type in background."
 
     elif action == "press_key":
         key = text or "Enter"
-        ok = _as.shadow_press_key(key, tab_index=tab_idx)
+        ok = _as.shadow_press_key(key, tab_index=tab_idx, window_index=win_idx)
         return f"Shadow pressed {key}" if ok else f"ERROR: Could not press {key}."
 
     elif action == "scroll":
-        ok = _as.shadow_scroll(direction=direction, amount=amount, selector=selector, tab_index=tab_idx)
+        ok = _as.shadow_scroll(direction=direction, amount=amount, selector=selector, tab_index=tab_idx, window_index=win_idx)
         return f"Shadow scrolled {direction} {amount}px" if ok else "ERROR: Could not scroll."
 
     elif action == "read":
-        result = _as.shadow_read_interactive(tab_index=tab_idx)
+        result = _as.shadow_read_interactive(tab_index=tab_idx, window_index=win_idx)
         if result:
             return f"Interactive elements (background scan):\n\n{result}"
         return "No interactive elements found or Chrome not available."
@@ -2897,7 +3037,7 @@ def _handle_shadow(args: dict) -> str:
     elif action == "js":
         if not text:
             return "ERROR: 'text' (JS code) required for js action."
-        result = _as.shadow_execute_js(text, tab_index=tab_idx)
+        result = _as.shadow_execute_js(text, tab_index=tab_idx, window_index=win_idx)
         if result is not None:
             return f"JS result: {result}"
         return "ERROR: JavaScript execution failed."

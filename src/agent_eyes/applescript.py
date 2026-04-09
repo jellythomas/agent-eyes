@@ -150,16 +150,15 @@ def _list_tabs_individual() -> list[AppleScriptTab]:
             continue
 
         entries = result.stdout.strip().split("---\n")
-        for entry in entries:
+        for tab_entry_idx, entry in enumerate(entries):
             lines = entry.strip().split("\n")
             if len(lines) >= 2:
                 tabs.append(AppleScriptTab(
-                    index=global_idx,
+                    index=tab_entry_idx,
                     title=lines[0].strip(),
                     url=lines[1].strip(),
                     window_index=win_idx - 1,
                 ))
-                global_idx += 1
 
     return tabs
 
