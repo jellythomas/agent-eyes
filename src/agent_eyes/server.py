@@ -892,6 +892,18 @@ TOOLS = [
             "required": ["selector"],
         },
     ),
+    Tool(
+        name="install_check",
+        description=(
+            "Check if agent-eyes platform dependencies are installed. "
+            "Reads ~/.agent-eyes/install.json and returns install state. "
+            "Used by /agent-eyes:init to determine if /agent-eyes:install needs to run first."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
 ]
 
 
@@ -950,6 +962,7 @@ def _build_dispatch_table() -> dict[str, object]:
         "context": _handle_context,
         "shadow": _handle_shadow,
         "pierce": _handle_pierce,
+        "install_check": lambda args: _handle_install_check(),
     }
 
 
@@ -985,6 +998,22 @@ def _handle_status() -> str:
         native_status = "native:unavailable"
 
     return f"ready | {platform} | {cdp_status} | {native_status} | {tab_count} tabs"
+
+
+def _handle_install_check() -> str:
+    """Check if platform dependencies are installed."""
+    install_path = pathlib.Path.home() / ".agent-eyes" / "install.json"
+    if not install_path.exists():
+        return "✗ not installed. Run /agent-eyes:install"
+    try:
+        state = json.loads(install_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "✗ install state corrupted. Run /agent-eyes:install"
+    if not state.get("installed"):
+        return "✗ not installed. Run /agent-eyes:install"
+    platform_name = state.get("platform", "unknown")
+    version = state.get("version", "unknown")
+    return f"✓ installed | {platform_name} | v{version}"
 
 
 def _handle_list_apps() -> str:
