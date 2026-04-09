@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 
 INTERACTIVE_ROLES = frozenset({
@@ -104,6 +104,36 @@ class AppInfo:
     bundle_id: str = ""
     windows: list[str] = field(default_factory=list)  # Window titles
     is_frontmost: bool = False
+
+
+@runtime_checkable
+class PlatformAdapter(Protocol):
+    """Runtime-checkable Protocol for platform accessibility adapters.
+
+    Every platform adapter (macOS, Linux, Windows) must implement all of
+    these methods.  Use ``isinstance(adapter, PlatformAdapter)`` to verify
+    at runtime that a given object satisfies the contract.
+    """
+
+    def is_available(self) -> bool: ...
+
+    def check_permissions(self) -> tuple[bool, str]: ...
+
+    def list_apps(self) -> list[AppInfo]: ...
+
+    def get_tree(self, pid: int, max_depth: int = 5) -> UIElement | None: ...
+
+    def find_elements(
+        self, pid: int, role: str = "", name: str = "", value: str = ""
+    ) -> list[UIElement]: ...
+
+    def perform_action(self, element: UIElement, action: str) -> bool: ...
+
+    def focus_element(self, element: UIElement) -> bool: ...
+
+    def set_value(self, element: UIElement, value: str) -> bool: ...
+
+    def get_focused_element(self) -> UIElement | None: ...
 
 
 class BaseAdapter(abc.ABC):

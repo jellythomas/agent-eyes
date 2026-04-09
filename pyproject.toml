@@ -27,26 +27,19 @@ classifiers = [
 dependencies = [
     "mcp>=1.0.0",
     "websockets>=12.0",
-    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
-    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
-    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
-    "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
-    "pywinauto>=0.6.8; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
 macos = [
-    "pyobjc-framework-ApplicationServices>=10.0",
-    "pyobjc-framework-Quartz>=10.0",
-    "pyobjc-framework-Cocoa>=10.0",
-    "pyobjc-framework-Vision>=10.0",
-]
-windows = [
-    "pywinauto>=0.6.8",
+    "pyobjc-framework-ApplicationServices",
+    "pyobjc-framework-Quartz",
+    "pyobjc-framework-Cocoa",
 ]
 linux = [
-    # pyatspi2 typically installed via system package manager
-    # apt install python3-pyatspi / dnf install python3-pyatspi
+    "python-xlib>=0.33",
+]
+windows = [
+    "comtypes>=1.4.0",
 ]
 
 [project.urls]
