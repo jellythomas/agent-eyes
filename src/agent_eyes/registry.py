@@ -2,16 +2,15 @@
 
 This is the bridge between the text representation sent to Claude
 and the actual native/CDP elements that can be acted upon.
+
+Elements expire when the page changes (URL mismatch), not on a timer.
 """
 from __future__ import annotations
-
-import time
 
 from .adapters.base import UIElement
 
 
-# TTL for registered elements (seconds)
-_REGISTRY_TTL_SECONDS = 60
+_MAX_ELEMENTS = 500
 
 
 class ElementRegistry:
@@ -19,65 +18,82 @@ class ElementRegistry:
 
     def __init__(self):
         self._elements: dict[int, UIElement] = {}
-        self.last_pid: int = 0  # PID from the last get_tree call
-        self.last_tab_index: int = -1  # Tab index from the last get_web_tree call
-        self._registered_at: float = 0  # Timestamp when elements were registered
+        self.last_pid: int = 0
+        self.last_tab_index: int = -1
+        self._page_url: str = ""
 
     def clear(self):
         self._elements.clear()
-        self._registered_at = 0
+        self._page_url = ""
 
-    def register_tree(self, root: UIElement, pid: int = 0, tab_index: int = -1):
+    def register_tree(
+        self,
+        root: UIElement,
+        pid: int = 0,
+        tab_index: int = -1,
+        *,
+        page_url: str = "",
+    ):
         """Walk a tree and register all elements, tagging each with the owning PID and tab_index."""
         self.clear()
         self.last_pid = pid
         self.last_tab_index = tab_index
-        self._registered_at = time.time()
+        self._page_url = page_url
         self._walk_and_register(root, pid, tab_index)
 
     def _walk_and_register(self, element: UIElement, pid: int = 0, tab_index: int = -1):
+        if len(self._elements) >= _MAX_ELEMENTS:
+            return
         if pid:
             element.pid = pid
         if tab_index >= 0:
             element.tab_index = tab_index
         self._elements[element.id] = element
         for child in element.children:
+            if len(self._elements) >= _MAX_ELEMENTS:
+                break
             self._walk_and_register(child, pid, tab_index)
 
-    def is_expired(self) -> bool:
-        """Check if the registry has expired (elements are stale)."""
-        if self._registered_at == 0:
-            return True  # Never registered
-        return (time.time() - self._registered_at) > _REGISTRY_TTL_SECONDS
+    def is_valid_for(self, *, page_url: str = "") -> bool:
+        """Return True if the registry is valid for the given page URL.
+
+        When page_url is empty (native/desktop elements), always returns True.
+        When _page_url is empty (registry was cleared or never populated with a URL),
+        always returns True.
+        """
+        if not page_url or not self._page_url:
+            return True
+        return self._page_url == page_url
 
     def get(self, element_id: int) -> UIElement | None:
-        # Note: We don't automatically return None for expired elements here
-        # because the caller should handle TTL checks to give better error messages.
-        # Use is_expired() to check before batch operations.
         return self._elements.get(element_id)
 
-    def get_with_ttl_check(self, element_id: int) -> tuple[UIElement | None, bool]:
-        """Get element with TTL expiration check.
-        Returns (element, is_expired). If expired, element may still be returned
-        but caller should warn user to refresh.
+    def get_checked(
+        self,
+        element_id: int,
+        *,
+        current_page_url: str = "",
+    ) -> tuple[UIElement | None, str]:
+        """Get element with page-state validation.
+
+        Returns (element, reason). On success, element is set and reason is "".
+        On failure, element is None and reason describes why.
         """
+        if not self.is_valid_for(page_url=current_page_url):
+            return None, "page changed — call web_tree to refresh"
+
         element = self._elements.get(element_id)
-        return element, self.is_expired()
+        if element is None:
+            return None, f"element [{element_id}] not found — call tree to refresh"
 
-    def register_element(self, element: "UIElement") -> None:
-        """Register a single element without clearing the full registry.
+        return element, ""
 
-        Updates the TTL timestamp so the element is not immediately stale.
-        Use this instead of writing to _elements directly.
-        """
-        if self._registered_at == 0:
-            self._registered_at = time.time()
+    def register_element(self, element: UIElement) -> None:
+        """Register a single element without clearing the full registry."""
         self._elements[element.id] = element
 
-    def register_elements(self, elements: list["UIElement"]) -> None:
+    def register_elements(self, elements: list[UIElement]) -> None:
         """Register multiple elements without clearing the full registry."""
-        if self._registered_at == 0:
-            self._registered_at = time.time()
         for el in elements:
             self._elements[el.id] = el
 

@@ -1682,7 +1682,7 @@ async def _handle_get_web_tree(args: dict) -> str:
                 tree = cdp_client._build_tree(nodes)
                 if tree is not None:
                     chrome_pid = _get_chrome_pid()
-                    registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index)
+                    registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url)
                     return _format_web_tree_response(
                         tree, tab.title, tab.url, tab_index, max_depth, interactive_only
                     )
@@ -1707,7 +1707,7 @@ async def _handle_get_web_tree(args: dict) -> str:
         tree = await cdp_client.get_accessibility_tree(legacy_tab, max_depth)
         if tree is not None:
             chrome_pid = _get_chrome_pid()
-            registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index)
+            registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=legacy_tab.url)
             return _format_web_tree_response(
                 tree, legacy_tab.title, legacy_tab.url, tab_index, max_depth, interactive_only
             )
