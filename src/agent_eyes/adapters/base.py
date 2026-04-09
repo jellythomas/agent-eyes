@@ -6,6 +6,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+INTERACTIVE_ROLES = frozenset({
+    "button", "link", "textbox", "checkbox", "radio",
+    "combobox", "select", "tab", "menuitem", "slider",
+    "switch", "searchbox", "spinbutton", "textarea",
+})
+
+
 @dataclass
 class UIElement:
     """Universal UI element representation across all platforms."""
@@ -75,6 +82,18 @@ class UIElement:
                 lines.append(child_text)
 
         return "\n".join(lines)
+
+    def to_flat_line(self) -> str:
+        """Render as single flat line: [id] role "name" value="val" state1"""
+        parts = [f"[{self.id}]", self.role]
+        if self.name:
+            parts.append(f'"{self.name}"')
+        if self.value:
+            parts.append(f'value="{self.value}"')
+        skip_states = {"enabled"}
+        meaningful = [s for s in self.states if s not in skip_states]
+        parts.extend(meaningful)
+        return " ".join(parts)
 
 
 @dataclass
