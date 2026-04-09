@@ -1,0 +1,657 @@
+"""Tests for WindowsAdapter (comtypes UI Automation) and WindowsInputBackend.
+
+These tests run on all platforms using mocks — they validate the adapter
+logic without requiring a real Windows environment or comtypes.
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from unittest.mock import MagicMock, patch, call
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_uia_element(
+    name="",
+    ctrl_type=50000,  # button
+    pid=1234,
+    is_enabled=True,
+    is_offscreen=False,
+    has_keyboard_focus=False,
+    rect=None,
+    value=None,
+):
+    el = MagicMock()
+    el.CurrentName = name
+    el.CurrentControlType = ctrl_type
+    el.CurrentProcessId = pid
+    el.CurrentIsEnabled = is_enabled
+    el.CurrentIsOffscreen = is_offscreen
+    el.CurrentHasKeyboardFocus = has_keyboard_focus
+
+    if rect is None:
+        r = MagicMock()
+        r.left = 10
+        r.top = 20
+        r.right = 110
+        r.bottom = 70
+        el.CurrentBoundingRectangle = r
+    else:
+        el.CurrentBoundingRectangle = rect
+
+    if value is not None:
+        value_pattern = MagicMock()
+        value_pattern.CurrentValue = value
+        el.GetCurrentPattern.return_value = value_pattern
+    else:
+        el.GetCurrentPattern.return_value = None
+
+    el.FindAll.return_value = _make_element_array([])
+    el.SetFocus.return_value = None
+    return el
+
+
+def _make_element_array(elements):
+    arr = MagicMock()
+    arr.Length = len(elements)
+    arr.GetElement.side_effect = lambda i: elements[i]
+    return arr
+
+
+def _make_windows_adapter_with_mock_uia(root_el=None):
+    """Create WindowsAdapter with mocked comtypes, bypassing real COM."""
+    from agent_eyes.adapters.windows import WindowsAdapter
+
+    adapter = WindowsAdapter.__new__(WindowsAdapter)
+    adapter._id_counter = 0
+    adapter._in_web_area = False
+
+    mock_uia = MagicMock()
+    mock_root = root_el if root_el is not None else MagicMock()
+    mock_uia.GetRootElement.return_value = mock_root
+    mock_uia.CreateTrueCondition.return_value = MagicMock()
+    mock_uia.CreatePropertyCondition.return_value = MagicMock()
+
+    adapter._uia = mock_uia
+    adapter._root = mock_root
+    return adapter
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: is_available
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterAvailability(unittest.TestCase):
+
+    def test_available_when_uia_set_and_win32(self):
+        with patch.object(sys, "platform", "win32"):
+            adapter = _make_windows_adapter_with_mock_uia()
+            self.assertTrue(adapter.is_available())
+
+    def test_unavailable_when_uia_is_none(self):
+        with patch.object(sys, "platform", "win32"):
+            adapter = _make_windows_adapter_with_mock_uia()
+            adapter._uia = None
+            self.assertFalse(adapter.is_available())
+
+    def test_unavailable_on_non_windows_platform(self):
+        with patch.object(sys, "platform", "darwin"):
+            adapter = _make_windows_adapter_with_mock_uia()
+            self.assertFalse(adapter.is_available())
+
+    def test_init_handles_import_error_gracefully(self):
+        """If comtypes is not installed, adapter initialises with _uia=None."""
+        with patch.dict("sys.modules", {"comtypes": None, "comtypes.client": None}):
+            from agent_eyes.adapters.windows import WindowsAdapter
+            adapter = WindowsAdapter.__new__(WindowsAdapter)
+            adapter._uia = None
+            adapter._root = None
+            adapter._id_counter = 0
+            adapter._in_web_area = False
+            self.assertIsNone(adapter._uia)
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: check_permissions
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterPermissions(unittest.TestCase):
+
+    def test_always_returns_true(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        ok, msg = adapter.check_permissions()
+        self.assertTrue(ok)
+        self.assertIn("UI Automation", msg)
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: list_apps
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterListApps(unittest.TestCase):
+
+    def test_returns_empty_when_uia_none(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia = None
+        self.assertEqual(adapter.list_apps(), [])
+
+    def test_returns_empty_when_root_none(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root = None
+        self.assertEqual(adapter.list_apps(), [])
+
+    def test_lists_top_level_windows(self):
+        el1 = _make_uia_element(name="Notepad", ctrl_type=50031, pid=100)
+        el2 = _make_uia_element(name="Chrome", ctrl_type=50031, pid=200)
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([el1, el2])
+        adapter._uia.CreateTrueCondition.return_value = MagicMock()
+
+        apps = adapter.list_apps()
+        self.assertEqual(len(apps), 2)
+        pids = {a.pid for a in apps}
+        self.assertIn(100, pids)
+        self.assertIn(200, pids)
+
+    def test_deduplicates_same_pid(self):
+        el1 = _make_uia_element(name="Chrome Main", ctrl_type=50031, pid=100)
+        el2 = _make_uia_element(name="Chrome DevTools", ctrl_type=50031, pid=100)
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([el1, el2])
+
+        apps = adapter.list_apps()
+        self.assertEqual(len(apps), 1)
+        self.assertEqual(apps[0].pid, 100)
+
+    def test_skips_elements_that_raise(self):
+        # Property access raises to simulate a COM error on the bad element
+        el_bad = MagicMock()
+        type(el_bad).CurrentProcessId = property(lambda self: (_ for _ in ()).throw(Exception("COM error")))
+        el_good = _make_uia_element(name="Notepad", pid=42)
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([el_bad, el_good])
+
+        apps = adapter.list_apps()
+        # Only the good element should produce an AppInfo
+        self.assertEqual(len(apps), 1)
+        self.assertEqual(apps[0].pid, 42)
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: get_tree
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterGetTree(unittest.TestCase):
+
+    def test_returns_none_when_uia_none(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia = None
+        self.assertIsNone(adapter.get_tree(1234))
+
+    def test_returns_none_when_element_not_found(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.CreatePropertyCondition.return_value = MagicMock()
+        adapter._root.FindFirst.return_value = None
+        self.assertIsNone(adapter.get_tree(9999))
+
+    def test_returns_ui_element_for_found_process(self):
+        root_el = _make_uia_element(name="Notepad", ctrl_type=50031, pid=42)
+        root_el.FindAll.return_value = _make_element_array([])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = root_el
+
+        result = adapter.get_tree(42)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.role, "window")
+        self.assertEqual(result.name, "Notepad")
+
+    def test_resets_id_counter_before_walk(self):
+        root_el = _make_uia_element(name="App", ctrl_type=50031, pid=1)
+        root_el.FindAll.return_value = _make_element_array([])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = root_el
+        adapter._id_counter = 500
+
+        adapter.get_tree(1)
+        self.assertLess(adapter._id_counter, 500)
+
+    def test_tree_includes_children(self):
+        child = _make_uia_element(name="Button OK", ctrl_type=50000, pid=1)
+        child.FindAll.return_value = _make_element_array([])
+
+        parent = _make_uia_element(name="Dialog", ctrl_type=50032, pid=1)
+        parent.FindAll.return_value = _make_element_array([child])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = parent
+
+        tree = adapter.get_tree(1)
+        self.assertIsNotNone(tree)
+        self.assertEqual(len(tree.children), 1)
+        self.assertEqual(tree.children[0].name, "Button OK")
+
+    def test_respects_max_depth(self):
+        # Build 3 levels: root -> child -> grandchild
+        grandchild = _make_uia_element(name="Grandchild", ctrl_type=50000)
+        grandchild.FindAll.return_value = _make_element_array([])
+
+        child = _make_uia_element(name="Child", ctrl_type=50032)
+        child.FindAll.return_value = _make_element_array([grandchild])
+
+        root_el = _make_uia_element(name="Root", ctrl_type=50031)
+        root_el.FindAll.return_value = _make_element_array([child])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = root_el
+
+        tree = adapter.get_tree(1, max_depth=1)
+        self.assertEqual(len(tree.children), 1)
+        # At depth 1 we have child; grandchild is at depth 2 (> max_depth=1)
+        self.assertEqual(len(tree.children[0].children), 0)
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: _element_to_ui — states and bounds
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterElementToUI(unittest.TestCase):
+
+    def test_enabled_state(self):
+        el = _make_uia_element(name="Btn", is_enabled=True, is_offscreen=False)
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertIn("enabled", ui.states)
+
+    def test_disabled_state(self):
+        el = _make_uia_element(name="Btn", is_enabled=False)
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertIn("disabled", ui.states)
+
+    def test_focused_state(self):
+        el = _make_uia_element(name="Input", has_keyboard_focus=True)
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertIn("focused", ui.states)
+
+    def test_bounds_computed_from_bounding_rectangle(self):
+        rect = MagicMock()
+        rect.left = 50
+        rect.top = 100
+        rect.right = 250
+        rect.bottom = 180
+        el = _make_uia_element(name="Btn", rect=rect)
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertEqual(ui.bounds, (50, 100, 200, 80))
+
+    def test_zero_size_bounds_excluded(self):
+        rect = MagicMock()
+        rect.left = 0
+        rect.top = 0
+        rect.right = 0
+        rect.bottom = 0
+        el = _make_uia_element(name="Invisible", rect=rect)
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertIsNone(ui.bounds)
+
+    def test_value_from_value_pattern(self):
+        el = _make_uia_element(name="Field", value="hello")
+        el.FindAll.return_value = _make_element_array([])
+        adapter = _make_windows_adapter_with_mock_uia()
+        ui = adapter._element_to_ui(el, 0, 5)
+        self.assertEqual(ui.value, "hello")
+
+    def test_returns_none_on_exception(self):
+        el = MagicMock()
+        # Make CurrentControlType raise via property so attribute access fails
+        type(el).CurrentControlType = property(lambda self: (_ for _ in ()).throw(Exception("COM error")))
+        adapter = _make_windows_adapter_with_mock_uia()
+        result = adapter._element_to_ui(el, 0, 5)
+        self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: find_elements
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterFindElements(unittest.TestCase):
+
+    def test_returns_empty_when_tree_is_none(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = None
+        result = adapter.find_elements(999, role="button")
+        self.assertEqual(result, [])
+
+    def test_finds_by_role(self):
+        btn = _make_uia_element(name="OK", ctrl_type=50000)  # button
+        btn.FindAll.return_value = _make_element_array([])
+        pane = _make_uia_element(name="Main", ctrl_type=50032)  # pane
+        pane.FindAll.return_value = _make_element_array([btn])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = pane
+
+        results = adapter.find_elements(1, role="button")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "OK")
+
+    def test_finds_by_name(self):
+        btn = _make_uia_element(name="Submit", ctrl_type=50000)
+        btn.FindAll.return_value = _make_element_array([])
+        pane = _make_uia_element(name="Dialog", ctrl_type=50032)
+        pane.FindAll.return_value = _make_element_array([btn])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = pane
+
+        results = adapter.find_elements(1, name="submit")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "Submit")
+
+    def test_no_match_returns_empty(self):
+        btn = _make_uia_element(name="OK", ctrl_type=50000)
+        btn.FindAll.return_value = _make_element_array([])
+        pane = _make_uia_element(name="Dialog", ctrl_type=50032)
+        pane.FindAll.return_value = _make_element_array([btn])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindFirst.return_value = pane
+
+        results = adapter.find_elements(1, name="nonexistent")
+        self.assertEqual(results, [])
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: perform_action
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterPerformAction(unittest.TestCase):
+
+    def _adapter(self):
+        return _make_windows_adapter_with_mock_uia()
+
+    def test_returns_false_when_no_platform_ref(self):
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="button", name="OK", platform_ref=None)
+        adapter = self._adapter()
+        self.assertFalse(adapter.perform_action(el, "click"))
+
+    def test_invoke_pattern_called_for_click(self):
+        mock_pattern = MagicMock()
+        native_el = MagicMock()
+        native_el.GetCurrentPattern.return_value = mock_pattern
+
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="button", name="OK", platform_ref=native_el)
+        adapter = self._adapter()
+
+        result = adapter.perform_action(el, "click")
+        self.assertTrue(result)
+        mock_pattern.Invoke.assert_called_once()
+
+    def test_toggle_pattern_called_for_toggle(self):
+        mock_pattern = MagicMock()
+        native_el = MagicMock()
+        native_el.GetCurrentPattern.return_value = mock_pattern
+
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="checkbox", name="Agree", platform_ref=native_el)
+        adapter = self._adapter()
+
+        result = adapter.perform_action(el, "toggle")
+        self.assertTrue(result)
+        mock_pattern.Toggle.assert_called_once()
+
+    def test_select_pattern_called_for_select(self):
+        mock_pattern = MagicMock()
+        native_el = MagicMock()
+        native_el.GetCurrentPattern.return_value = mock_pattern
+
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="listitem", name="Item 1", platform_ref=native_el)
+        adapter = self._adapter()
+
+        result = adapter.perform_action(el, "select")
+        self.assertTrue(result)
+        mock_pattern.Select.assert_called_once()
+
+    def test_returns_false_on_exception(self):
+        native_el = MagicMock()
+        native_el.GetCurrentPattern.side_effect = Exception("pattern unavailable")
+
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="button", name="Fail", platform_ref=native_el)
+        adapter = self._adapter()
+
+        self.assertFalse(adapter.perform_action(el, "click"))
+
+
+# ---------------------------------------------------------------------------
+# WindowsAdapter: focus_element + set_value + get_focused_element
+# ---------------------------------------------------------------------------
+
+class TestWindowsAdapterFocusAndValue(unittest.TestCase):
+
+    def test_focus_calls_set_focus(self):
+        native_el = MagicMock()
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="edit", name="Input", platform_ref=native_el)
+        adapter = _make_windows_adapter_with_mock_uia()
+
+        result = adapter.focus_element(el)
+        self.assertTrue(result)
+        native_el.SetFocus.assert_called_once()
+
+    def test_focus_returns_false_when_no_platform_ref(self):
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="edit", name="Input", platform_ref=None)
+        adapter = _make_windows_adapter_with_mock_uia()
+        self.assertFalse(adapter.focus_element(el))
+
+    def test_set_value_uses_value_pattern(self):
+        mock_pattern = MagicMock()
+        native_el = MagicMock()
+        native_el.GetCurrentPattern.return_value = mock_pattern
+
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="edit", name="Name", platform_ref=native_el)
+        adapter = _make_windows_adapter_with_mock_uia()
+
+        result = adapter.set_value(el, "Alice")
+        self.assertTrue(result)
+        mock_pattern.SetValue.assert_called_once_with("Alice")
+
+    def test_set_value_returns_false_when_no_platform_ref(self):
+        from agent_eyes.adapters.base import UIElement
+        el = UIElement(id=1, role="edit", name="Name", platform_ref=None)
+        adapter = _make_windows_adapter_with_mock_uia()
+        self.assertFalse(adapter.set_value(el, "Alice"))
+
+    def test_get_focused_element_returns_none_when_uia_none(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia = None
+        self.assertIsNone(adapter.get_focused_element())
+
+    def test_get_focused_element_returns_ui_element(self):
+        focused_el = _make_uia_element(name="Username", ctrl_type=50004)
+        focused_el.FindAll.return_value = _make_element_array([])
+
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.GetFocusedElement.return_value = focused_el
+
+        result = adapter.get_focused_element()
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "Username")
+        self.assertEqual(result.role, "edit")
+
+    def test_get_focused_element_returns_none_on_exception(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.GetFocusedElement.side_effect = Exception("COM error")
+        self.assertIsNone(adapter.get_focused_element())
+
+
+# ---------------------------------------------------------------------------
+# WindowsInputBackend: scroll
+# ---------------------------------------------------------------------------
+
+class TestWindowsInputBackendScroll(unittest.TestCase):
+    """Tests for WindowsInputBackend.scroll.
+
+    We mock _send_input and _load directly so the tests never touch ctypes,
+    and track calls via a counter on _move_to.
+    """
+
+    def _make_backend(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._user32 = MagicMock()
+        backend._user32.GetSystemMetrics.side_effect = lambda m: 1920 if m == 0 else 1080
+        backend._INPUT = MagicMock()
+        backend._MOUSEINPUT = MagicMock()
+        backend._KEYBDINPUT = MagicMock()
+        # Replace _send_input so ctypes.byref is never called
+        backend._send_input = MagicMock()
+        return backend
+
+    def test_scroll_down_returns_true(self):
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            result = backend.scroll(500, 400, delta_y=-3)
+        self.assertTrue(result)
+
+    def test_scroll_up_returns_true(self):
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            result = backend.scroll(500, 400, delta_y=3)
+        self.assertTrue(result)
+
+    def test_scroll_zero_delta_uses_default_amount(self):
+        """When delta_y=0 and delta_x=0, still sends 3 wheel events."""
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            backend.scroll(500, 400, delta_x=0, delta_y=0)
+        # 1 move call + 3 wheel calls = 4 _send_input calls
+        self.assertEqual(backend._send_input.call_count, 4)
+
+    def test_scroll_move_then_wheel_events(self):
+        """scroll() first moves the mouse, then sends |delta_y| wheel events."""
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            backend.scroll(100, 200, delta_y=-5)
+        # 1 move + 5 wheel = 6
+        self.assertEqual(backend._send_input.call_count, 6)
+
+    def test_scroll_returns_false_on_exception(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._user32 = MagicMock()
+        backend._INPUT = MagicMock()
+        backend._MOUSEINPUT = MagicMock()
+        backend._KEYBDINPUT = MagicMock()
+        backend._send_input = MagicMock(side_effect=Exception("crash"))
+
+        result = backend.scroll(0, 0)
+        self.assertFalse(result)
+
+
+# ---------------------------------------------------------------------------
+# WindowsInputBackend: drag
+# ---------------------------------------------------------------------------
+
+class TestWindowsInputBackendDrag(unittest.TestCase):
+
+    def _make_backend(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._user32 = MagicMock()
+        backend._user32.GetSystemMetrics.side_effect = lambda m: 1920 if m == 0 else 1080
+        backend._INPUT = MagicMock()
+        backend._MOUSEINPUT = MagicMock()
+        backend._KEYBDINPUT = MagicMock()
+        backend._send_input = MagicMock()
+        return backend
+
+    def test_drag_returns_true(self):
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            result = backend.drag(100, 100, 300, 200)
+        self.assertTrue(result)
+
+    def test_drag_sends_mouse_down_and_up(self):
+        """drag() must call _mouse_event with LEFTDOWN before LEFTUP."""
+        backend = self._make_backend()
+        sent_flags = []
+
+        def capture_mouse_event(flags):
+            sent_flags.append(flags)
+
+        backend._mouse_event = capture_mouse_event
+        with patch("agent_eyes.input_sim.time"):
+            backend.drag(100, 100, 300, 200)
+
+        MOUSEEVENTF_LEFTDOWN = 0x0002
+        MOUSEEVENTF_LEFTUP = 0x0004
+        self.assertIn(MOUSEEVENTF_LEFTDOWN, sent_flags)
+        self.assertIn(MOUSEEVENTF_LEFTUP, sent_flags)
+        self.assertLess(
+            sent_flags.index(MOUSEEVENTF_LEFTDOWN),
+            sent_flags.index(MOUSEEVENTF_LEFTUP),
+        )
+
+    def test_drag_same_point_still_returns_true(self):
+        """Dragging from and to the same coordinates should not crash."""
+        backend = self._make_backend()
+        with patch("agent_eyes.input_sim.time"):
+            result = backend.drag(100, 100, 100, 100)
+        self.assertTrue(result)
+
+    def test_drag_returns_false_on_exception(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._user32 = MagicMock()
+        backend._INPUT = MagicMock()
+        backend._MOUSEINPUT = MagicMock()
+        backend._KEYBDINPUT = MagicMock()
+        backend._send_input = MagicMock(side_effect=Exception("crash"))
+
+        result = backend.drag(0, 0, 100, 100)
+        self.assertFalse(result)
+
+
+# ---------------------------------------------------------------------------
+# WindowsInputBackend: _move_to helper
+# ---------------------------------------------------------------------------
+
+class TestWindowsInputBackendMoveHelper(unittest.TestCase):
+
+    def test_move_to_calls_send_input_once(self):
+        """_move_to() sends exactly one INPUT event."""
+        from agent_eyes.input_sim import WindowsInputBackend
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._user32 = MagicMock()
+        backend._user32.GetSystemMetrics.side_effect = lambda m: 1920 if m == 0 else 1080
+        backend._INPUT = MagicMock()
+        backend._MOUSEINPUT = MagicMock()
+        backend._send_input = MagicMock()
+
+        backend._move_to(960, 540)
+        backend._send_input.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

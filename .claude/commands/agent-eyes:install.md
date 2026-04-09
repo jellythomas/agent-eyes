@@ -1,6 +1,6 @@
-# agent-eyes Setup Wizard
+# agent-eyes Install
 
-Run the agent-eyes first-time setup to configure your AI tools and replace competing MCP servers.
+Install and configure agent-eyes across your AI coding tools. Scans for competing MCP servers and offers to replace them.
 
 ## Instructions
 

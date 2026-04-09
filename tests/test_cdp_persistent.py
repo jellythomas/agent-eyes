@@ -403,7 +403,7 @@ class TestCDPConnectionMessageIdMonotonicity:
 
         async def run():
             conn = CDPConnection()
-            ids = [await conn._next_id() for _ in range(10)]
+            ids = [conn._next_id() for _ in range(10)]
             return ids
 
         ids = loop.run_until_complete(run())
@@ -411,26 +411,13 @@ class TestCDPConnectionMessageIdMonotonicity:
         assert ids == list(range(1, 11))
 
     def test_ids_start_at_one(self):
-        loop = asyncio.new_event_loop()
-
-        async def run():
-            conn = CDPConnection()
-            return await conn._next_id()
-
-        first = loop.run_until_complete(run())
-        loop.close()
+        conn = CDPConnection()
+        first = conn._next_id()
         assert first == 1
 
     def test_ids_never_repeat(self):
-        loop = asyncio.new_event_loop()
-
-        async def run():
-            conn = CDPConnection()
-            ids = [await conn._next_id() for _ in range(100)]
-            return ids
-
-        ids = loop.run_until_complete(run())
-        loop.close()
+        conn = CDPConnection()
+        ids = [conn._next_id() for _ in range(100)]
         assert len(ids) == len(set(ids))
 
 

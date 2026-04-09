@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-eyes",
+  "description": "Accessibility-tree vision for AI agents — browser, desktop, and OS automation without screenshots",
+  "owner": {
+    "name": "Jelly Thomas"
+  },
+  "plugins": [
+    {
+      "name": "agent-eyes",
+      "description": "See and interact with any application using accessibility trees. Replaces Playwright/Puppeteer MCP.",
+      "category": "productivity",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/jellythomas/agent-eyes",
+        "sha": "HEAD"
+      },
+      "homepage": "https://github.com/jellythomas/agent-eyes"
+    }
+  ]
+}

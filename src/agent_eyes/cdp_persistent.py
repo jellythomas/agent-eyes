@@ -22,7 +22,7 @@ from .platform_utils import discover_cdp_port
 
 logger = logging.getLogger("agent-eyes")
 
-_DEFAULT_HOST = "127.0.0.1"
+_DEFAULT_HOST = "localhost"
 _DEFAULT_PORT = 9222
 
 
@@ -61,13 +61,56 @@ class CDPSession:
         """Send a CDP command and await its response.
 
         Returns the 'result' dict from Chrome, or raises RuntimeError on error.
+        On ConnectionError or websockets.ConnectionClosed, attempts one automatic
+        reconnect with a 2-second timeout before retrying the command.
         """
         msg_id = self._connection._next_id()
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = future
 
-        await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+        try:
+            await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+        except Exception as exc:
+            # Detect connection-level failures — WebSocket closed or gone
+            _is_conn_err = isinstance(exc, (ConnectionError, OSError))
+            if not _is_conn_err:
+                try:
+                    import websockets.exceptions
+                    _is_conn_err = isinstance(exc, websockets.exceptions.ConnectionClosed)
+                except ImportError:
+                    pass
+            if not _is_conn_err:
+                # Re-raise non-connection errors immediately (e.g. RuntimeError from dead socket)
+                _is_conn_err = "closed" in str(exc).lower() or "disconnected" in str(exc).lower()
+
+            if not _is_conn_err:
+                self._pending.pop(msg_id, None)
+                raise
+
+            # One automatic reconnect attempt — 2 second timeout
+            self._pending.pop(msg_id, None)
+            try:
+                await asyncio.wait_for(self._connection.ensure_connected(), timeout=2.0)
+            except Exception as reconnect_exc:
+                raise RuntimeError(
+                    f"CDP disconnected during {method}. "
+                    f"Reconnect failed: {reconnect_exc}. "
+                    f"Is Chrome still running with --remote-debugging-port?"
+                ) from reconnect_exc
+
+            # Retry once with a fresh future
+            msg_id = self._connection._next_id()
+            future = asyncio.get_running_loop().create_future()
+            self._pending[msg_id] = future
+            try:
+                await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+            except Exception as retry_exc:
+                self._pending.pop(msg_id, None)
+                raise RuntimeError(
+                    f"CDP disconnected during {method}. "
+                    f"Reconnect failed after 2s. "
+                    f"Is Chrome still running with --remote-debugging-port?"
+                ) from retry_exc
 
         try:
             result = await asyncio.wait_for(future, timeout=15.0)
@@ -137,7 +180,6 @@ class CDPConnection:
         self._ws = None
         self._connected = False
         self._msg_id = 0
-        self._id_lock = asyncio.Lock()
         self._sessions: dict[str, CDPSession] = {}   # sessionId → CDPSession
         self._tabs: list[ChromeTab] = []              # ordered list of tabs
         self._tab_by_target: dict[str, ChromeTab] = {}  # targetId → ChromeTab
@@ -245,11 +287,13 @@ class CDPConnection:
 
     # ── Internal: message ID ──────────────────────────────────────────
 
-    async def _next_id(self) -> int:
-        """Return a monotonically increasing message ID (thread-safe)."""
-        async with self._id_lock:
-            self._msg_id += 1
-            return self._msg_id
+    def _next_id(self) -> int:
+        """Return a monotonically increasing message ID.
+
+        Asyncio is single-threaded — no lock needed for a simple counter.
+        """
+        self._msg_id += 1
+        return self._msg_id
 
     # ── Internal: sending ─────────────────────────────────────────────
 
@@ -264,9 +308,8 @@ class CDPConnection:
 
     async def _send_browser(self, method: str, params: dict | None = None) -> dict:
         """Send a browser-level CDP command (no sessionId) and await response."""
-        msg_id = await self._next_id()
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
+        msg_id = self._next_id()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._browser_pending[msg_id] = future
 
         msg: dict[str, Any] = {"id": msg_id, "method": method, "params": params or {}}
@@ -323,6 +366,18 @@ class CDPConnection:
         except Exception as exc:
             logger.warning("CDPConnection: read loop error: %s", exc)
             self._connected = False
+        finally:
+            # Cancel all pending futures so callers don't hang
+            loop_err = RuntimeError("CDPConnection: read loop terminated")
+            for session in self._sessions.values():
+                for fut in session._pending.values():
+                    if not fut.done():
+                        fut.set_exception(loop_err)
+                session._pending.clear()
+            for fut in self._browser_pending.values():
+                if not fut.done():
+                    fut.set_exception(loop_err)
+            self._browser_pending.clear()
 
     # ── Internal: target lifecycle ────────────────────────────────────
 
@@ -370,6 +425,15 @@ class CDPConnection:
         session_id: str = params.get("sessionId", "")
         target_id: str = params.get("targetId", "")
 
+        # Cancel pending futures before removing session
+        session = self._sessions.get(session_id)
+        if session:
+            err = RuntimeError("Tab was closed while commands were pending")
+            for fut in session._pending.values():
+                if not fut.done():
+                    fut.set_exception(err)
+            session._pending.clear()
+
         # Remove session
         self._sessions.pop(session_id, None)
 
@@ -399,13 +463,28 @@ class CDPConnection:
 
     async def _get_browser_ws_url(self, port: int) -> str | None:
         """Fetch the browser WebSocket URL from /json/version HTTP endpoint."""
-        import urllib.request
-        try:
-            url = f"http://{self._host}:{port}/json/version"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read())
-                return data.get("webSocketDebuggerUrl")
-        except Exception as exc:
-            logger.debug("CDPConnection: /json/version failed: %s", exc)
-            return None
+        import urllib.parse
+
+        def _fetch_sync() -> str | None:
+            import urllib.request
+            try:
+                url = f"http://{self._host}:{port}/json/version"
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read())
+                    ws_url = data.get("webSocketDebuggerUrl")
+                    # Validate WebSocket URL points to localhost (not a remote host)
+                    if ws_url:
+                        parsed = urllib.parse.urlparse(ws_url)
+                        if parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+                            logger.warning(
+                                "CDPConnection: suspicious WS host %s — rejecting",
+                                parsed.hostname,
+                            )
+                            return None
+                    return ws_url
+            except Exception as exc:
+                logger.debug("CDPConnection: /json/version failed: %s", exc)
+                return None
+
+        return await asyncio.get_running_loop().run_in_executor(None, _fetch_sync)

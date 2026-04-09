@@ -101,6 +101,89 @@ def format_ax_tree(tree: dict | None, indent: int = 0) -> str:
     return "\n".join(lines) if lines else "No elements found."
 
 
+def _dom_to_role(node: dict) -> str:
+    """Infer accessibility role from DOM node."""
+    # Check ARIA role attribute first
+    attrs = node.get("attributes", [])
+    for i in range(0, len(attrs) - 1, 2):
+        if attrs[i] == "role":
+            return attrs[i + 1]
+
+    # Skip non-element nodes
+    if node.get("nodeType", 1) != 1:
+        return ""
+
+    tag = node.get("nodeName", "").lower()
+
+    # Handle input types
+    if tag == "input":
+        input_type = ""
+        for i in range(0, len(attrs) - 1, 2):
+            if attrs[i] == "type":
+                input_type = attrs[i + 1]
+                break
+        input_role_map = {
+            "checkbox": "checkbox", "radio": "radio",
+            "range": "slider", "submit": "button",
+            "button": "button", "reset": "button",
+        }
+        return input_role_map.get(input_type, "textbox")
+
+    tag_role_map = {
+        "a": "link", "button": "button", "select": "combobox",
+        "textarea": "textarea", "img": "image", "nav": "navigation",
+        "main": "main", "header": "banner", "footer": "contentinfo",
+        "h1": "heading", "h2": "heading", "h3": "heading",
+        "h4": "heading", "h5": "heading", "h6": "heading",
+        "table": "table", "form": "form", "dialog": "dialog",
+        "menu": "menu", "option": "option", "li": "listitem",
+        "ul": "list", "ol": "list",
+    }
+    return tag_role_map.get(tag, "")
+
+
+def _dom_to_name(node: dict) -> str:
+    """Extract accessible name from DOM node."""
+    attrs = node.get("attributes", [])
+    # Priority: aria-label > alt > title > placeholder > value
+    for priority_attr in ("aria-label", "alt", "title", "placeholder", "value"):
+        for i in range(0, len(attrs) - 1, 2):
+            if attrs[i] == priority_attr:
+                return attrs[i + 1]
+    # Fall back to text content for text nodes
+    node_value = node.get("nodeValue", "")
+    if node_value:
+        return node_value.strip()
+    return ""
+
+
+def merge_pierced_nodes(pierced_nodes: list[dict], existing_node_ids: set[int]) -> list[dict]:
+    """Find elements in pierced DOM that are NOT in the accessibility tree.
+
+    These are shadow DOM elements that the AX tree missed.
+    Returns list of dicts with role, name, nodeId for each shadow element.
+    Only includes elements that have a meaningful role AND name.
+    """
+    shadow_elements = []
+    for node in pierced_nodes:
+        node_id = node.get("nodeId")
+        if node_id in existing_node_ids:
+            continue  # Already in AX tree
+
+        role = _dom_to_role(node)
+        name = _dom_to_name(node)
+
+        if role and name:  # Only include meaningful elements
+            shadow_elements.append({
+                "role": role,
+                "name": name,
+                "nodeId": node_id,
+                "source": "shadow-dom",
+            })
+
+    return shadow_elements
+
+
 def _walk_format(node: dict, lines: list[str], depth: int) -> None:
     prefix = "  " * depth
     el_id = node.get("id", "")

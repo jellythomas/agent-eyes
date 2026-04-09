@@ -7,7 +7,7 @@ listeners to validate input (e.g., Jamf, web apps in Chrome).
 
 Platform support:
   - macOS:   CGEvent API via PyObjC (HID-level, indistinguishable from hardware)
-  - Linux:   xdotool (X11) / ydotool (Wayland) via subprocess
+  - Linux:   python-xlib XTest extension (X11, no subprocess)
   - Windows: SendInput via ctypes (kernel input stream)
 
 Usage:
@@ -81,6 +81,10 @@ class InputBackend(abc.ABC):
 
     def paste_text(self, text: str) -> bool:
         """Paste text via clipboard. Override per platform."""
+        return False
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> bool:
+        """Drag from one screen position to another."""
         return False
 
     def select_all(self) -> bool:
@@ -410,232 +414,210 @@ class MacOSInputBackend(InputBackend):
             return False
 
 
-# ── Linux: xdotool / ydotool ──────────────────────────────────────
+# ── Linux: python-xlib XTest ──────────────────────────────────────
 
 class LinuxInputBackend(InputBackend):
-    """Linux input simulation using xdotool (X11) or ydotool (Wayland)."""
+    """Linux input simulation using python-xlib XTest extension (X11)."""
 
     def __init__(self):
-        self._display_server: Optional[str] = None
-        self._tool: Optional[str] = None
-
-    def _detect(self):
-        if self._display_server is not None:
-            return
-
-        session = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        if session == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
-            self._display_server = "wayland"
-        else:
-            self._display_server = "x11"
-
-        # Check available tools
-        if self._display_server == "x11":
-            self._tool = "xdotool" if self._cmd_exists("xdotool") else None
-        else:
-            # Wayland: prefer ydotool, then wtype, then xdotool via XWayland
-            if self._cmd_exists("ydotool"):
-                self._tool = "ydotool"
-            elif self._cmd_exists("wtype"):
-                self._tool = "wtype"
-            elif self._cmd_exists("xdotool"):
-                self._tool = "xdotool"  # XWayland fallback
-
-    @staticmethod
-    def _cmd_exists(cmd: str) -> bool:
+        self._display = None
+        self._X = None
+        self._XK = None
+        self._xtest = None
         try:
-            result = subprocess.run(
-                ["which", cmd], capture_output=True, timeout=2,
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
+            from Xlib import X, XK, display
+            from Xlib.ext import xtest
+            self._display = display.Display()
+            self._X = X
+            self._XK = XK
+            self._xtest = xtest
+        except ImportError:
+            pass
 
     def is_available(self) -> bool:
-        if sys.platform != "linux":
-            return False
-        self._detect()
-        return self._tool is not None
+        return self._display is not None
 
     def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
-        self._detect()
-        delay_ms = int(delay * 1000)
         try:
-            if self._tool == "xdotool":
-                subprocess.run(
-                    ["xdotool", "type", "--delay", str(delay_ms), text],
-                    capture_output=True, timeout=30,
-                )
-            elif self._tool == "ydotool":
-                subprocess.run(
-                    ["ydotool", "type", "--key-delay", str(delay_ms), text],
-                    capture_output=True, timeout=30,
-                )
-            elif self._tool == "wtype":
-                subprocess.run(
-                    ["wtype", "-d", str(delay_ms), text],
-                    capture_output=True, timeout=30,
-                )
-            else:
-                return False
+            for char in text:
+                keysym = self._XK.string_to_keysym(char)
+                if not keysym:
+                    # Use Unicode keysym for chars not in standard X keysym table
+                    keysym = ord(char) | 0x01000000
+                keycode = self._display.keysym_to_keycode(keysym)
+                if keycode:
+                    self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
+                    self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
+                    self._display.sync()
+                if human_like:
+                    d = delay + random.uniform(-0.005, 0.015)
+                    if char in " .,;:!?\n":
+                        d *= random.uniform(1.3, 2.0)
+                    time.sleep(max(0, d))
+                else:
+                    time.sleep(delay)
             return True
         except Exception as e:
             logger.error("Linux type_text failed: %s", e)
             return False
 
-    # xdotool key name mapping
-    _XDOTOOL_KEYS = {
+    # XK name mapping for special keys
+    _KEY_MAP = {
         "return": "Return", "enter": "Return", "tab": "Tab",
-        "delete": "BackSpace", "backspace": "BackSpace",
-        "forward_delete": "Delete", "escape": "Escape", "esc": "Escape",
-        "space": "space", "home": "Home", "end": "End",
-        "page_up": "Page_Up", "page_down": "Page_Down",
-        "left": "Left", "right": "Right", "up": "Up", "down": "Down",
+        "escape": "Escape", "esc": "Escape",
+        "backspace": "BackSpace", "delete": "BackSpace",
+        "forward_delete": "Delete",
+        "space": "space",
+        "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+        "home": "Home", "end": "End",
+        "pageup": "Prior", "page_up": "Prior",
+        "pagedown": "Next", "page_down": "Next",
+        "control": "Control_L", "ctrl": "Control_L",
+        "shift": "Shift_L",
+        "alt": "Alt_L", "option": "Alt_L",
+        "command": "Super_L",
         "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
         "f5": "F5", "f6": "F6", "f7": "F7", "f8": "F8",
         "f9": "F9", "f10": "F10", "f11": "F11", "f12": "F12",
     }
 
-    # ydotool uses Linux evdev key codes
-    _YDOTOOL_KEYS = {
-        "return": 28, "enter": 28, "tab": 15,
-        "delete": 14, "backspace": 14,
-        "forward_delete": 111, "escape": 1, "esc": 1,
-        "space": 57, "home": 102, "end": 107,
-        "page_up": 104, "page_down": 109,
-        "left": 105, "right": 106, "up": 103, "down": 108,
-        "a": 30, "control": 29, "ctrl": 29, "shift": 42, "alt": 56,
-    }
-
     def press_key(self, key: str) -> bool:
-        self._detect()
         try:
-            if self._tool == "xdotool":
-                xkey = self._XDOTOOL_KEYS.get(key.lower(), key)
-                subprocess.run(
-                    ["xdotool", "key", xkey],
-                    capture_output=True, timeout=5,
-                )
-            elif self._tool == "ydotool":
-                code = self._YDOTOOL_KEYS.get(key.lower())
-                if code is None:
-                    return False
-                subprocess.run(
-                    ["ydotool", "key", f"{code}:1", f"{code}:0"],
-                    capture_output=True, timeout=5,
-                )
-            elif self._tool == "wtype":
-                xkey = self._XDOTOOL_KEYS.get(key.lower(), key)
-                subprocess.run(
-                    ["wtype", "-k", xkey],
-                    capture_output=True, timeout=5,
-                )
-            else:
+            xk_name = self._KEY_MAP.get(key.lower(), key)
+            keysym = self._XK.string_to_keysym(xk_name)
+            if not keysym:
+                logger.error("Linux press_key: unknown key %s", key)
                 return False
+            keycode = self._display.keysym_to_keycode(keysym)
+            if not keycode:
+                logger.error("Linux press_key: no keycode for %s", key)
+                return False
+            self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
+            self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
+            self._display.sync()
             return True
         except Exception as e:
             logger.error("Linux press_key failed: %s", e)
             return False
 
     def hotkey(self, *keys: str) -> bool:
-        self._detect()
         try:
-            if self._tool == "xdotool":
-                combo = "+".join(
-                    self._XDOTOOL_KEYS.get(k.lower(), k) for k in keys
-                )
-                subprocess.run(
-                    ["xdotool", "key", combo],
-                    capture_output=True, timeout=5,
-                )
-            elif self._tool == "ydotool":
-                # Press all modifiers, then key, then release in reverse
-                events = []
-                for k in keys:
-                    code = self._YDOTOOL_KEYS.get(k.lower())
-                    if code is None:
-                        return False
-                    events.append(f"{code}:1")
-                for k in reversed(keys):
-                    code = self._YDOTOOL_KEYS.get(k.lower())
-                    events.append(f"{code}:0")
-                subprocess.run(
-                    ["ydotool", "key"] + events,
-                    capture_output=True, timeout=5,
-                )
-            elif self._tool == "wtype":
-                # wtype: -M mod -k key -m mod
-                mods = keys[:-1]
-                final = keys[-1]
-                cmd = ["wtype"]
-                for m in mods:
-                    cmd.extend(["-M", m.lower()])
-                cmd.extend(["-k", self._XDOTOOL_KEYS.get(final.lower(), final)])
-                for m in reversed(mods):
-                    cmd.extend(["-m", m.lower()])
-                subprocess.run(cmd, capture_output=True, timeout=5)
-            else:
-                return False
+            keycodes = []
+            for key in keys:
+                xk_name = self._KEY_MAP.get(key.lower(), key)
+                keysym = self._XK.string_to_keysym(xk_name)
+                if not keysym:
+                    logger.error("Linux hotkey: unknown key %s", key)
+                    return False
+                kc = self._display.keysym_to_keycode(keysym)
+                if not kc:
+                    logger.error("Linux hotkey: no keycode for %s", key)
+                    return False
+                keycodes.append(kc)
+            for kc in keycodes:
+                self._xtest.fake_input(self._display, self._X.KeyPress, kc)
+            for kc in reversed(keycodes):
+                self._xtest.fake_input(self._display, self._X.KeyRelease, kc)
+            self._display.sync()
             return True
         except Exception as e:
             logger.error("Linux hotkey failed: %s", e)
             return False
 
     def click(self, x: int, y: int, button: str = "left") -> bool:
-        self._detect()
-        btn = "3" if button == "right" else "1"
+        btn_map = {"left": 1, "middle": 2, "right": 3}
+        btn = btn_map.get(button, 1)
         try:
-            if self._tool in ("xdotool",):
-                subprocess.run(
-                    ["xdotool", "mousemove", str(x), str(y)],
-                    capture_output=True, timeout=5,
-                )
-                time.sleep(0.01)
-                subprocess.run(
-                    ["xdotool", "click", btn],
-                    capture_output=True, timeout=5,
-                )
-            elif self._tool == "ydotool":
-                subprocess.run(
-                    ["ydotool", "mousemove", "--absolute",
-                     "-x", str(x), "-y", str(y)],
-                    capture_output=True, timeout=5,
-                )
-                time.sleep(0.01)
-                click_code = "0xC1" if button == "right" else "0xC0"
-                subprocess.run(
-                    ["ydotool", "click", click_code],
-                    capture_output=True, timeout=5,
-                )
-            else:
-                return False
+            root = self._display.screen().root
+            root.warp_pointer(x, y)
+            self._display.sync()
+            self._xtest.fake_input(self._display, self._X.ButtonPress, btn)
+            self._xtest.fake_input(self._display, self._X.ButtonRelease, btn)
+            self._display.sync()
             return True
         except Exception as e:
             logger.error("Linux click failed: %s", e)
             return False
 
+    def double_click(self, x: int, y: int) -> bool:
+        try:
+            root = self._display.screen().root
+            root.warp_pointer(x, y)
+            self._display.sync()
+            for _ in range(2):
+                self._xtest.fake_input(self._display, self._X.ButtonPress, 1)
+                self._xtest.fake_input(self._display, self._X.ButtonRelease, 1)
+                self._display.sync()
+                time.sleep(0.05)
+            return True
+        except Exception as e:
+            logger.error("Linux double_click failed: %s", e)
+            return False
+
+    def move_mouse(self, x: int, y: int) -> bool:
+        try:
+            root = self._display.screen().root
+            root.warp_pointer(x, y)
+            self._display.sync()
+            return True
+        except Exception as e:
+            logger.error("Linux move_mouse failed: %s", e)
+            return False
+
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
-        # TODO: implement platform-specific scroll
-        return False
+        # X11 button 4 = scroll up, button 5 = scroll down
+        # delta_y negative = down (button 5), positive = up (button 4)
+        try:
+            root = self._display.screen().root
+            root.warp_pointer(x, y)
+            self._display.sync()
+            if delta_y != 0:
+                btn = 5 if delta_y < 0 else 4
+                amount = abs(delta_y)
+                for _ in range(amount):
+                    self._xtest.fake_input(self._display, self._X.ButtonPress, btn)
+                    self._xtest.fake_input(self._display, self._X.ButtonRelease, btn)
+            if delta_x != 0:
+                # X11 button 6 = scroll left, button 7 = scroll right
+                btn = 7 if delta_x > 0 else 6
+                amount = abs(delta_x)
+                for _ in range(amount):
+                    self._xtest.fake_input(self._display, self._X.ButtonPress, btn)
+                    self._xtest.fake_input(self._display, self._X.ButtonRelease, btn)
+            self._display.sync()
+            return True
+        except Exception as e:
+            logger.error("Linux scroll failed: %s", e)
+            return False
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> bool:
+        try:
+            root = self._display.screen().root
+            root.warp_pointer(from_x, from_y)
+            self._display.sync()
+            self._xtest.fake_input(self._display, self._X.ButtonPress, 1)
+            self._display.sync()
+            steps = max(abs(to_x - from_x), abs(to_y - from_y), 1)
+            steps = min(steps, 20)
+            for i in range(1, steps + 1):
+                ix = from_x + (to_x - from_x) * i // steps
+                iy = from_y + (to_y - from_y) * i // steps
+                root.warp_pointer(ix, iy)
+                self._display.sync()
+            self._xtest.fake_input(self._display, self._X.ButtonRelease, 1)
+            self._display.sync()
+            return True
+        except Exception as e:
+            logger.error("Linux drag failed: %s", e)
+            return False
+
+    def paste_text(self, text: str) -> bool:
+        """Paste text via Ctrl+V after setting clipboard via xclip/xsel if available."""
+        return self.hotkey("ctrl", "v")
 
     def activate_window(self, pid: int) -> bool:
-        self._detect()
-        if self._tool == "xdotool":
-            try:
-                result = subprocess.run(
-                    ["xdotool", "search", "--pid", str(pid)],
-                    capture_output=True, text=True, timeout=5,
-                )
-                window_ids = result.stdout.strip().split("\n")
-                if window_ids and window_ids[0]:
-                    subprocess.run(
-                        ["xdotool", "windowactivate", "--sync", window_ids[0]],
-                        capture_output=True, timeout=5,
-                    )
-                    time.sleep(0.3)
-                    return True
-            except Exception:
-                pass
+        # python-xlib does not provide a reliable cross-WM window activation API.
+        # Return False and let the caller use alternative means.
         return False
 
 
@@ -879,9 +861,67 @@ class WindowsInputBackend(InputBackend):
             logger.error("Windows click failed: %s", e)
             return False
 
+    def _move_to(self, x: int, y: int):
+        """Move mouse to absolute position using normalized coords."""
+        screen_w = self._user32.GetSystemMetrics(0)
+        screen_h = self._user32.GetSystemMetrics(1)
+        nx = int(x * 65535 / screen_w)
+        ny = int(y * 65535 / screen_h)
+        inp = self._INPUT(
+            type=0,
+            _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
+                dx=nx, dy=ny,
+                dwFlags=0x0001 | 0x8000,  # MOVE | ABSOLUTE
+            )),
+        )
+        self._send_input(inp)
+
+    def _mouse_event(self, flags: int, data: int = 0):
+        """Send a mouse event with given flags."""
+        inp = self._INPUT(
+            type=0,
+            _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
+                dwFlags=flags, mouseData=data,
+            )),
+        )
+        self._send_input(inp)
+
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
-        # TODO: implement platform-specific scroll
-        return False
+        """Scroll using SendInput mouse wheel events."""
+        self._load()
+        try:
+            self._move_to(x, y)
+            MOUSEEVENTF_WHEEL = 0x0800
+            WHEEL_DELTA = 120
+            # delta_y negative = scroll down, positive = scroll up
+            amount = abs(delta_y) if delta_y != 0 else 3
+            wheel_delta = -WHEEL_DELTA if delta_y <= 0 else WHEEL_DELTA
+            for _ in range(amount):
+                self._mouse_event(MOUSEEVENTF_WHEEL, wheel_delta)
+            return True
+        except Exception as e:
+            logger.error("Windows scroll failed: %s", e)
+            return False
+
+    def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> bool:
+        """Drag using SendInput mouse events."""
+        self._load()
+        try:
+            self._move_to(from_x, from_y)
+            time.sleep(0.01)
+            self._mouse_event(0x0002)  # MOUSEEVENTF_LEFTDOWN
+            time.sleep(0.01)
+            steps = min(max(abs(to_x - from_x), abs(to_y - from_y), 1), 20)
+            for i in range(1, steps + 1):
+                ix = from_x + (to_x - from_x) * i // steps
+                iy = from_y + (to_y - from_y) * i // steps
+                self._move_to(ix, iy)
+                time.sleep(0.01)
+            self._mouse_event(0x0004)  # MOUSEEVENTF_LEFTUP
+            return True
+        except Exception as e:
+            logger.error("Windows drag failed: %s", e)
+            return False
 
     def activate_window(self, pid: int) -> bool:
         self._load()
