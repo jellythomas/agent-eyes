@@ -61,12 +61,56 @@ class CDPSession:
         """Send a CDP command and await its response.
 
         Returns the 'result' dict from Chrome, or raises RuntimeError on error.
+        On ConnectionError or websockets.ConnectionClosed, attempts one automatic
+        reconnect with a 2-second timeout before retrying the command.
         """
         msg_id = self._connection._next_id()
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = future
 
-        await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+        try:
+            await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+        except Exception as exc:
+            # Detect connection-level failures — WebSocket closed or gone
+            _is_conn_err = isinstance(exc, (ConnectionError, OSError))
+            if not _is_conn_err:
+                try:
+                    import websockets.exceptions
+                    _is_conn_err = isinstance(exc, websockets.exceptions.ConnectionClosed)
+                except ImportError:
+                    pass
+            if not _is_conn_err:
+                # Re-raise non-connection errors immediately (e.g. RuntimeError from dead socket)
+                _is_conn_err = "closed" in str(exc).lower() or "disconnected" in str(exc).lower()
+
+            if not _is_conn_err:
+                self._pending.pop(msg_id, None)
+                raise
+
+            # One automatic reconnect attempt — 2 second timeout
+            self._pending.pop(msg_id, None)
+            try:
+                await asyncio.wait_for(self._connection.ensure_connected(), timeout=2.0)
+            except Exception as reconnect_exc:
+                raise RuntimeError(
+                    f"CDP disconnected during {method}. "
+                    f"Reconnect failed: {reconnect_exc}. "
+                    f"Is Chrome still running with --remote-debugging-port?"
+                ) from reconnect_exc
+
+            # Retry once with a fresh future
+            msg_id = self._connection._next_id()
+            future = asyncio.get_running_loop().create_future()
+            self._pending[msg_id] = future
+            try:
+                await self._connection._send_raw(self.session_id, msg_id, method, params or {})
+            except Exception as retry_exc:
+                self._pending.pop(msg_id, None)
+                raise RuntimeError(
+                    f"CDP disconnected during {method}. "
+                    f"Reconnect failed after 2s. "
+                    f"Is Chrome still running with --remote-debugging-port?"
+                ) from retry_exc
 
         try:
             result = await asyncio.wait_for(future, timeout=15.0)
