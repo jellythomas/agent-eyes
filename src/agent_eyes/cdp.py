@@ -539,8 +539,8 @@ class CDPClient:
                 if error_text:
                     return {"error": error_text}
 
-                # Wait for load event (up to 10s)
-                deadline = time.monotonic() + 10
+                # Wait for load event (up to 12s — under the 15s outer server timeout)
+                deadline = time.monotonic() + 12
                 while time.monotonic() < deadline:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)

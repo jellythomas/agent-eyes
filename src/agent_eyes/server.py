@@ -37,6 +37,15 @@ else:
 
 logger = logging.getLogger("agent-eyes")
 
+
+async def _with_timeout(coro, seconds: float, operation: str):
+    """Wrap any async operation with a timeout and clear error."""
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except asyncio.TimeoutError:
+        return f"✗ {operation}: timed out after {seconds}s"
+
+
 # ── First-run auto-setup (once per process) ─────────────────────────
 _setup_checked = False
 
@@ -1232,7 +1241,11 @@ async def _handle_click(args: dict) -> str:
             # Validate CDP element is still valid (not stale from page changes)
             if not await cdp_client.is_element_valid(tab, element.platform_ref):
                 return f"ERROR: click [{element_id}]: element stale (page changed)\n  -> try: web_tree to refresh"
-            success = await cdp_client.click_element(tab, element.platform_ref)
+            success = await _with_timeout(
+                cdp_client.click_element(tab, element.platform_ref), 5.0, "click"
+            )
+            if isinstance(success, str):
+                return success  # timeout error string
             if success:
                 return f'clicked [{element_id}] {element.role} "{element.name}"'
             return f"ERROR: Could not click [{element_id}] via CDP."
@@ -1288,44 +1301,51 @@ async def _handle_type(args: dict) -> str:
         session, tier2_tab, tier2_err = await _get_cdp_session({"tab_index": tab_idx})
         if session is not None:
             try:
-                await session.enable_domain("DOM")
-                await session.enable_domain("Runtime")
-                # Focus the element
-                result = await session.send(
-                    "DOM.resolveNode",
-                    {"backendNodeId": element.platform_ref},
-                )
-                object_id = result.get("object", {}).get("objectId")
-                if object_id:
-                    await session.send(
-                        "Runtime.callFunctionOn",
-                        {
-                            "functionDeclaration": "function() { this.focus(); }",
-                            "objectId": object_id,
-                        },
+                async def _tier2_type():
+                    await session.enable_domain("DOM")
+                    await session.enable_domain("Runtime")
+                    # Focus the element
+                    res = await session.send(
+                        "DOM.resolveNode",
+                        {"backendNodeId": element.platform_ref},
                     )
-                    # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
-                    await session.send("Input.insertText", {"text": text})
-                    # Verify typing worked
-                    await asyncio.sleep(0.1)
-                    val_result = await session.send(
-                        "Runtime.callFunctionOn",
-                        {
-                            "functionDeclaration": "function() { return this.value || this.textContent || ''; }",
-                            "objectId": object_id,
-                            "returnByValue": True,
-                        },
-                    )
-                    actual_value = val_result.get("result", {}).get("value")
-                    if actual_value is not None and text in str(actual_value):
-                        return f'typed "{text}" into [{element_id}]'
-                    elif actual_value is not None:
-                        return (
-                            f"WARNING: typed \"{text}\" but verification failed. "
-                            f"Current value: \"{str(actual_value)[:80]}\". "
-                            f"The element may not accept input or may have transformed it."
+                    obj_id = res.get("object", {}).get("objectId")
+                    if obj_id:
+                        await session.send(
+                            "Runtime.callFunctionOn",
+                            {
+                                "functionDeclaration": "function() { this.focus(); }",
+                                "objectId": obj_id,
+                            },
                         )
+                        # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
+                        await session.send("Input.insertText", {"text": text})
+                        # Verify typing worked
+                        await asyncio.sleep(0.1)
+                        val_res = await session.send(
+                            "Runtime.callFunctionOn",
+                            {
+                                "functionDeclaration": "function() { return this.value || this.textContent || ''; }",
+                                "objectId": obj_id,
+                                "returnByValue": True,
+                            },
+                        )
+                        actual_val = val_res.get("result", {}).get("value")
+                        if actual_val is not None and text in str(actual_val):
+                            return f'typed "{text}" into [{element_id}]'
+                        elif actual_val is not None:
+                            return (
+                                f"WARNING: typed \"{text}\" but verification failed. "
+                                f"Current value: \"{str(actual_val)[:80]}\". "
+                                f"The element may not accept input or may have transformed it."
+                            )
                     return f'typed "{text}" into [{element_id}]'
+                tier2_result = await _with_timeout(_tier2_type(), 5.0, "type")
+                if isinstance(tier2_result, str) and not tier2_result.startswith("✗"):
+                    return tier2_result
+                elif tier2_result.startswith("✗"):
+                    logger.debug("_handle_type: Tier 2 timed out, falling through")
+                    # Fall through to Tier 3
             except Exception as exc:
                 logger.debug("_handle_type: Tier 2 failed: %s", exc)
                 # Fall through to Tier 3
@@ -1341,7 +1361,11 @@ async def _handle_type(args: dict) -> str:
             tab = _cached_tabs[tab_idx]
             if not await cdp_client.is_element_valid(tab, element.platform_ref):
                 return f"ERROR: type [{element_id}]: element stale (page changed)\n  -> try: web_tree to refresh"
-            success = await cdp_client.type_text(tab, element.platform_ref, text)
+            success = await _with_timeout(
+                cdp_client.type_text(tab, element.platform_ref, text), 5.0, "type"
+            )
+            if isinstance(success, str):
+                return success  # timeout error string
             if success:
                 await asyncio.sleep(0.1)
                 actual_value = await cdp_client.get_element_value(tab, element.platform_ref)
@@ -1672,20 +1696,25 @@ async def _handle_get_web_tree(args: dict) -> str:
     if session is not None and tab is not None:
         # Tier 2: get accessibility tree via persistent session
         try:
-            await session.enable_domain("Accessibility")
-            result = await session.send(
-                "Accessibility.getFullAXTree", {"depth": max_depth}
-            )
-            nodes = result.get("nodes", [])
-            if nodes:
-                # Build tree using the legacy CDPClient helper (reuse parsing logic)
-                tree = cdp_client._build_tree(nodes)
-                if tree is not None:
-                    chrome_pid = _get_chrome_pid()
-                    registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url)
-                    return _format_web_tree_response(
-                        tree, tab.title, tab.url, tab_index, max_depth, interactive_only
-                    )
+            async def _tier2_web_tree():
+                await session.enable_domain("Accessibility")
+                return await session.send(
+                    "Accessibility.getFullAXTree", {"depth": max_depth}
+                )
+            result = await _with_timeout(_tier2_web_tree(), 5.0, "get_web_tree")
+            if not isinstance(result, str):
+                nodes = result.get("nodes", [])
+                if nodes:
+                    # Build tree using the legacy CDPClient helper (reuse parsing logic)
+                    tree = cdp_client._build_tree(nodes)
+                    if tree is not None:
+                        chrome_pid = _get_chrome_pid()
+                        registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url)
+                        return _format_web_tree_response(
+                            tree, tab.title, tab.url, tab_index, max_depth, interactive_only
+                        )
+            else:
+                logger.debug("_handle_get_web_tree: Tier 2 timed out, falling through")
         except Exception as exc:
             logger.debug("_handle_get_web_tree: Tier 2 failed: %s", exc)
             # Fall through to Tier 3
@@ -1704,13 +1733,17 @@ async def _handle_get_web_tree(args: dict) -> str:
             return f"ERROR: Tab index {tab_index} out of range. Only {len(_cached_tabs)} tabs available."
 
         legacy_tab = _cached_tabs[tab_index]
-        tree = await cdp_client.get_accessibility_tree(legacy_tab, max_depth)
-        if tree is not None:
+        tree = await _with_timeout(
+            cdp_client.get_accessibility_tree(legacy_tab, max_depth), 5.0, "get_web_tree"
+        )
+        if not isinstance(tree, str) and tree is not None:
             chrome_pid = _get_chrome_pid()
             registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=legacy_tab.url)
             return _format_web_tree_response(
                 tree, legacy_tab.title, legacy_tab.url, tab_index, max_depth, interactive_only
             )
+        elif isinstance(tree, str):
+            return tree  # timeout error string
 
     # Fallback: AppleScript JS injection (macOS only, no CDP required)
     if sys.platform == "darwin" and _as is not None and _as.is_available():
@@ -1808,18 +1841,26 @@ async def _handle_navigate(args: dict) -> str:
         if session is not None:
             # Tier 2: persistent WebSocket path
             try:
-                await session.send("Page.navigate", {"url": url})
-                # Give the page a moment to start loading
-                await asyncio.sleep(0.3)
-                result = await session.send("Target.getTargetInfo", {"targetId": tab.id})
-                target_info = result.get("targetInfo", {})
-                return f"navigated to {target_info.get('url', url)}"
+                async def _tier2_navigate():
+                    await session.send("Page.navigate", {"url": url})
+                    # Give the page a moment to start loading
+                    await asyncio.sleep(0.3)
+                    r = await session.send("Target.getTargetInfo", {"targetId": tab.id})
+                    return r.get("targetInfo", {})
+                tier2_result = await _with_timeout(_tier2_navigate(), 15.0, "navigate")
+                if isinstance(tier2_result, str):
+                    # timed out — fall through to Tier 3
+                    logger.debug("_handle_navigate: Tier 2 timed out, falling through")
+                else:
+                    return f"navigated to {tier2_result.get('url', url)}"
             except Exception as exc:
                 logger.debug("_handle_navigate: Tier 2 failed: %s", exc)
                 # Fall through to Tier 3
 
         # Tier 3: legacy cdp_client
-        result = await cdp_client.navigate(tab, url)
+        result = await _with_timeout(cdp_client.navigate(tab, url), 15.0, "navigate")
+        if isinstance(result, str):
+            return result  # timeout error string
         if "error" in result:
             return f"ERROR: Navigation failed: {result['error']}"
         return f"navigated to {result.get('url', url)}"
@@ -1857,27 +1898,35 @@ async def _handle_evaluate(args: dict) -> str:
     if session is not None:
         # Tier 2: evaluate via persistent session
         try:
-            await session.enable_domain("Runtime")
-            result = await session.send(
-                "Runtime.evaluate",
-                {"expression": expression, "returnByValue": True},
-            )
-            exc_details = result.get("exceptionDetails")
-            if exc_details:
-                cdp_error = exc_details.get("text", "runtime exception")
+            async def _tier2_evaluate():
+                await session.enable_domain("Runtime")
+                return await session.send(
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True},
+                )
+            result = await _with_timeout(_tier2_evaluate(), 5.0, "evaluate")
+            if isinstance(result, str):
+                # timed out
+                cdp_error = result
             else:
-                value = result.get("result", {}).get("value")
-                if value is None:
-                    return "Result: undefined"
-                return f"Result: {json.dumps(value, indent=2, default=str) if not isinstance(value, str) else value}"
+                exc_details = result.get("exceptionDetails")
+                if exc_details:
+                    cdp_error = exc_details.get("text", "runtime exception")
+                else:
+                    value = result.get("result", {}).get("value")
+                    if value is None:
+                        return "Result: undefined"
+                    return f"Result: {json.dumps(value, indent=2, default=str) if not isinstance(value, str) else value}"
         except Exception as exc:
             logger.debug("_handle_evaluate: Tier 2 failed: %s", exc)
             cdp_error = str(exc)
 
     elif tab is not None:
         # Tier 3: legacy cdp_client
-        result = await cdp_client.evaluate(tab, expression)
-        if "error" not in result:
+        result = await _with_timeout(cdp_client.evaluate(tab, expression), 5.0, "evaluate")
+        if isinstance(result, str):
+            cdp_error = result
+        elif "error" not in result:
             value = result.get("value")
             if value is None:
                 return "Result: undefined"
@@ -2020,7 +2069,14 @@ async def _handle_wait_for(args: dict) -> str:
     if not err:
         tab, err = _get_tab(args)
         if not err:
-            element = await cdp_client.wait_for_element(tab, role, name, timeout)
+            wait_timeout = min(timeout, 30.0)
+            element = await _with_timeout(
+                cdp_client.wait_for_element(tab, role, name, timeout),
+                wait_timeout + 2.0,  # outer guard: slightly larger than inner polling timeout
+                "wait_for",
+            )
+            if isinstance(element, str):
+                return element  # timeout error string
             if element:
                 registry.register_element(element)
                 return (
