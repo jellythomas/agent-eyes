@@ -27,7 +27,7 @@ from .registry import ElementRegistry
 from . import platform_utils as _pu
 from .__init__ import __version__
 from .input_sim import get_input_backend
-from .js_bridge import build_ax_tree_script, format_ax_tree
+from .js_bridge import build_ax_tree_script, format_ax_tree, merge_pierced_nodes
 
 # AppleScript is macOS-only — import conditionally
 if sys.platform == "darwin":
@@ -867,6 +867,31 @@ TOOLS = [
             "required": ["action"],
         },
     ),
+    Tool(
+        name="pierce",
+        description=(
+            "Inspect shadow DOM elements inside a CSS selector's shadow root. "
+            "Modern web apps (Salesforce, Shopify, GitHub, Google) use shadow DOM to "
+            "encapsulate components — standard accessibility trees miss these elements. "
+            "Use pierce to see what's inside a shadow root: roles, names, and IDs for interaction. "
+            "Returns a flat list of all elements found via CDP DOM.getFlattenedDocument(pierce: true)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector identifying the element whose shadow root to inspect (e.g. 'custom-nav', '#app-shell')",
+                },
+                "tab_index": {
+                    "type": "integer",
+                    "description": "Chrome tab index (0-based, default: active tab)",
+                    "default": 0,
+                },
+            },
+            "required": ["selector"],
+        },
+    ),
 ]
 
 
@@ -924,6 +949,7 @@ def _build_dispatch_table() -> dict[str, object]:
         "window": _handle_window,
         "context": _handle_context,
         "shadow": _handle_shadow,
+        "pierce": _handle_pierce,
     }
 
 
@@ -1651,6 +1677,65 @@ def _get_chrome_pid() -> int:
     return 0
 
 
+async def _append_shadow_dom_elements(
+    tree: UIElement, tab, chrome_pid: int, tab_index: int, page_url: str
+) -> int:
+    """Augment the accessibility tree with shadow DOM elements from CDP pierce mode.
+
+    Calls DOM.getFlattenedDocument(pierce=True), finds elements that are NOT
+    already in the AX tree (by backendDOMNodeId), converts them to UIElement
+    objects, appends them as a flat list of children to the tree root, and
+    registers them in the registry.
+
+    Returns the count of shadow DOM elements added.
+    This is a best-effort operation — any failure is silently ignored so the
+    standard tree is always returned intact.
+    """
+    try:
+        pierced_nodes = await asyncio.wait_for(
+            cdp_client.get_pierced_dom(tab), timeout=3.0
+        )
+        if not pierced_nodes:
+            return 0
+
+        # Collect all backendDOMNodeIds already visible in the AX tree
+        existing_ids: set[int] = set()
+        _collect_platform_refs(tree, existing_ids)
+
+        shadow_dicts = merge_pierced_nodes(pierced_nodes, existing_ids)
+        if not shadow_dicts:
+            return 0
+
+        # Convert shadow dicts to UIElements and register them
+        shadow_elements: list[UIElement] = []
+        for sd in shadow_dicts:
+            el = UIElement(
+                id=cdp_client._next_id(),
+                role=sd["role"],
+                name=sd["name"],
+                source="shadow-dom",
+                platform_ref=sd.get("nodeId"),
+                pid=chrome_pid,
+                tab_index=tab_index,
+            )
+            shadow_elements.append(el)
+
+        registry.register_elements(shadow_elements)
+        tree.children.extend(shadow_elements)
+        return len(shadow_elements)
+    except Exception as e:
+        logger.debug("_append_shadow_dom_elements failed (non-critical): %s", e)
+        return 0
+
+
+def _collect_platform_refs(element: UIElement, refs: set[int]) -> None:
+    """Recursively collect all platform_ref values from a UIElement tree."""
+    if element.platform_ref is not None:
+        refs.add(element.platform_ref)
+    for child in element.children:
+        _collect_platform_refs(child, refs)
+
+
 def _format_web_tree_response(
     tree: UIElement,
     tab_title: str,
@@ -1710,6 +1795,11 @@ async def _handle_get_web_tree(args: dict) -> str:
                     if tree is not None:
                         chrome_pid = _get_chrome_pid()
                         registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url)
+                        # Augment with shadow DOM elements (optional — never blocks the response)
+                        try:
+                            await _append_shadow_dom_elements(tree, tab, chrome_pid, tab_index, tab.url)
+                        except Exception as _shadow_err:
+                            logger.debug("Shadow DOM piercing skipped: %s", _shadow_err)
                         return _format_web_tree_response(
                             tree, tab.title, tab.url, tab_index, max_depth, interactive_only
                         )
@@ -1739,6 +1829,11 @@ async def _handle_get_web_tree(args: dict) -> str:
         if not isinstance(tree, str) and tree is not None:
             chrome_pid = _get_chrome_pid()
             registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=legacy_tab.url)
+            # Augment with shadow DOM elements (optional — never blocks the response)
+            try:
+                await _append_shadow_dom_elements(tree, legacy_tab, chrome_pid, tab_index, legacy_tab.url)
+            except Exception as _shadow_err:
+                logger.debug("Shadow DOM piercing skipped: %s", _shadow_err)
             return _format_web_tree_response(
                 tree, legacy_tab.title, legacy_tab.url, tab_index, max_depth, interactive_only
             )
@@ -2779,6 +2874,38 @@ def _handle_shadow(args: dict) -> str:
         return "ERROR: JavaScript execution failed."
 
     return f"ERROR: Unknown action '{action}'."
+
+
+# ── Shadow DOM pierce handler ────────────────────────────────────────
+async def _handle_pierce(args: dict) -> str:
+    selector = args.get("selector", "")
+    if not selector:
+        return "✗ pierce: selector required"
+
+    session, tab, cdp_err = await _get_cdp_session(args)
+    if tab is None:
+        return f"✗ pierce: no browser connection — {cdp_err or 'check Chrome is running with --remote-debugging-port=9222'}"
+
+    try:
+        pierced = await asyncio.wait_for(
+            cdp_client.get_pierced_dom(tab), timeout=3.0
+        )
+        if not pierced:
+            return f"✗ pierce: no DOM nodes returned (CDP unavailable or page not loaded)"
+
+        # Include ALL pierced nodes (not filtered by existing AX tree)
+        elements = merge_pierced_nodes(pierced, set())
+        if not elements:
+            return f"✗ pierce: no shadow DOM elements found for selector '{selector}'"
+
+        lines = []
+        for el in elements:
+            lines.append(f'[shadow] {el["role"]} "{el["name"]}"')
+        return "\n".join(lines)
+    except asyncio.TimeoutError:
+        return "✗ pierce: timed out after 3s"
+    except Exception as e:
+        return f"✗ pierce: {e}"
 
 
 # ── Entry point ─────────────────────────────────────────────────────

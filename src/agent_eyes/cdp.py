@@ -1152,3 +1152,27 @@ class CDPClient:
             platform_ref=backend_id,  # Store backend DOM node ID
             source="cdp",
         )
+
+    async def get_pierced_dom(self, tab: ChromeTab) -> list[dict]:
+        """Get full DOM including shadow roots via CDP pierce mode.
+
+        Uses DOM.getFlattenedDocument with pierce=True to traverse into
+        shadow roots that are invisible to the Accessibility tree.
+        Returns the flat list of DOM nodes, or [] on any failure.
+        """
+        import websockets
+
+        try:
+            async with websockets.connect(tab.ws_url) as ws:
+                # Enable DOM domain first
+                await self._send(ws, "DOM.enable")
+                result = await self._send(
+                    ws,
+                    "DOM.getFlattenedDocument",
+                    {"depth": -1, "pierce": True},
+                    timeout=3.0,
+                )
+                return result.get("nodes", [])
+        except Exception as e:
+            logger.debug("get_pierced_dom failed (non-critical): %s", e)
+            return []
