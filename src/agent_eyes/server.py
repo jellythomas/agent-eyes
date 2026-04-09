@@ -187,14 +187,14 @@ def _platform_status() -> str:
         parts.append(f"Native adapter: {native_adapter.__class__.__name__} — {msg}")
     else:
         parts.append("Native adapter: NOT AVAILABLE (missing dependencies)")
-    parts.append("CDP (Chrome): check with eyes_list_chrome_tabs")
+    parts.append("CDP (Chrome): check with list_tabs")
     return "\n".join(parts)
 
 
 # ── Tool definitions ────────────────────────────────────────────────
 TOOLS = [
     Tool(
-        name="eyes_status",
+        name="status",
         description=(
             "Check agent-eyes status: platform adapter, permissions, CDP availability. "
             "Call this first to verify the server is working."
@@ -202,26 +202,26 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
-        name="eyes_list_apps",
+        name="list_apps",
         description=(
             "List all running applications with visible windows. "
             "Returns PID, name, bundle ID, window titles. "
-            "Use the PID to call eyes_get_tree."
+            "Use the PID to call tree."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
-        name="eyes_get_tree",
+        name="tree",
         description=(
             "Get the accessibility tree of an application by PID. "
             "Returns a numbered text representation of ALL UI elements — "
             "buttons, text fields, headings, tables, etc. "
-            "Each element has an [id] you can use with eyes_click/eyes_type. "
+            "Each element has an [id] you can use with click/type. "
             "This is the PRIMARY way to 'see' an application — no screenshot needed. "
             "For Chrome/Chromium browsers, automatically includes web page content "
             "(headings, buttons, inputs, links, chat items) via AppleScript on macOS "
             "or CDP on all platforms (macOS/Linux/Windows). "
-            "For large apps, use eyes_get_subtree to drill into specific sections."
+            "For large apps, use subtree to drill into specific sections."
         ),
         inputSchema={
             "type": "object",
@@ -240,10 +240,10 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_find",
+        name="find",
         description=(
             "Search for UI elements by role, name, or value within an app. "
-            "Searches the currently loaded tree (call eyes_get_tree first) "
+            "Searches the currently loaded tree (call tree first) "
             "or specify a PID to load fresh. Returns matching elements with IDs."
         ),
         inputSchema={
@@ -276,7 +276,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_click",
+        name="click",
         description=(
             "Click/press a UI element by its [id] from the tree. "
             "Works for buttons, links, checkboxes, menu items, etc. "
@@ -306,7 +306,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_type",
+        name="type",
         description=(
             "Type text into a UI element (text field, search box, etc.) by its [id]. "
             "Uses human-like keyboard simulation (real key events) when possible, "
@@ -328,7 +328,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_get_focused",
+        name="focused",
         description=(
             "Get the currently focused UI element across all apps. "
             "Useful to see what's active without knowing which app/PID."
@@ -336,18 +336,18 @@ TOOLS = [
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
-        name="eyes_list_chrome_tabs",
+        name="list_tabs",
         description=(
             "List all Chrome browser tabs. Returns tab ID, title, URL. "
             "Uses CDP (Chrome DevTools Protocol) with auto-discovery of debug port. "
             "On macOS, falls back to AppleScript if CDP unavailable. "
             "On Linux/Windows, requires Chrome started with --remote-debugging-port. "
-            "Use tab ID with eyes_get_web_tree for richer web content access."
+            "Use tab ID with web_tree for richer web content access."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
-        name="eyes_get_web_tree",
+        name="web_tree",
         description=(
             "Get the accessibility tree of a Chrome tab via CDP. "
             "Richer than native AX for web content — gets full semantic structure. "
@@ -358,7 +358,7 @@ TOOLS = [
             "properties": {
                 "tab_index": {
                     "type": "integer",
-                    "description": "Tab index from eyes_list_chrome_tabs (0-based)",
+                    "description": "Tab index from list_tabs (0-based)",
                     "default": 0,
                 },
                 "max_depth": {
@@ -372,7 +372,7 @@ TOOLS = [
     ),
     # ── New tools ──────────────────────────────────────────────────
     Tool(
-        name="eyes_navigate",
+        name="navigate",
         description=(
             "Navigate a Chrome tab to a URL. Opens the URL in the specified tab "
             "(default: current tab). Waits for the page to load."
@@ -394,7 +394,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_evaluate",
+        name="js",
         description=(
             "Execute JavaScript in a Chrome tab and return the result. "
             "Supports async expressions (await). Returns the evaluated value."
@@ -416,7 +416,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_press_key",
+        name="press_key",
         description=(
             "Press a keyboard key in any application (native or web). "
             "For native apps, provide a PID to target that app. "
@@ -424,7 +424,7 @@ TOOLS = [
             "Supports special keys (Enter, Tab, Escape, Backspace, Delete, "
             "ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, F1-F12, Space) "
             "and modifiers (Ctrl, Alt, Meta/Cmd, Shift). "
-            "For typing text into a field, use eyes_type instead."
+            "For typing text into a field, use type instead."
         ),
         inputSchema={
             "type": "object",
@@ -452,7 +452,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_wait_for",
+        name="wait",
         description=(
             "Wait for a web element to appear in the accessibility tree. "
             "Polls until the element is found or timeout is reached."
@@ -487,7 +487,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_new_tab",
+        name="new_tab",
         description=(
             "Open a new Chrome tab, optionally navigating to a URL. "
             "Returns the new tab's info."
@@ -505,10 +505,10 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_close_tab",
+        name="close_tab",
         description=(
             "Close a Chrome tab by title match or index. "
-            "IMPORTANT: Always call eyes_list_chrome_tabs first to verify "
+            "IMPORTANT: Always call list_tabs first to verify "
             "which tab to close. Prefer using 'title' over 'tab_index' for safety."
         ),
         inputSchema={
@@ -530,7 +530,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_handle_dialog",
+        name="dialog",
         description=(
             "Handle a JavaScript dialog (alert, confirm, prompt). "
             "Accept or dismiss it, optionally providing text for prompts."
@@ -557,7 +557,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_file_upload",
+        name="upload",
         description=(
             "Upload file(s) to a file input element by its [id]. "
             "Provide absolute file paths."
@@ -579,7 +579,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_scroll",
+        name="scroll",
         description=(
             "Scroll the page in a Chrome tab. Use positive delta_y to scroll down, "
             "negative to scroll up. Coordinates specify where to scroll from."
@@ -621,7 +621,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_drag",
+        name="drag",
         description=(
             "Drag and drop from one point to another in a Chrome tab. "
             "Simulates smooth mouse movement."
@@ -643,7 +643,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_fill_form",
+        name="fill_form",
         description=(
             "Fill multiple form fields at once. Each field is identified by its [id] "
             "from the web accessibility tree."
@@ -674,7 +674,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_hover",
+        name="hover",
         description=(
             "Hover over a UI element to trigger tooltips, dropdown previews, "
             "or CSS :hover states. Moves the mouse to the element's center."
@@ -699,7 +699,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_app",
+        name="app",
         description=(
             "Launch, quit, or switch to an application. "
             "Actions: 'launch' (by name or bundle ID), 'quit', 'focus' (bring to front)."
@@ -721,7 +721,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_get_subtree",
+        name="subtree",
         description=(
             "Get the accessibility subtree rooted at a specific element. "
             "Use to drill into complex UIs without loading the entire tree. "
@@ -732,7 +732,7 @@ TOOLS = [
             "properties": {
                 "id": {
                     "type": "integer",
-                    "description": "Element ID to expand (from a previous eyes_get_tree)",
+                    "description": "Element ID to expand (from a previous tree call)",
                 },
                 "max_depth": {
                     "type": "integer",
@@ -744,7 +744,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_window",
+        name="window",
         description=(
             "Manage application windows. Actions: 'list' (all windows with positions), "
             "'focus' (bring to front), 'minimize', 'close', 'move' (x,y), 'resize' (w,h)."
@@ -770,7 +770,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_context",
+        name="context",
         description=(
             "Get a quick context snapshot: frontmost app, active window, focused element, "
             "and a summary of interactive elements. One call instead of multiple tools. "
@@ -793,7 +793,7 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_shadow",
+        name="shadow",
         description=(
             "Execute browser actions in the background WITHOUT focusing Chrome. "
             "Actions: 'click' (by text/selector), 'type' (into focused/selected element), "
@@ -867,32 +867,32 @@ _DISPATCH_TABLE: dict[str, object] | None = None
 def _build_dispatch_table() -> dict[str, object]:
     """O(1) lookup instead of 30+ if/elif branches."""
     return {
-        "eyes_status": lambda args: _handle_status(),
-        "eyes_list_apps": lambda args: _handle_list_apps(),
-        "eyes_get_tree": _handle_get_tree,
-        "eyes_find": _handle_find,
-        "eyes_click": _handle_click,
-        "eyes_type": _handle_type,
-        "eyes_get_focused": lambda args: _handle_get_focused(),
-        "eyes_list_chrome_tabs": lambda args: _handle_list_chrome_tabs(),
-        "eyes_get_web_tree": _handle_get_web_tree,
-        "eyes_navigate": _handle_navigate,
-        "eyes_evaluate": _handle_evaluate,
-        "eyes_press_key": _handle_press_key,
-        "eyes_wait_for": _handle_wait_for,
-        "eyes_new_tab": _handle_new_tab,
-        "eyes_close_tab": _handle_close_tab,
-        "eyes_handle_dialog": _handle_dialog,
-        "eyes_file_upload": _handle_file_upload,
-        "eyes_scroll": _handle_scroll,
-        "eyes_drag": _handle_drag,
-        "eyes_fill_form": _handle_fill_form,
-        "eyes_hover": _handle_hover,
-        "eyes_app": _handle_app,
-        "eyes_get_subtree": _handle_get_subtree,
-        "eyes_window": _handle_window,
-        "eyes_context": _handle_context,
-        "eyes_shadow": _handle_shadow,
+        "status": lambda args: _handle_status(),
+        "list_apps": lambda args: _handle_list_apps(),
+        "tree": _handle_get_tree,
+        "find": _handle_find,
+        "click": _handle_click,
+        "type": _handle_type,
+        "focused": lambda args: _handle_get_focused(),
+        "list_tabs": lambda args: _handle_list_chrome_tabs(),
+        "web_tree": _handle_get_web_tree,
+        "navigate": _handle_navigate,
+        "js": _handle_evaluate,
+        "press_key": _handle_press_key,
+        "wait": _handle_wait_for,
+        "new_tab": _handle_new_tab,
+        "close_tab": _handle_close_tab,
+        "dialog": _handle_dialog,
+        "upload": _handle_file_upload,
+        "scroll": _handle_scroll,
+        "drag": _handle_drag,
+        "fill_form": _handle_fill_form,
+        "hover": _handle_hover,
+        "app": _handle_app,
+        "subtree": _handle_get_subtree,
+        "window": _handle_window,
+        "context": _handle_context,
+        "shadow": _handle_shadow,
     }
 
 
@@ -973,7 +973,7 @@ def _handle_list_apps() -> str:
         lines.append(f"{app.pid:<6} | {app.name[:30]:<30}{front} | {wins}")
 
     lines.append(f"\n{len(apps)} apps found. * = frontmost")
-    lines.append("Use eyes_get_tree with a PID to see the app's UI.")
+    lines.append("Use tree with a PID to see the app's UI.")
     return "\n".join(lines)
 
 
@@ -1028,18 +1028,18 @@ async def _handle_get_tree(args: dict) -> str:
             "\n\n── Web content not yet visible in native tree ──────────────\n"
             "The app may not have built its accessibility tree yet.\n"
             "Try again — agent-eyes has signaled the app to enable accessibility.\n"
-            "If this persists, try: eyes_get_tree with max_depth=20"
+            "If this persists, try: tree with max_depth=20"
         )
     elif interactive_count < 3 and registry.count() > 5:
         advisory = (
             "\n\nNote: few interactive elements found. "
-            "Try eyes_get_web_tree for web content or increase max_depth."
+            "Try web_tree for web content or increase max_depth."
         )
 
     return (
         f"{meta}\n\n"
         f"{text}{advisory}\n\n"
-        f"Use [id] numbers with eyes_click or eyes_type to interact."
+        f"Use [id] numbers with click or type to interact."
     )
 
 
@@ -1185,12 +1185,12 @@ async def _handle_click(args: dict) -> str:
 
     element = registry.get(element_id)
     if element is None:
-        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+        return f"ERROR: Element [{element_id}] not found. Call tree first."
 
     # Validate element reference is still alive (app may have navigated, window closed)
     if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
         if not native_adapter.is_element_valid(element):
-            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call tree to refresh."
 
     # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
     if element.source == "cdp" and element.platform_ref is not None:
@@ -1202,11 +1202,11 @@ async def _handle_click(args: dict) -> str:
             # Use element's tab_index, not hardcoded 0
             tab_idx = element.tab_index if element.tab_index >= 0 else 0
             if tab_idx >= len(_cached_tabs):
-                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call eyes_get_web_tree to refresh."
+                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call web_tree to refresh."
             tab = _cached_tabs[tab_idx]
             # Validate CDP element is still valid (not stale from page changes)
             if not await cdp_client.is_element_valid(tab, element.platform_ref):
-                return f"ERROR: Element [{element_id}] is stale (page has changed). Call eyes_get_web_tree to refresh."
+                return f"ERROR: Element [{element_id}] is stale (page has changed). Call web_tree to refresh."
             success = await cdp_client.click_element(tab, element.platform_ref)
             if success:
                 return f"Clicked [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx})"
@@ -1251,12 +1251,12 @@ async def _handle_type(args: dict) -> str:
 
     element = registry.get(element_id)
     if element is None:
-        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+        return f"ERROR: Element [{element_id}] not found. Call tree first."
 
     # Validate element reference is still alive (app may have navigated, window closed)
     if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
         if not native_adapter.is_element_valid(element):
-            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
+            return f"ERROR: Element [{element_id}] is stale (UI has changed). Call tree to refresh."
 
     # Route CDP elements to CDP backend — try Tier 2 (persistent) first, then Tier 3 (legacy)
     if element.source == "cdp" and element.platform_ref is not None:
@@ -1315,10 +1315,10 @@ async def _handle_type(args: dict) -> str:
                 return err
         if _cached_tabs:
             if tab_idx >= len(_cached_tabs):
-                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call eyes_get_web_tree to refresh."
+                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call web_tree to refresh."
             tab = _cached_tabs[tab_idx]
             if not await cdp_client.is_element_valid(tab, element.platform_ref):
-                return f"ERROR: Element [{element_id}] is stale (page has changed). Call eyes_get_web_tree to refresh."
+                return f"ERROR: Element [{element_id}] is stale (page has changed). Call web_tree to refresh."
             success = await cdp_client.type_text(tab, element.platform_ref, text)
             if success:
                 await asyncio.sleep(0.1)
@@ -1520,7 +1520,7 @@ async def _handle_list_chrome_tabs() -> str:
             for i, tab in enumerate(pool_tabs):
                 lines.append(f"[{i}] {tab.title}")
                 lines.append(f"    {tab.url}\n")
-            lines.append("Use eyes_get_web_tree with tab_index to see a tab's UI.")
+            lines.append("Use web_tree with tab_index to see a tab's UI.")
             return "\n".join(lines)
 
     available = await cdp_client.is_available()
@@ -1538,7 +1538,7 @@ async def _handle_list_chrome_tabs() -> str:
             lines.append(f"[{i}] {tab.title}")
             lines.append(f"    {tab.url}\n")
 
-        lines.append("Use eyes_get_web_tree with tab_index to see a tab's UI.")
+        lines.append("Use web_tree with tab_index to see a tab's UI.")
         return "\n".join(lines)
 
     # Fallback: AppleScript (macOS only, no --remote-debugging-port needed)
@@ -1552,9 +1552,9 @@ async def _handle_list_chrome_tabs() -> str:
                 lines.append(f"    {tab.url}  (window {tab.window_index})\n")
 
             lines.append(
-                "Note: For full web tree interaction (eyes_get_web_tree, eyes_click),\n"
+                "Note: For full web tree interaction (web_tree, click),\n"
                 f"start Chrome with: {launch_cmd}\n\n"
-                "Current mode supports: tab listing, page content reading via eyes_get_tree on Chrome PID."
+                "Current mode supports: tab listing, page content reading via tree on Chrome PID."
             )
             return "\n".join(lines)
 
@@ -1645,7 +1645,7 @@ async def _handle_get_web_tree(args: dict) -> str:
                         f"URL: {tab.url}\n"
                         f"Elements: {registry.count()}\n\n"
                         f"{text}\n\n"
-                        f"Use [id] numbers with eyes_click or eyes_type to interact."
+                        f"Use [id] numbers with click or type to interact."
                     )
         except Exception as exc:
             logger.debug("_handle_get_web_tree: Tier 2 failed: %s", exc)
@@ -1675,7 +1675,7 @@ async def _handle_get_web_tree(args: dict) -> str:
                 f"URL: {legacy_tab.url}\n"
                 f"Elements: {registry.count()}\n\n"
                 f"{text}\n\n"
-                f"Use [id] numbers with eyes_click or eyes_type to interact."
+                f"Use [id] numbers with click or type to interact."
             )
 
     # Fallback: AppleScript JS injection (macOS only, no CDP required)
@@ -1696,7 +1696,7 @@ async def _handle_get_web_tree(args: dict) -> str:
                     f"URL: {tab_url}\n"
                     "(via AppleScript JS injection — CDP not available)\n\n"
                     f"{text}\n\n"
-                    "Note: element [id]s are JS-generated — use eyes_shadow for interaction without CDP."
+                    "Note: element [id]s are JS-generated — use shadow for interaction without CDP."
                 )
             except Exception as e:
                 logger.debug("AppleScript web tree parse failed: %s", e)
@@ -1998,7 +1998,7 @@ async def _handle_wait_for(args: dict) -> str:
                 registry.register_element(element)
                 return (
                     f"Found element: [{element.id}] {element.role} \"{element.name}\"\n"
-                    f"Use this [id] with eyes_click or eyes_type."
+                    f"Use this [id] with click or type."
                 )
             return f"Timeout: element not found after {timeout}s (role={role!r}, name={name!r})"
 
@@ -2409,7 +2409,7 @@ async def _handle_hover(args: dict) -> str:
 
     element = registry.get(element_id)
     if element is None:
-        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+        return f"ERROR: Element [{element_id}] not found. Call tree first."
 
     if element.bounds:
         x, y, w, h = element.bounds
@@ -2431,7 +2431,7 @@ def _handle_app(args: dict) -> str:
         return "ERROR: action and name are required."
 
     if sys.platform != "darwin":
-        return "ERROR: eyes_app currently only supports macOS."
+        return "ERROR: app currently only supports macOS."
 
     try:
         from AppKit import NSWorkspace, NSWorkspaceOpenConfiguration
@@ -2482,7 +2482,7 @@ def _handle_get_subtree(args: dict) -> str:
 
     element = registry.get(element_id)
     if element is None:
-        return f"ERROR: Element [{element_id}] not found. Call eyes_get_tree first."
+        return f"ERROR: Element [{element_id}] not found. Call tree first."
 
     if not native_adapter:
         return "ERROR: No native adapter available."
@@ -2490,7 +2490,7 @@ def _handle_get_subtree(args: dict) -> str:
     # Validate element is still alive
     if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
         if not native_adapter.is_element_valid(element):
-            return f"ERROR: Element [{element_id}] is stale. Call eyes_get_tree to refresh."
+            return f"ERROR: Element [{element_id}] is stale. Call tree to refresh."
 
     # Re-traverse from this element's platform_ref
     if element.platform_ref is None:
@@ -2506,7 +2506,7 @@ def _handle_get_subtree(args: dict) -> str:
     return (
         f"Subtree of [{element_id}] ({_count_interactive(subtree)} interactive elements):\n\n"
         f"{text}\n\n"
-        f"Use [id] numbers with eyes_click or eyes_type to interact."
+        f"Use [id] numbers with click or type to interact."
     )
 
 
