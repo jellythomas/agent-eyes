@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -68,7 +69,7 @@ class CDPClient:
     falling back to the specified port (default 9222).
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 9222):
+    def __init__(self, host: str = "localhost", port: int = 9222):
         self.host = host
         self.port = port
         self._discovered_port: int | None = None
@@ -128,42 +129,55 @@ class CDPClient:
 
     async def _check_port_urllib(self, port: int) -> bool:
         """Fallback availability check without aiohttp."""
-        import urllib.request
-        try:
-            req = urllib.request.Request(
-                f"http://{self.host}:{port}/json/version"
-            )
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        def _check_sync() -> bool:
+            import urllib.request
+            try:
+                req = urllib.request.Request(
+                    f"http://{self.host}:{port}/json/version"
+                )
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    return resp.status == 200
+            except Exception:
+                return False
+        return await asyncio.get_running_loop().run_in_executor(None, _check_sync)
 
     async def list_tabs(self) -> list[ChromeTab]:
         """List all Chrome tabs."""
-        import urllib.request
-        try:
-            req = urllib.request.Request(
-                f"http://{self.host}:{self.active_port}/json"
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
+        def _list_sync() -> list[ChromeTab]:
+            import urllib.request
+            try:
+                req = urllib.request.Request(
+                    f"http://{self.host}:{self.active_port}/json"
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read())
 
-            tabs = []
-            for item in data:
-                if item.get("type") != "page":
-                    continue
-                ws_url = item.get("webSocketDebuggerUrl", "")
-                if not ws_url:
-                    continue
-                tabs.append(ChromeTab(
-                    id=item.get("id", ""),
-                    title=item.get("title", ""),
-                    url=item.get("url", ""),
-                    ws_url=ws_url,
-                ))
-            return tabs
-        except Exception:
-            return []
+                tabs = []
+                for item in data:
+                    if item.get("type") != "page":
+                        continue
+                    ws_url = item.get("webSocketDebuggerUrl", "")
+                    if not ws_url:
+                        continue
+                    # Validate WebSocket URL points to localhost
+                    import urllib.parse
+                    parsed_ws = urllib.parse.urlparse(ws_url)
+                    if parsed_ws.hostname not in ("localhost", "127.0.0.1", "::1"):
+                        logger.warning(
+                            "CDPClient: suspicious WS host %s — skipping tab",
+                            parsed_ws.hostname,
+                        )
+                        continue
+                    tabs.append(ChromeTab(
+                        id=item.get("id", ""),
+                        title=item.get("title", ""),
+                        url=item.get("url", ""),
+                        ws_url=ws_url,
+                    ))
+                return tabs
+            except Exception:
+                return []
+        return await asyncio.get_running_loop().run_in_executor(None, _list_sync)
 
     async def get_accessibility_tree(
         self, tab: ChromeTab, max_depth: int = 5, enrich: bool = True
@@ -231,17 +245,19 @@ class CDPClient:
 
     async def _enrich_subtree(self, ws, element: UIElement, limit: int) -> int:
         """Recursive helper for _enrich_tree (domains already enabled)."""
+        if limit <= 0:
+            return 0
         enriched = 0
-        if enriched >= limit:
-            return enriched
 
         if element.role in self._ENRICH_ROLES and element.platform_ref:
             try:
-                box = await self._get_box_model(ws, element.platform_ref)
+                # Run box model and visual summary in parallel (halves enrichment time)
+                box, vis = await asyncio.gather(
+                    self._get_box_model(ws, element.platform_ref),
+                    self._get_visual_summary(ws, element.platform_ref),
+                )
                 if box:
                     element.bounds = box
-
-                vis = await self._get_visual_summary(ws, element.platform_ref)
                 if vis:
                     element.visual = vis
 
@@ -328,11 +344,12 @@ class CDPClient:
         except Exception:
             return ""
 
+    _COLOR_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
+
     @staticmethod
     def _simplify_color(css_color: str) -> str:
         """Convert rgb(r,g,b) to a readable name or short hex."""
-        import re
-        m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", css_color)
+        m = CDPClient._COLOR_RE.match(css_color)
         if not m:
             return css_color[:20]
         r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -384,6 +401,63 @@ class CDPClient:
                 return elements
         except Exception:
             return []
+
+    async def is_element_valid(self, tab: ChromeTab, backend_node_id: int) -> bool:
+        """Check if a CDP element reference is still valid (not stale).
+
+        Returns True if the element still exists in the DOM, False if stale.
+        Use this before actions to give better error messages.
+        """
+        import websockets
+
+        try:
+            async with websockets.connect(tab.ws_url) as ws:
+                await self._send(ws, "DOM.enable")
+                result = await self._send(
+                    ws, "DOM.resolveNode",
+                    {"backendNodeId": backend_node_id},
+                )
+                object_id = result.get("object", {}).get("objectId")
+                return object_id is not None
+        except Exception:
+            return False
+
+    async def get_element_value(self, tab: ChromeTab, backend_node_id: int) -> str | None:
+        """Get the current value of an input element.
+
+        Returns the value string, or None if the element doesn't exist or has no value.
+        Used for typing verification.
+        """
+        import websockets
+
+        try:
+            async with websockets.connect(tab.ws_url) as ws:
+                await self._send(ws, "DOM.enable")
+                result = await self._send(
+                    ws, "DOM.resolveNode",
+                    {"backendNodeId": backend_node_id},
+                )
+                object_id = result.get("object", {}).get("objectId")
+                if not object_id:
+                    return None
+
+                # Get value via JS
+                result = await self._send(
+                    ws, "Runtime.callFunctionOn",
+                    {
+                        "functionDeclaration": """function() {
+                            if (this.value !== undefined) return this.value;
+                            if (this.textContent !== undefined) return this.textContent;
+                            if (this.innerText !== undefined) return this.innerText;
+                            return '';
+                        }""",
+                        "objectId": object_id,
+                        "returnByValue": True,
+                    },
+                )
+                return result.get("result", {}).get("value", "")
+        except Exception:
+            return None
 
     async def click_element(self, tab: ChromeTab, backend_node_id: int) -> bool:
         """Click an element by its backend DOM node ID."""
@@ -439,20 +513,11 @@ class CDPClient:
                     },
                 )
 
-                # Type each character via Input.dispatchKeyEvent
-                for char in text:
-                    await self._send(
-                        ws, "Input.dispatchKeyEvent",
-                        {
-                            "type": "keyDown",
-                            "text": char,
-                            "key": char,
-                        },
-                    )
-                    await self._send(
-                        ws, "Input.dispatchKeyEvent",
-                        {"type": "keyUp", "key": char},
-                    )
+                # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
+                await self._send(
+                    ws, "Input.insertText",
+                    {"text": text},
+                )
 
                 return True
         except Exception:
@@ -508,7 +573,7 @@ class CDPClient:
 
         MAX_EVAL_RESULT_LEN = 10_000
 
-        logger.info(
+        logger.debug(
             "eyes_evaluate (len=%d): %.200s", len(expression), expression
         )
 
@@ -948,7 +1013,7 @@ class CDPClient:
         except Exception as e:
             return f"ERROR: CDP JS execution failed: {e}"
 
-    async def _send(self, ws, method: str, params: dict | None = None) -> dict:
+    async def _send(self, ws, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
         """Send a CDP command and wait for response.
 
         Uses a locally-captured message ID to avoid race conditions
@@ -962,8 +1027,16 @@ class CDPClient:
 
         await ws.send(json.dumps(msg))
 
+        deadline = asyncio.get_running_loop().time() + timeout
         while True:
-            response = json.loads(await ws.recv())
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError(f"CDP command {method} timed out after {timeout}s")
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"CDP command {method} timed out after {timeout}s")
+            response = json.loads(raw)
             if response.get("id") == msg_id:
                 if "error" in response:
                     raise RuntimeError(

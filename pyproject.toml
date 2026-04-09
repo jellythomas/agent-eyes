@@ -67,6 +67,9 @@ version = {attr = "agent_eyes.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+agent_eyes = ["extension/**/*"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",

@@ -1,6 +1,6 @@
 """Tier dispatch infrastructure for agent-eyes.
 
-Manages which connection tier (Extension, CDP, Native) is available
+Manages which connection tier (CDP, Native) is available
 and routes tool calls to the best available tier.
 """
 from __future__ import annotations
@@ -10,9 +10,8 @@ from enum import IntEnum
 
 class ConnectionTier(IntEnum):
     """Connection tiers, ordered by preference (lower = better)."""
-    EXTENSION = 1  # Chrome Extension bridge (best: no flags, cross-platform)
-    CDP = 2        # Direct CDP persistent WebSocket (needs --remote-debugging-port)
-    NATIVE = 3     # Native AX + AppleScript (always available, limited web)
+    CDP = 1     # Direct CDP persistent WebSocket (needs --remote-debugging-port)
+    NATIVE = 2  # Native AX APIs (always available)
 
 
 class TierManager:
@@ -20,7 +19,6 @@ class TierManager:
 
     def __init__(self) -> None:
         self._available: dict[ConnectionTier, bool] = {
-            ConnectionTier.EXTENSION: False,
             ConnectionTier.CDP: False,
             ConnectionTier.NATIVE: True,  # Always available
         }

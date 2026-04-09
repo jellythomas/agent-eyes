@@ -22,7 +22,6 @@ from mcp.types import Tool, TextContent
 from .adapters.base import BaseAdapter, UIElement
 from .cdp import CDPClient
 from .cdp_persistent import CDPConnection as PersistentCDP
-from .extension_bridge import ExtensionBridge
 from .tiers import TierManager, ConnectionTier
 from .registry import ElementRegistry
 from . import platform_utils as _pu
@@ -83,18 +82,19 @@ def _auto_install_platform_deps() -> None:
 
     def _pip_install(packages: list[str]) -> None:
         """Install packages, preferring ``uv pip`` (works in uvx envs)."""
+        logger.info("Installing platform dependencies: %s", ", ".join(packages))
         uv = shutil.which("uv")
         if uv:
             subprocess.check_call(
                 [uv, "pip", "install", "--python", sys.executable, *packages],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         else:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", *packages],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
 
     if sys.platform == "darwin":
@@ -177,7 +177,7 @@ native_adapter = _get_native_adapter()
 cdp_client = CDPClient()
 tier_manager = TierManager()
 cdp_pool = PersistentCDP()
-ext_bridge = ExtensionBridge()
+_input_backend = get_input_backend()  # Singleton — no need to re-probe on every call
 
 
 def _platform_status() -> str:
@@ -674,26 +674,6 @@ TOOLS = [
         },
     ),
     Tool(
-        name="eyes_get_ocr_hints",
-        description=(
-            "Get visual text hints from a window screenshot using OCR. "
-            "Use when the accessibility tree is insufficient (few interactive elements). "
-            "Returns text blocks with screen coordinates for coordinate-based clicking. "
-            "These are NOT semantic UI elements — text labels may or may not be interactive. "
-            "Requires Screen Recording permission on macOS."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID of the application",
-                },
-            },
-            "required": ["pid"],
-        },
-    ),
-    Tool(
         name="eyes_hover",
         description=(
             "Hover over a UI element to trigger tooltips, dropdown previews, "
@@ -716,22 +696,6 @@ TOOLS = [
                 },
             },
             "required": [],
-        },
-    ),
-    Tool(
-        name="eyes_element_at",
-        description=(
-            "Identify the UI element at specific screen coordinates. "
-            "Returns the element with an [id] you can use for click/type. "
-            "Useful after OCR hints to identify what's at a position."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer", "description": "Screen X coordinate"},
-                "y": {"type": "integer", "description": "Screen Y coordinate"},
-            },
-            "required": ["x", "y"],
         },
     ),
     Tool(
@@ -872,54 +836,6 @@ TOOLS = [
             "required": ["action"],
         },
     ),
-    # ── Setup Tools ─────────────────────────────────────────────────
-    Tool(
-        name="eyes_setup",
-        description=(
-            "Smart scan: detect all AI coding tools on this machine and find competing "
-            "browser/desktop/vision MCP servers that agent-eyes can replace. "
-            "Returns a structured report — does NOT make any changes. "
-            "Call this first, then use eyes_setup_apply to act on the results."
-        ),
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="eyes_setup_apply",
-        description=(
-            "Apply agent-eyes configuration to selected AI tools. "
-            "Call eyes_setup first to get the scan report, then present options to the user. "
-            "Pass the user's selections here to make changes. "
-            "Creates backups before any modification. Only changes what's selected."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "replace_competitors": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "List of competitor IDs to replace "
-                        "(e.g., ['playwright-mcp', 'puppeteer-mcp'])"
-                    ),
-                },
-                "configure_tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "List of AI tool IDs to configure "
-                        "(e.g., ['claude-code', 'cursor'])"
-                    ),
-                },
-                "level": {
-                    "type": "string",
-                    "enum": ["global", "project"],
-                    "description": "Installation level: 'global' (user-wide) or 'project' (current directory)",
-                    "default": "global",
-                },
-            },
-            "required": ["replace_competitors", "configure_tools"],
-        },
-    ),
 ]
 
 
@@ -940,72 +856,57 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except Exception as e:
         import traceback
         logger.error("Tool '%s' failed: %s\n%s", name, e, traceback.format_exc())
-        return [TextContent(type="text", text=f"ERROR: {e}")]
+        # Return generic message to avoid leaking internal paths/state to caller
+        return [TextContent(type="text", text=f"ERROR: Tool '{name}' failed unexpectedly. Check server logs for details.")]
+
+
+# Dispatch table — built lazily on first call so all handlers are defined.
+_DISPATCH_TABLE: dict[str, object] | None = None
+
+
+def _build_dispatch_table() -> dict[str, object]:
+    """O(1) lookup instead of 30+ if/elif branches."""
+    return {
+        "eyes_status": lambda args: _handle_status(),
+        "eyes_list_apps": lambda args: _handle_list_apps(),
+        "eyes_get_tree": _handle_get_tree,
+        "eyes_find": _handle_find,
+        "eyes_click": _handle_click,
+        "eyes_type": _handle_type,
+        "eyes_get_focused": lambda args: _handle_get_focused(),
+        "eyes_list_chrome_tabs": lambda args: _handle_list_chrome_tabs(),
+        "eyes_get_web_tree": _handle_get_web_tree,
+        "eyes_navigate": _handle_navigate,
+        "eyes_evaluate": _handle_evaluate,
+        "eyes_press_key": _handle_press_key,
+        "eyes_wait_for": _handle_wait_for,
+        "eyes_new_tab": _handle_new_tab,
+        "eyes_close_tab": _handle_close_tab,
+        "eyes_handle_dialog": _handle_dialog,
+        "eyes_file_upload": _handle_file_upload,
+        "eyes_scroll": _handle_scroll,
+        "eyes_drag": _handle_drag,
+        "eyes_fill_form": _handle_fill_form,
+        "eyes_hover": _handle_hover,
+        "eyes_app": _handle_app,
+        "eyes_get_subtree": _handle_get_subtree,
+        "eyes_window": _handle_window,
+        "eyes_context": _handle_context,
+        "eyes_shadow": _handle_shadow,
+    }
 
 
 async def _dispatch(name: str, args: dict) -> str:
-    if name == "eyes_status":
-        return _handle_status()
-    elif name == "eyes_list_apps":
-        return _handle_list_apps()
-    elif name == "eyes_get_tree":
-        return _handle_get_tree(args)
-    elif name == "eyes_find":
-        return _handle_find(args)
-    elif name == "eyes_click":
-        return await _handle_click(args)
-    elif name == "eyes_type":
-        return await _handle_type(args)
-    elif name == "eyes_get_focused":
-        return _handle_get_focused()
-    elif name == "eyes_list_chrome_tabs":
-        return await _handle_list_chrome_tabs()
-    elif name == "eyes_get_web_tree":
-        return await _handle_get_web_tree(args)
-    elif name == "eyes_navigate":
-        return await _handle_navigate(args)
-    elif name == "eyes_evaluate":
-        return await _handle_evaluate(args)
-    elif name == "eyes_press_key":
-        return await _handle_press_key(args)
-    elif name == "eyes_wait_for":
-        return await _handle_wait_for(args)
-    elif name == "eyes_new_tab":
-        return await _handle_new_tab(args)
-    elif name == "eyes_close_tab":
-        return await _handle_close_tab(args)
-    elif name == "eyes_handle_dialog":
-        return await _handle_dialog(args)
-    elif name == "eyes_file_upload":
-        return await _handle_file_upload(args)
-    elif name == "eyes_scroll":
-        return await _handle_scroll(args)
-    elif name == "eyes_drag":
-        return await _handle_drag(args)
-    elif name == "eyes_fill_form":
-        return await _handle_fill_form(args)
-    elif name == "eyes_get_ocr_hints":
-        return _handle_get_ocr_hints(args)
-    elif name == "eyes_hover":
-        return _handle_hover(args)
-    elif name == "eyes_element_at":
-        return _handle_element_at(args)
-    elif name == "eyes_app":
-        return _handle_app(args)
-    elif name == "eyes_get_subtree":
-        return _handle_get_subtree(args)
-    elif name == "eyes_window":
-        return _handle_window(args)
-    elif name == "eyes_context":
-        return _handle_context(args)
-    elif name == "eyes_shadow":
-        return _handle_shadow(args)
-    elif name == "eyes_setup":
-        return _handle_setup()
-    elif name == "eyes_setup_apply":
-        return _handle_setup_apply(args)
-    else:
+    global _DISPATCH_TABLE
+    if _DISPATCH_TABLE is None:
+        _DISPATCH_TABLE = _build_dispatch_table()
+    handler = _DISPATCH_TABLE.get(name)
+    if handler is None:
         return f"Unknown tool: {name}"
+    result = handler(args)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 
 
 # ── Native handlers ─────────────────────────────────────────────────
@@ -1013,23 +914,17 @@ def _handle_status() -> str:
     chrome_binary = _pu.get_chrome_binary()
     launch_cmd = _pu.get_chrome_launch_cmd()
     discovered_port = _pu.discover_cdp_port()
-    input_backend = get_input_backend()
+    input_backend = _input_backend
 
     # Determine active tier for status report
-    ext_installed = ext_bridge.is_connected
-    if ext_installed:
-        tier_manager.set_available(ConnectionTier.EXTENSION, True)
-    active_tier = tier_manager.best_tier()
     if cdp_pool.is_connected:
         tier_manager.set_available(ConnectionTier.CDP, True)
-        active_tier = tier_manager.best_tier()
+    active_tier = tier_manager.best_tier()
     tier_label = {
-        ConnectionTier.EXTENSION: "Tier 1 — Chrome Extension",
-        ConnectionTier.CDP: "Tier 2 — Persistent CDP WebSocket",
-        ConnectionTier.NATIVE: "Tier 3 — Native AX + AppleScript (CDP not connected)",
+        ConnectionTier.CDP: "Tier 1 — Persistent CDP WebSocket",
+        ConnectionTier.NATIVE: "Tier 2 — Native AX + AppleScript (CDP not connected)",
     }.get(active_tier, str(active_tier))
 
-    ext_available = tier_manager.is_available(ConnectionTier.EXTENSION)
     cdp_available = tier_manager.is_available(ConnectionTier.CDP)
 
     lines = [
@@ -1040,11 +935,9 @@ def _handle_status() -> str:
         f"Active tier: {tier_label}",
         "",
         "Connection tiers:",
-        f"  Tier 1 — Chrome Extension Bridge: {'installed' if ext_installed else 'not installed'}"
-        " (run extension/install.sh to set up)",
-        f"  Tier 2 — CDP Persistent Connection: {'connected' if cdp_available else 'not connected'}"
+        f"  Tier 1 — CDP Persistent Connection: {'connected' if cdp_available else 'not connected'}"
         f" (port {cdp_pool.active_port}, {len(cdp_pool.list_tabs())} tab(s) tracked)",
-        "  Tier 3 — Native Fallback: available (always)",
+        "  Tier 2 — Native Fallback: available (always)",
         "",
         f"Input backend: {input_backend.__class__.__name__} "
         f"({'available' if input_backend.is_available() else 'NOT available'})",
@@ -1084,7 +977,7 @@ def _handle_list_apps() -> str:
     return "\n".join(lines)
 
 
-def _handle_get_tree(args: dict) -> str:
+async def _handle_get_tree(args: dict) -> str:
     if not native_adapter:
         return "ERROR: No native adapter available."
     pid = args.get("pid")
@@ -1097,22 +990,27 @@ def _handle_get_tree(args: dict) -> str:
     max_depth = min(args.get("max_depth", 10), 20)
 
     # Build tree — all adapters accept is_browser
-    tree = native_adapter.get_tree(pid, max_depth, is_browser=is_browser)
+    # Run in executor to avoid blocking the asyncio event loop
+    loop = asyncio.get_running_loop()
+    tree = await loop.run_in_executor(
+        None, lambda: native_adapter.get_tree(pid, max_depth, is_browser=is_browser)
+    )
 
     if tree is None:
         return f"ERROR: Could not get accessibility tree for PID {pid}. App may not be running or permission denied."
 
     # Auto-retry: if web content found but tree is sparse, rebuild deeper
-    has_web = _tree_has_web_content(tree)
-    interactive_count = _count_interactive(tree)
+    has_web, interactive_count = _analyze_tree(tree)
 
     if has_web and interactive_count < 5 and max_depth < 20:
         # Web content exists but not enough interactive elements reached.
         # Retry with max depth to capture deeply nested buttons/inputs.
-        tree = native_adapter.get_tree(pid, 20, is_browser=is_browser)
+        tree = await loop.run_in_executor(
+            None, lambda: native_adapter.get_tree(pid, 20, is_browser=is_browser)
+        )
         if tree is None:
             return f"ERROR: Could not rebuild accessibility tree for PID {pid}."
-        interactive_count = _count_interactive(tree)
+        _, interactive_count = _analyze_tree(tree)
         max_depth = 20
 
     registry.register_tree(tree, pid=pid)
@@ -1135,7 +1033,7 @@ def _handle_get_tree(args: dict) -> str:
     elif interactive_count < 3 and registry.count() > 5:
         advisory = (
             "\n\nNote: few interactive elements found. "
-            "Use eyes_get_ocr_hints for visual text detection."
+            "Try eyes_get_web_tree for web content or increase max_depth."
         )
 
     return (
@@ -1145,26 +1043,29 @@ def _handle_get_tree(args: dict) -> str:
     )
 
 
-def _tree_has_web_content(element) -> bool:
-    """Check if the native tree contains web area elements (reached web content)."""
-    if element.role in ("webarea", "web area", "document"):
-        return True
-    for child in element.children:
-        if _tree_has_web_content(child):
-            return True
-    return False
-
-
-def _count_interactive(element, _interactive_roles=frozenset({
+_INTERACTIVE_ROLES = frozenset({
     "button", "link", "textfield", "textarea", "combobox",
     "checkbox", "radiobutton", "slider", "menuitem", "tab",
     "searchfield", "popupbutton", "switch", "togglebutton",
-})) -> int:
-    """Count interactive elements in the tree."""
-    count = 1 if element.role in _interactive_roles else 0
+})
+
+_WEB_ROLES = frozenset({"webarea", "web area", "document"})
+
+
+def _analyze_tree(element) -> tuple[bool, int]:
+    """Analyze tree in a single O(n) pass. Returns (has_web_content, interactive_count)."""
+    has_web = element.role in _WEB_ROLES
+    count = 1 if element.role in _INTERACTIVE_ROLES else 0
     for child in element.children:
-        count += _count_interactive(child)
-    return count
+        child_web, child_count = _analyze_tree(child)
+        has_web = has_web or child_web
+        count += child_count
+    return has_web, count
+
+
+def _count_interactive(element) -> int:
+    """Count interactive elements in the tree."""
+    return _analyze_tree(element)[1]
 
 
 def _match_text(query: str, text: str, match_type: str = "contains") -> bool:
@@ -1181,6 +1082,8 @@ def _match_text(query: str, text: str, match_type: str = "contains") -> bool:
         return text_lower.endswith(query_lower)
     elif match_type == "regex":
         import re
+        if len(query) > 500:
+            return False
         try:
             return bool(re.search(query, text, re.IGNORECASE))
         except re.error:
@@ -1202,21 +1105,21 @@ def _handle_find(args: dict) -> str:
     if pid and native_adapter:
         elements = native_adapter.find_elements(pid, role, name, value)
         # Re-register found elements
-        for el in elements:
-            registry._elements[el.id] = el
-        # Apply match-type filtering on name and value (find_elements uses contains)
+        registry.register_elements(elements)
+        # Apply match-type filtering consistently on role, name, and value
         if match_type != "contains":
             elements = [
                 el for el in elements
-                if (not name or _match_text(name, el.name, match_type))
+                if (not role or _match_text(role, el.role, match_type))
+                and (not name or _match_text(name, el.name, match_type))
                 and (not value or _match_text(value, el.value, match_type))
             ]
     else:
-        # Filter from registry using _match_text
+        # Filter from registry using _match_text (consistent for all fields)
         all_elements = list(registry._elements.values())
         elements = []
         for el in all_elements:
-            if role and role.lower() not in el.role.lower():
+            if role and not _match_text(role, el.role, match_type):
                 continue
             if name and not _match_text(name, el.name, match_type):
                 continue
@@ -1236,6 +1139,29 @@ def _handle_find(args: dict) -> str:
     return "\n".join(lines)
 
 
+async def _verify_focus(pid: int, timeout: float = 0.5, retries: int = 3) -> tuple[bool, str]:
+    """Verify app is frontmost after activation. Returns (success, error_message).
+
+    This prevents the race condition where another app steals focus between
+    activate_window() and the actual click/type action.
+    """
+    input_backend = _input_backend
+    if not input_backend.is_available():
+        return True, ""  # Can't verify, assume success
+
+    delay = timeout / retries
+
+    for attempt in range(retries):
+        if input_backend.is_frontmost(pid):
+            return True, ""
+        if attempt < retries - 1:
+            await asyncio.sleep(delay)
+            # Re-activate in case something stole focus
+            input_backend.activate_window(pid)
+
+    return False, f"Could not bring app (PID {pid}) to front after {retries} attempts"
+
+
 async def _handle_click(args: dict) -> str:
     element_id = args.get("id")
     click_x = args.get("x")
@@ -1244,12 +1170,12 @@ async def _handle_click(args: dict) -> str:
 
     # Coordinate-based click (from OCR hints or manual)
     if click_x is not None and click_y is not None:
-        input_backend = get_input_backend()
+        input_backend = _input_backend
         if not input_backend.is_available():
             return "ERROR: No input backend available for coordinate click."
         if click_pid:
             input_backend.activate_window(click_pid)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
         if input_backend.click(click_x, click_y):
             return f"Clicked at ({click_x}, {click_y})"
         return f"ERROR: Could not click at ({click_x}, {click_y})."
@@ -1273,10 +1199,17 @@ async def _handle_click(args: dict) -> str:
             if err:
                 return err
         if _cached_tabs:
-            tab = _cached_tabs[0]
+            # Use element's tab_index, not hardcoded 0
+            tab_idx = element.tab_index if element.tab_index >= 0 else 0
+            if tab_idx >= len(_cached_tabs):
+                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call eyes_get_web_tree to refresh."
+            tab = _cached_tabs[tab_idx]
+            # Validate CDP element is still valid (not stale from page changes)
+            if not await cdp_client.is_element_valid(tab, element.platform_ref):
+                return f"ERROR: Element [{element_id}] is stale (page has changed). Call eyes_get_web_tree to refresh."
             success = await cdp_client.click_element(tab, element.platform_ref)
             if success:
-                return f"Clicked [{element_id}] {element.role} \"{element.name}\""
+                return f"Clicked [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx})"
             return f"ERROR: Could not click [{element_id}] via CDP."
 
     # Native path for non-CDP elements
@@ -1291,12 +1224,14 @@ async def _handle_click(args: dict) -> str:
     # Strategy 2: Coordinate-based click (human-like fallback)
     # Activate the correct app first so the click goes to the right window.
     if element.bounds:
-        input_backend = get_input_backend()
+        input_backend = _input_backend
         if input_backend.is_available():
             if element.pid:
                 input_backend.activate_window(element.pid)
-                import time as _time
-                _time.sleep(0.1)
+                # Verify focus before clicking (prevents race condition)
+                focus_ok, focus_err = await _verify_focus(element.pid)
+                if not focus_ok:
+                    return f"ERROR: {focus_err}. Click aborted to prevent wrong target."
             x, y, w, h = element.bounds
             cx, cy = x + w // 2, y + h // 2
             if input_backend.click(cx, cy):
@@ -1323,30 +1258,97 @@ async def _handle_type(args: dict) -> str:
         if not native_adapter.is_element_valid(element):
             return f"ERROR: Element [{element_id}] is stale (UI has changed). Call eyes_get_tree to refresh."
 
-    # Route CDP elements to CDP backend (unified: works for both stealth and existing browser)
+    # Route CDP elements to CDP backend — try Tier 2 (persistent) first, then Tier 3 (legacy)
     if element.source == "cdp" and element.platform_ref is not None:
+        tab_idx = element.tab_index if element.tab_index >= 0 else 0
+
+        # ── Tier 2: persistent CDP session (single WebSocket, Input.insertText) ──
+        session, tier2_tab, tier2_err = await _get_cdp_session({"tab_index": tab_idx})
+        if session is not None:
+            try:
+                await session.enable_domain("DOM")
+                await session.enable_domain("Runtime")
+                # Focus the element
+                result = await session.send(
+                    "DOM.resolveNode",
+                    {"backendNodeId": element.platform_ref},
+                )
+                object_id = result.get("object", {}).get("objectId")
+                if object_id:
+                    await session.send(
+                        "Runtime.callFunctionOn",
+                        {
+                            "functionDeclaration": "function() { this.focus(); }",
+                            "objectId": object_id,
+                        },
+                    )
+                    # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
+                    await session.send("Input.insertText", {"text": text})
+                    # Verify typing worked
+                    await asyncio.sleep(0.1)
+                    val_result = await session.send(
+                        "Runtime.callFunctionOn",
+                        {
+                            "functionDeclaration": "function() { return this.value || this.textContent || ''; }",
+                            "objectId": object_id,
+                            "returnByValue": True,
+                        },
+                    )
+                    actual_value = val_result.get("result", {}).get("value")
+                    if actual_value is not None and text in str(actual_value):
+                        return f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx}, verified)"
+                    elif actual_value is not None:
+                        return (
+                            f"WARNING: Typed \"{text}\" but verification failed. "
+                            f"Current value: \"{str(actual_value)[:80]}\". "
+                            f"The element may not accept input or may have transformed it."
+                        )
+                    return f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx}, unverified)"
+            except Exception as exc:
+                logger.debug("_handle_type: Tier 2 failed: %s", exc)
+                # Fall through to Tier 3
+
+        # ── Tier 3: legacy per-request CDP (fallback) ──
         if not _cached_tabs:
             err = await _ensure_tabs()
             if err:
                 return err
         if _cached_tabs:
-            tab = _cached_tabs[0]
+            if tab_idx >= len(_cached_tabs):
+                return f"ERROR: Element's tab (index {tab_idx}) no longer exists. Call eyes_get_web_tree to refresh."
+            tab = _cached_tabs[tab_idx]
+            if not await cdp_client.is_element_valid(tab, element.platform_ref):
+                return f"ERROR: Element [{element_id}] is stale (page has changed). Call eyes_get_web_tree to refresh."
             success = await cdp_client.type_text(tab, element.platform_ref, text)
             if success:
-                return f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\""
+                await asyncio.sleep(0.1)
+                actual_value = await cdp_client.get_element_value(tab, element.platform_ref)
+                if actual_value is not None and text in actual_value:
+                    return f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx}, verified)"
+                elif actual_value is not None:
+                    return (
+                        f"WARNING: Typed \"{text}\" but verification failed. "
+                        f"Current value: \"{actual_value[:80]}{'...' if len(actual_value) > 80 else ''}\". "
+                        f"The element may not accept input or may have transformed it."
+                    )
+                else:
+                    return f"Typed \"{text}\" into [{element_id}] {element.role} \"{element.name}\" (tab {tab_idx}, unverified)"
             return f"ERROR: Could not type into [{element_id}] via CDP."
 
     # Native path for non-CDP elements
     if not native_adapter:
         return "ERROR: No native adapter available."
 
-    input_backend = get_input_backend()
+    input_backend = _input_backend
     is_web = "scrolltovisible" in element.actions  # web elements have this action
 
     # ── Step 1: Activate the target app window (always, for all strategies)
     if element.pid and input_backend.is_available():
         input_backend.activate_window(element.pid)
-        time.sleep(0.1)
+        # Verify focus before typing (prevents race condition)
+        focus_ok, focus_err = await _verify_focus(element.pid)
+        if not focus_ok:
+            return f"ERROR: {focus_err}. Type aborted to prevent wrong target."
 
     # ── Secure text field detection (NSSecureTextField / SecureField)
     # These fields call EnableSecureEventInput() when focused, which blocks ALL
@@ -1360,7 +1362,7 @@ async def _handle_type(args: dict) -> str:
     keyboard_injected = False
     if not is_secure and hasattr(native_adapter, 'focus_element') and input_backend.is_available():
         if native_adapter.focus_element(element):
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             # For web elements: type directly WITHOUT clear_and_type.
             # clear_and_type sends Cmd+A + Delete before typing, which in Chrome
             # can select the entire page, trigger shortcuts (Cmd+T = new tab), and
@@ -1380,7 +1382,7 @@ async def _handle_type(args: dict) -> str:
                 # For native elements: verify the text actually landed.
                 # Some apps (e.g. Jamf, secure input) silently ignore CGEvent
                 # keystrokes while AX set_value works.
-                time.sleep(0.15)
+                await asyncio.sleep(0.15)
                 verified = False
                 if element.platform_ref and hasattr(native_adapter, '_read_attr'):
                     current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
@@ -1407,7 +1409,7 @@ async def _handle_type(args: dict) -> str:
         cx, cy = x + w // 2, y + h // 2
         if input_backend.click_and_type(cx, cy, text):
             # Verify text landed
-            time.sleep(0.15)
+            await asyncio.sleep(0.15)
             verified = False
             if element.platform_ref and hasattr(native_adapter, '_read_attr'):
                 current_val = native_adapter._read_attr(element.platform_ref, "AXValue")
@@ -1447,7 +1449,7 @@ def _handle_get_focused() -> str:
     if element is None:
         return "No focused element found."
 
-    registry._elements[element.id] = element
+    registry.register_element(element)
     return f"Focused element:\n{element.to_text(max_depth=2)}"
 
 
@@ -1455,36 +1457,27 @@ def _handle_get_focused() -> str:
 # _cached_tabs_time removed — Tier 2 (cdp_pool) tracks tabs via auto-attach;
 # Tier 3 (_ensure_tabs) uses its own 30-second cache window internally.
 _cached_tabs: list = []
+_tabs_lock = asyncio.Lock()  # Protects _cached_tabs from concurrent mutation
 
 
 async def _get_cdp_session(args: dict) -> tuple:
     """Try to get the best available CDP session for the requested tab.
 
     Tier fallback chain:
-      Tier 1 — Chrome Extension bridge (ext_bridge): no flags, cross-platform.
-               Checked first via ext_bridge.is_connected (manifest on disk).
-               Full live dispatch is wired in a future milestone; for now we
-               update tier_manager so status reporting is accurate.
-      Tier 2 — Persistent single-WebSocket CDP (cdp_pool): needs
-               --remote-debugging-port. Tried when Tier 1 is unavailable.
-      Tier 3 — Legacy per-request CDP / native AX fallback (cdp_client):
+      Tier 1 — Persistent single-WebSocket CDP (cdp_pool): needs
+               --remote-debugging-port.
+      Tier 2 — Legacy per-request CDP / native AX fallback (cdp_client):
                always attempted last.
 
     Returns:
         (session_or_None, tab_or_None, error_string)
-        - If Tier 2 succeeds: (CDPSession, ChromeTab, "")
-        - If Tier 2 fails and Tier 3 available: (None, ChromeTab, "")
+        - If Tier 1 succeeds: (CDPSession, ChromeTab, "")
+        - If Tier 1 fails and Tier 2 available: (None, ChromeTab, "")
         - If both fail: (None, None, error_string)
     """
     tab_index = args.get("tab_index", 0)
 
-    # ── Tier 1: Chrome Extension bridge ──
-    if ext_bridge.is_connected:
-        tier_manager.set_available(ConnectionTier.EXTENSION, True)
-        # Live dispatch via the extension is wired in a future milestone.
-        # For now, fall through to Tier 2 so existing functionality is unchanged.
-
-    # ── Tier 2: persistent WebSocket ──
+    # ── Tier 1: persistent WebSocket ──
     try:
         await cdp_pool.ensure_connected()
         tabs = cdp_pool.list_tabs()
@@ -1496,7 +1489,7 @@ async def _get_cdp_session(args: dict) -> tuple:
     except Exception as exc:
         logger.debug("_get_cdp_session: Tier 2 unavailable: %s", exc)
 
-    # ── Tier 3 fallback: legacy cdp_client ──
+    # ── Tier 2 fallback: legacy cdp_client ──
     # _ensure_tabs / cdp_client are still used for all other handlers
     err = await _ensure_tabs()
     if not err:
@@ -1517,10 +1510,24 @@ async def _handle_list_chrome_tabs() -> str:
         pass  # fall through to the non-CDP paths below
 
     # Try CDP first (richer interaction, cross-platform)
+    # Prefer Tier 2 (cdp_pool) — zero network calls when connected
+    if cdp_pool.is_connected:
+        pool_tabs = cdp_pool.list_tabs()
+        if pool_tabs:
+            async with _tabs_lock:
+                _cached_tabs = list(pool_tabs)
+            lines = ["Chrome tabs (via persistent CDP):\n"]
+            for i, tab in enumerate(pool_tabs):
+                lines.append(f"[{i}] {tab.title}")
+                lines.append(f"    {tab.url}\n")
+            lines.append("Use eyes_get_web_tree with tab_index to see a tab's UI.")
+            return "\n".join(lines)
+
     available = await cdp_client.is_available()
     if available:
         tabs = await cdp_client.list_tabs()
-        _cached_tabs = tabs
+        async with _tabs_lock:
+            _cached_tabs = list(tabs)
 
         if not tabs:
             return "Chrome is running but no tabs found."
@@ -1561,6 +1568,56 @@ async def _handle_list_chrome_tabs() -> str:
     )
 
 
+_chrome_pid_cache: int = 0
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a PID is still running."""
+    try:
+        import os
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _get_chrome_pid() -> int:
+    """Find Chrome's process ID for window activation.
+
+    Returns the PID of Chrome (or Chromium), or 0 if not found.
+    Uses a cache with staleness guard to avoid repeated subprocess spawns.
+    """
+    global _chrome_pid_cache
+    if _chrome_pid_cache and _is_pid_alive(_chrome_pid_cache):
+        return _chrome_pid_cache
+
+    try:
+        import subprocess
+        # Try common Chrome process names
+        for browser in ["Google Chrome", "Chromium", "Chrome"]:
+            result = subprocess.run(
+                ["pgrep", "-x", browser],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pid = int(result.stdout.strip().split()[0])
+                _chrome_pid_cache = pid
+                return pid
+        # Fallback: search by pattern
+        result = subprocess.run(
+            ["pgrep", "-f", "Google Chrome"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pid = int(result.stdout.strip().split()[0])
+            _chrome_pid_cache = pid
+            return pid
+    except Exception:
+        pass
+    _chrome_pid_cache = 0
+    return 0
+
+
 async def _handle_get_web_tree(args: dict) -> str:
     tab_index = args.get("tab_index", 0)
     max_depth = min(args.get("max_depth", 5), 10)
@@ -1580,7 +1637,8 @@ async def _handle_get_web_tree(args: dict) -> str:
                 # Build tree using the legacy CDPClient helper (reuse parsing logic)
                 tree = cdp_client._build_tree(nodes)
                 if tree is not None:
-                    registry.register_tree(tree, pid=0)
+                    chrome_pid = _get_chrome_pid()
+                    registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index)
                     text = tree.to_text(max_depth=max_depth)
                     return (
                         f"Web accessibility tree for: {tab.title}\n"
@@ -1599,7 +1657,8 @@ async def _handle_get_web_tree(args: dict) -> str:
         available = await cdp_client.is_available()
         if available:
             tabs = await cdp_client.list_tabs()
-            _cached_tabs.extend(tabs)
+            async with _tabs_lock:
+                _cached_tabs.extend(tabs)
 
     if _cached_tabs:
         if tab_index >= len(_cached_tabs):
@@ -1608,7 +1667,8 @@ async def _handle_get_web_tree(args: dict) -> str:
         legacy_tab = _cached_tabs[tab_index]
         tree = await cdp_client.get_accessibility_tree(legacy_tab, max_depth)
         if tree is not None:
-            registry.register_tree(tree, pid=0)  # CDP elements don't have a native PID
+            chrome_pid = _get_chrome_pid()
+            registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index)  # Track which tab elements came from
             text = tree.to_text(max_depth=max_depth)
             return (
                 f"Web accessibility tree for: {legacy_tab.title}\n"
@@ -1661,16 +1721,17 @@ async def _ensure_tabs(force: bool = False) -> str:
         force: Always refresh, ignoring cache age. Use when listing tabs explicitly.
     """
     global _cached_tabs
-    if not force and _cached_tabs:
+    async with _tabs_lock:
+        if not force and _cached_tabs:
+            return ""
+        available = await cdp_client.is_available()
+        if not available:
+            return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
+        tabs = await cdp_client.list_tabs()
+        _cached_tabs = list(tabs)
+        if not _cached_tabs:
+            return "ERROR: No Chrome tabs found."
         return ""
-    available = await cdp_client.is_available()
-    if not available:
-        return "ERROR: Chrome remote debugging not available. Start Chrome with --remote-debugging-port=9222"
-    tabs = await cdp_client.list_tabs()
-    _cached_tabs = list(tabs)
-    if not _cached_tabs:
-        return "ERROR: No Chrome tabs found."
-    return ""
 
 
 def _get_tab(args: dict) -> tuple:
@@ -1681,10 +1742,30 @@ def _get_tab(args: dict) -> tuple:
     return _cached_tabs[idx], ""
 
 
+_SAFE_URL_SCHEMES = frozenset({"http", "https", "about", "chrome", "chrome-extension"})
+
+
+def _validate_url(url: str) -> str | None:
+    """Validate URL scheme. Returns error string or None if valid."""
+    import urllib.parse
+    if url.startswith("--"):
+        return "ERROR: URL must not start with '--' (flag injection)."
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme:
+        return "ERROR: URL must include an explicit scheme (e.g., https://)."
+    if parsed.scheme not in _SAFE_URL_SCHEMES:
+        return f"ERROR: URL scheme '{parsed.scheme}' is not permitted. Use http, https, or about:blank."
+    return None
+
+
 async def _handle_navigate(args: dict) -> str:
     url = args.get("url")
     if not url:
         return "ERROR: url is required."
+
+    url_err = _validate_url(url)
+    if url_err:
+        return url_err
 
     # Try Tier 2 (persistent CDP) then Tier 3 (legacy CDP)
     session, tab, cdp_err = await _get_cdp_session(args)
@@ -1820,7 +1901,7 @@ async def _handle_press_key(args: dict) -> str:
 
         if not is_browser:
             # Native app path — use OS-level input simulation
-            input_backend = get_input_backend()
+            input_backend = _input_backend
             if not input_backend.is_available():
                 return "ERROR: No input backend available for native key press."
 
@@ -1828,11 +1909,11 @@ async def _handle_press_key(args: dict) -> str:
             # This prevents keys like Escape/Cmd+A from hitting the wrong app
             # (e.g., Claude Code's terminal) due to activation race conditions.
             input_backend.activate_window(pid)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             if not input_backend.is_frontmost(pid):
                 # Retry with longer delay
                 input_backend.activate_window(pid)
-                time.sleep(0.3)
+                await asyncio.sleep(0.3)
                 if not input_backend.is_frontmost(pid):
                     return (
                         f"ERROR: Could not bring app (PID {pid}) to front. "
@@ -1854,7 +1935,7 @@ async def _handle_press_key(args: dict) -> str:
     err = await _ensure_tabs()
     if err:
         # Fallback: if no Chrome tabs but we have an input backend, use native
-        input_backend = get_input_backend()
+        input_backend = _input_backend
         if input_backend.is_available():
             if modifiers:
                 native_mods = [mod_map.get(m.lower(), m.lower()) for m in modifiers]
@@ -1876,10 +1957,13 @@ async def _handle_press_key(args: dict) -> str:
     return f"ERROR: Could not press key '{key}' via CDP."
 
 
+_MAX_WAIT_TIMEOUT = 60.0  # seconds — cap to prevent MCP server DoS
+
+
 async def _handle_wait_for(args: dict) -> str:
     role = args.get("role", "")
     name = args.get("name", "")
-    timeout = args.get("timeout", 5.0)
+    timeout = min(float(args.get("timeout", 5.0)), _MAX_WAIT_TIMEOUT)
 
     if not role and not name:
         return "ERROR: Specify at least one of: role, name"
@@ -1888,13 +1972,15 @@ async def _handle_wait_for(args: dict) -> str:
     if pid is not None and native_adapter:
         # Native app polling — check for element appearance
         start = time.time()
+        loop = asyncio.get_running_loop()
         while time.time() - start < timeout:
             if role or name:
-                elements = native_adapter.find_elements(pid, role=role, name=name)
+                elements = await loop.run_in_executor(
+                    None, lambda: native_adapter.find_elements(pid, role=role, name=name)
+                )
                 if elements:
                     # Register found elements
-                    for el in elements:
-                        registry._elements[el.id] = el
+                    registry.register_elements(elements)
                     el = elements[0]
                     return (
                         f"Found [{el.id}] {el.role} \"{el.name}\" "
@@ -1909,7 +1995,7 @@ async def _handle_wait_for(args: dict) -> str:
         if not err:
             element = await cdp_client.wait_for_element(tab, role, name, timeout)
             if element:
-                registry._elements[element.id] = element
+                registry.register_element(element)
                 return (
                     f"Found element: [{element.id}] {element.role} \"{element.name}\"\n"
                     f"Use this [id] with eyes_click or eyes_type."
@@ -1948,12 +2034,14 @@ async def _handle_new_tab(args: dict) -> str:
     if available:
         if not _cached_tabs:
             tabs = await cdp_client.list_tabs()
-            _cached_tabs.extend(tabs)
+            async with _tabs_lock:
+                _cached_tabs.extend(tabs)
         tab = await cdp_client.new_tab(url)
         if tab is None:
             return "ERROR: Could not create new tab."
-        _cached_tabs.append(tab)
-        idx = len(_cached_tabs) - 1
+        async with _tabs_lock:
+            _cached_tabs.append(tab)
+            idx = len(_cached_tabs) - 1
         return f"New tab [{idx}]: {tab.title}\nURL: {tab.url}"
 
     # Fallback: AppleScript (macOS only — richer interaction)
@@ -2005,10 +2093,14 @@ async def _handle_close_tab(args: dict) -> str:
                     )
                 idx, matched_tab = matches[0]
 
+            # Validate idx is a non-negative integer before AppleScript interpolation
+            if not isinstance(idx, int) or idx < 0:
+                return f"ERROR: Invalid tab index: {idx!r}"
+
             # Close via AppleScript
             close_script = f'''
             tell application "Google Chrome"
-                close tab {idx + 1} of window 1
+                close tab {int(idx) + 1} of window 1
             end tell
             '''
             import subprocess as _sp
@@ -2061,7 +2153,9 @@ async def _handle_close_tab(args: dict) -> str:
     tab_url = getattr(tab, "url", "unknown")
     success = await cdp_client.close_tab(tab)
     if success:
-        _cached_tabs.pop(idx)
+        async with _tabs_lock:
+            if idx < len(_cached_tabs):
+                _cached_tabs.pop(idx)
         return f"Closed tab [{idx}]: {tab_title}\n  URL: {tab_url}"
     return f"ERROR: Could not close tab [{idx}]: {tab_title} — {tab_url}"
 
@@ -2097,12 +2191,33 @@ async def _handle_file_upload(args: dict) -> str:
     if not files:
         return "ERROR: files list is required."
 
-    # Validate all file paths exist before sending to CDP
+    # Validate all file paths exist and are safe to upload
+    import pathlib
+    _home = pathlib.Path.home()
+    _blocked_prefixes = [
+        _home / ".ssh",
+        _home / ".aws",
+        _home / ".gnupg",
+        _home / ".config" / "gcloud",
+        _home / ".config" / "op",
+        _home / ".kube",
+        _home / ".docker",
+        _home / ".netrc",
+        _home / ".npmrc",
+        _home / ".pypirc",
+        _home / ".gem" / "credentials",
+        pathlib.Path("/etc"),
+    ]
     validated: list[str] = []
     for path in files:
-        abs_path = os.path.abspath(path)
+        # Resolve symlinks before checking to prevent symlink bypass
+        abs_path = os.path.realpath(os.path.abspath(path))
         if not os.path.isfile(abs_path):
             return f"ERROR: File not found: {path!r}"
+        abs_p = pathlib.Path(abs_path)
+        for blocked in _blocked_prefixes:
+            if abs_p.is_relative_to(blocked):
+                return f"ERROR: Upload of files from {blocked} is not permitted for security."
         validated.append(abs_path)
 
     element = registry.get(element_id)
@@ -2139,7 +2254,7 @@ async def _handle_scroll(args: dict) -> str:
 
     # ── Native path: use OS-level scroll events for non-browser apps
     if pid is not None:
-        input_backend = get_input_backend()
+        input_backend = _input_backend
         if input_backend.is_available():
             # Convert from CDP convention (positive=down) to CGEvent convention (negative=down)
             native_delta_y = -delta_y if delta_y != 0 else 0
@@ -2189,7 +2304,7 @@ async def _handle_drag(args: dict) -> str:
             return "ERROR: Drag failed."
 
     # Fallback: OS input simulation (works for native apps and browser windows)
-    input_backend = get_input_backend()
+    input_backend = _input_backend
     if input_backend.is_available() and hasattr(input_backend, "drag"):
         success = input_backend.drag(from_x, from_y, to_x, to_y)
         if success:
@@ -2211,8 +2326,6 @@ async def _handle_fill_form(args: dict) -> str:
 
     err = await _ensure_tabs()
     if not err:
-        tab = _cached_tabs[0]
-
         filled = []
         errors = []
         for field in fields:
@@ -2224,6 +2337,16 @@ async def _handle_fill_form(args: dict) -> str:
                 continue
             if element.source != "cdp" or element.platform_ref is None:
                 errors.append(f"[{eid}] not a web element")
+                continue
+            # Use element's tab_index, not hardcoded 0
+            tab_idx = element.tab_index if element.tab_index >= 0 else 0
+            if tab_idx >= len(_cached_tabs):
+                errors.append(f"[{eid}] tab {tab_idx} no longer exists")
+                continue
+            tab = _cached_tabs[tab_idx]
+            # Validate CDP element is still valid
+            if not await cdp_client.is_element_valid(tab, element.platform_ref):
+                errors.append(f"[{eid}] is stale (page changed)")
                 continue
             success = await cdp_client.type_text(tab, element.platform_ref, value)
             if success:
@@ -2268,72 +2391,16 @@ async def _handle_fill_form(args: dict) -> str:
     )
 
 
-def _handle_get_ocr_hints(args: dict) -> str:
-    pid = args.get("pid")
-    if pid is None:
-        return "ERROR: pid is required."
-
-    from .screenshot import capture_window
-    from .ocr import get_ocr_engine
-
-    engine = get_ocr_engine()
-    if engine is None:
-        import sys as _sys
-        platform = _sys.platform
-        if platform == "darwin":
-            msg = "Install: pip install 'agent-eyes[macos]'"
-        elif platform == "win32":
-            msg = "Install: pip install winrt-Windows.Media.Ocr"
-        else:
-            msg = "Install: pip install pytesseract (+ apt install tesseract-ocr)"
-        return f"ERROR: No OCR engine available. {msg}"
-
-    capture = capture_window(pid)
-    if capture is None:
-        import sys as _sys
-        if _sys.platform == "darwin":
-            return "ERROR: Could not capture window. Check Screen Recording permission in System Settings > Privacy & Security."
-        return f"ERROR: Could not capture window for PID {pid}."
-
-    hints = engine.recognize(
-        capture.image_data,
-        scale_factor=capture.scale_factor,
-        window_x=capture.window_x,
-        window_y=capture.window_y,
-        window_w=capture.window_w,
-        window_h=capture.window_h,
-    )
-
-    if not hints:
-        return "No text detected in window. The window may be empty or OCR could not read it."
-
-    lines = [
-        f"OCR text hints for PID {pid} ({len(hints)} text blocks detected).",
-        "These are visual text positions — NOT semantic UI elements.",
-        "Use eyes_click(x=..., y=..., pid=...) to click at these coordinates.",
-        "",
-    ]
-    for h in sorted(hints, key=lambda h: (h.y, h.x)):
-        cx = h.x + h.width // 2
-        cy = h.y + h.height // 2
-        lines.append(
-            f'  "{h.text}" @({cx},{cy}) size={h.width}x{h.height} conf={h.confidence}'
-        )
-
-    return "\n".join(lines)
-
-
 # ── New tool handlers ────────────────────────────────────────────────
 
-def _handle_hover(args: dict) -> str:
+async def _handle_hover(args: dict) -> str:
     hover_x = args.get("x")
     hover_y = args.get("y")
     element_id = args.get("id")
 
     if hover_x is not None and hover_y is not None:
-        input_backend = get_input_backend()
-        if input_backend.is_available():
-            input_backend.move_mouse(hover_x, hover_y)
+        if _input_backend.is_available():
+            _input_backend.move_mouse(hover_x, hover_y)
             return f"Hovering at ({hover_x}, {hover_y})"
         return "ERROR: No input backend available."
 
@@ -2347,32 +2414,14 @@ def _handle_hover(args: dict) -> str:
     if element.bounds:
         x, y, w, h = element.bounds
         cx, cy = x + w // 2, y + h // 2
-        input_backend = get_input_backend()
-        if input_backend.is_available():
+        if _input_backend.is_available():
             if element.pid:
-                input_backend.activate_window(element.pid)
-                time.sleep(0.1)
-            input_backend.move_mouse(cx, cy)
+                _input_backend.activate_window(element.pid)
+                await asyncio.sleep(0.1)
+            _input_backend.move_mouse(cx, cy)
             return f"Hovering over [{element_id}] {element.role} \"{element.name}\" at ({cx}, {cy})"
 
     return f"ERROR: Element [{element_id}] has no bounds for hover."
-
-
-def _handle_element_at(args: dict) -> str:
-    x = args.get("x")
-    y = args.get("y")
-    if x is None or y is None:
-        return "ERROR: x and y are required."
-
-    if not native_adapter or not hasattr(native_adapter, 'element_at_position'):
-        return "ERROR: element_at_position not supported on this platform."
-
-    element = native_adapter.element_at_position(float(x), float(y))
-    if element is None:
-        return f"No element found at ({x}, {y})."
-
-    registry._elements[element.id] = element
-    return f"Element at ({x}, {y}):\n{element.to_text(max_depth=0)}\n\nUse [{element.id}] with eyes_click or eyes_type."
 
 
 def _handle_app(args: dict) -> str:
@@ -2515,7 +2564,7 @@ def _handle_window(args: dict) -> str:
     if action == "focus":
         try:
             native_adapter._ax.AXUIElementPerformAction(window, "AXRaise")
-            input_backend = get_input_backend()
+            input_backend = _input_backend
             if input_backend.is_available():
                 input_backend.activate_window(pid)
             return f"Focused window for PID {pid}."
@@ -2585,7 +2634,7 @@ def _handle_context(args: dict) -> str:
                 lines.append(f"Active window: \"{frontmost.windows[0]}\"")
             focused = native_adapter.get_focused_element()
             if focused:
-                registry._elements[focused.id] = focused
+                registry.register_element(focused)
                 lines.append(f"Focused: [{focused.id}] {focused.role} \"{focused.name}\"")
         else:
             lines.append("No frontmost app detected.")
@@ -2609,31 +2658,25 @@ def _handle_context(args: dict) -> str:
         # Get focused element
         focused = native_adapter.get_focused_element()
         if focused:
-            registry._elements[focused.id] = focused
+            registry.register_element(focused)
             lines.append(f"Focused: [{focused.id}] {focused.role} \"{focused.name}\"")
 
         # Get tree and count interactive elements
         tree = native_adapter.get_tree(frontmost.pid, max_depth=10, is_browser=False)
         if tree:
             registry.register_tree(tree, pid=frontmost.pid)
-            interactive = _count_interactive(tree)
-            has_web = _tree_has_web_content(tree)
+            has_web, interactive = _analyze_tree(tree)
             lines.append(f"Elements: {registry.count()} total, {interactive} interactive")
             if has_web:
                 lines.append("Web content detected (Electron/browser/webview)")
 
             # List interactive elements (compact)
             lines.append("\nInteractive elements:")
-            _interactive_roles = frozenset({
-                "button", "link", "textfield", "textarea", "combobox",
-                "checkbox", "radiobutton", "slider", "menuitem", "tab",
-                "searchfield", "popupbutton", "switch", "togglebutton",
-            })
 
             def collect_interactive(el, results, max_items=30):
                 if len(results) >= max_items:
                     return
-                if el.role in _interactive_roles:
+                if el.role in _INTERACTIVE_ROLES:
                     results.append(el)
                 for child in el.children:
                     collect_interactive(child, results, max_items)
@@ -2713,20 +2756,6 @@ def _handle_shadow(args: dict) -> str:
         return "ERROR: JavaScript execution failed."
 
     return f"ERROR: Unknown action '{action}'."
-
-
-# ── Setup handlers ──────────────────────────────────────────────────
-
-def _handle_setup() -> str:
-    """Scan for AI tools and competing MCP servers."""
-    from .setup.handlers import handle_setup
-    return handle_setup()
-
-
-def _handle_setup_apply(args: dict) -> str:
-    """Apply agent-eyes configuration based on user selections."""
-    from .setup.handlers import handle_setup_apply
-    return handle_setup_apply(args)
 
 
 # ── Entry point ─────────────────────────────────────────────────────

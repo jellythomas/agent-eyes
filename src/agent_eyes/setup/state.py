@@ -9,14 +9,8 @@ from pathlib import Path
 
 
 def _state_dir() -> Path:
-    """Get the state directory, platform-aware."""
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "agent-eyes"
-    elif sys.platform == "win32":
-        appdata = Path.home() / "AppData" / "Roaming"
-        return appdata / "agent-eyes"
-    else:
-        return Path.home() / ".config" / "agent-eyes"
+    """Get the state directory - ~/.agent-eyes/ on all platforms."""
+    return Path.home() / ".agent-eyes"
 
 
 def _state_file() -> Path:
@@ -57,11 +51,26 @@ def is_first_run() -> bool:
 
 
 def needs_rescan(current_version: str) -> bool:
-    """Check if a rescan is needed (version upgrade)."""
+    """Check if a rescan is needed (only for major version changes).
+
+    Minor/patch updates (0.3.1 -> 0.4.0) don't require re-init.
+    Only major version changes (0.x -> 1.x) or first run trigger this.
+    """
     state = get_state()
     if not state.get("initialized"):
         return True
-    return state.get("version") != current_version
+
+    saved_version = state.get("version", "0.0.0")
+
+    # Extract major version (first number)
+    def major(v: str) -> int:
+        try:
+            return int(v.split(".")[0])
+        except (ValueError, IndexError):
+            return 0
+
+    # Only rescan on major version bump (e.g., 0.x -> 1.x)
+    return major(current_version) > major(saved_version)
 
 
 def mark_initialized(

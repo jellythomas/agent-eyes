@@ -388,6 +388,8 @@ class MacOSInputBackend(InputBackend):
 
         More reliable than AppleScript — works for apps that don't respond
         to System Events (like Jamf Self Service+).
+
+        Returns True only if the app actually became frontmost.
         """
         try:
             from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
@@ -395,16 +397,20 @@ class MacOSInputBackend(InputBackend):
             if app:
                 app.activateWithOptionSet_(NSApplicationActivateIgnoringOtherApps)
                 time.sleep(0.15)
-                return True
+                # Verify activation actually worked
+                return self.is_frontmost(pid)
             # Fallback to System Events if NSRunningApplication fails
-            subprocess.run(
+            result = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to set frontmost of '
                  f'(first process whose unix id is {pid}) to true'],
                 capture_output=True, timeout=3,
             )
             time.sleep(0.15)
-            return True
+            # Verify activation and check subprocess result
+            if result.returncode != 0:
+                return False
+            return self.is_frontmost(pid)
         except Exception as e:
             logger.error("macOS activate_window failed: %s", e)
             return False
@@ -463,17 +469,17 @@ class LinuxInputBackend(InputBackend):
         try:
             if self._tool == "xdotool":
                 subprocess.run(
-                    ["xdotool", "type", "--delay", str(delay_ms), text],
+                    ["xdotool", "type", "--delay", str(delay_ms), "--", text],
                     capture_output=True, timeout=30,
                 )
             elif self._tool == "ydotool":
                 subprocess.run(
-                    ["ydotool", "type", "--key-delay", str(delay_ms), text],
+                    ["ydotool", "type", "--key-delay", str(delay_ms), "--", text],
                     capture_output=True, timeout=30,
                 )
             elif self._tool == "wtype":
                 subprocess.run(
-                    ["wtype", "-d", str(delay_ms), text],
+                    ["wtype", "-d", str(delay_ms), "--", text],
                     capture_output=True, timeout=30,
                 )
             else:
@@ -587,12 +593,7 @@ class LinuxInputBackend(InputBackend):
         try:
             if self._tool in ("xdotool",):
                 subprocess.run(
-                    ["xdotool", "mousemove", str(x), str(y)],
-                    capture_output=True, timeout=5,
-                )
-                time.sleep(0.01)
-                subprocess.run(
-                    ["xdotool", "click", btn],
+                    ["xdotool", "mousemove", str(x), str(y), "click", btn],
                     capture_output=True, timeout=5,
                 )
             elif self._tool == "ydotool":

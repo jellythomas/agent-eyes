@@ -22,6 +22,7 @@ class UIElement:
     source: str = "native"           # "native" or "cdp"
     visual: str = ""                 # Visual description (e.g. "red bg, white text, 14px")
     pid: int = 0                     # PID of the owning application (for window activation)
+    tab_index: int = -1              # Chrome tab index for CDP elements (-1 = native/unknown)
 
     def _location_label(self, viewport_w: int = 1920, viewport_h: int = 1080) -> str:
         """Compute spatial location label from bounds."""
