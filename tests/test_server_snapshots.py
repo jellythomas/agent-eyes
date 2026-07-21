@@ -1846,13 +1846,14 @@ def test_late_apple_shadow_mutation_is_unknown_and_not_replayed(monkeypatch):
     asyncio.run(run())
 
 
-def test_slow_native_tree_does_not_block_event_loop_heartbeat(monkeypatch):
+def test_native_tree_provider_work_runs_off_event_loop_thread(monkeypatch):
     from agent_eyes import server
 
     worker = ProviderWorker("heartbeat-test")
+    provider_thread_ids: list[int] = []
     adapter = MagicMock()
     adapter.get_tree.side_effect = lambda *args, **kwargs: (
-        time.sleep(0.05) or _native_tree("slow")
+        provider_thread_ids.append(threading.get_ident()) or _native_tree("slow")
     )
     monkeypatch.setattr(server, "native_adapter", adapter)
     monkeypatch.setattr(server, "native_worker", worker)
@@ -1860,15 +1861,16 @@ def test_slow_native_tree_does_not_block_event_loop_heartbeat(monkeypatch):
     monkeypatch.setattr(server._pu, "is_browser_pid", lambda pid: False)
 
     async def run() -> None:
-        loop = asyncio.get_running_loop()
-        tree_task = asyncio.create_task(server._handle_get_tree({"pid": 42}))
-        started = loop.time()
-        await asyncio.sleep(0.01)
-        heartbeat_lag = loop.time() - started - 0.01
-
-        assert heartbeat_lag < 0.02
-        assert "snapshot=" in await tree_task
-        await worker.aclose()
+        event_loop_thread_id = threading.get_ident()
+        try:
+            output = await server._handle_get_tree({"pid": 42})
+            assert "snapshot=" in output
+            assert provider_thread_ids
+            assert all(
+                thread_id != event_loop_thread_id for thread_id in provider_thread_ids
+            )
+        finally:
+            await worker.aclose()
 
     asyncio.run(run())
 
