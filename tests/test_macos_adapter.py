@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import sys
 from types import SimpleNamespace
 
 from agent_eyes.adapters.macos import MacOSAdapter
@@ -143,7 +144,19 @@ def test_browser_tree_rejects_ax_application_self_reference_without_fallback_wal
     assert fake_ax.action_reads == 0
 
 
-def test_browser_tree_has_an_independent_hard_limit_per_window():
+def test_browser_tree_has_an_independent_hard_limit_per_window(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "Foundation",
+        SimpleNamespace(
+            NSArray=SimpleNamespace(arrayWithArray_=lambda values: list(values))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        SimpleNamespace(kCFNull=object()),
+    )
     first_window = FakeAXElement(
         1,
         "AXWindow",

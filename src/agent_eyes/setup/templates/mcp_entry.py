@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 
 def _executable_path(executable: str | Path) -> str:
@@ -34,7 +35,7 @@ def get_mcp_entry_zed(executable: str | Path) -> dict:
 
 # ── Tool list for Claude Code agent definitions ─────────────────────
 
-AGENT_EYES_TOOLS = [
+_ALL_AGENT_EYES_TOOLS = [
     "mcp__agent-eyes__status",
     "mcp__agent-eyes__list_apps",
     "mcp__agent-eyes__tree",
@@ -63,6 +64,26 @@ AGENT_EYES_TOOLS = [
     "mcp__agent-eyes__shadow",
     "mcp__agent-eyes__pierce",
 ]
+
+_MACOS_ONLY_AGENT_EYES_TOOLS = frozenset(
+    {
+        "mcp__agent-eyes__app",
+        "mcp__agent-eyes__window",
+    }
+)
+
+
+def _agent_eyes_tools_for_platform(platform_name: str) -> list[str]:
+    if platform_name == "darwin":
+        return list(_ALL_AGENT_EYES_TOOLS)
+    return [
+        tool
+        for tool in _ALL_AGENT_EYES_TOOLS
+        if tool not in _MACOS_ONLY_AGENT_EYES_TOOLS
+    ]
+
+
+AGENT_EYES_TOOLS = _agent_eyes_tools_for_platform(sys.platform)
 
 
 def get_agent_eyes_tools_list() -> str:

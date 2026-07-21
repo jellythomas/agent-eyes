@@ -19,6 +19,7 @@ from agent_eyes.setup.configurator import (
 )
 from agent_eyes.setup.templates.mcp_entry import (
     AGENT_EYES_TOOLS,
+    _agent_eyes_tools_for_platform,
     get_mcp_entry,
     get_mcp_entry_zed,
 )
@@ -135,6 +136,21 @@ def test_generated_agent_tool_names_match_current_mcp_surface():
         "command": EXECUTABLE,
         "args": ["serve"],
     }
+
+
+def test_generated_agent_tool_names_follow_platform_specific_surface():
+    macos_tools = set(_agent_eyes_tools_for_platform("darwin"))
+    linux_tools = set(_agent_eyes_tools_for_platform("linux"))
+    windows_tools = set(_agent_eyes_tools_for_platform("win32"))
+
+    assert {
+        "mcp__agent-eyes__app",
+        "mcp__agent-eyes__window",
+    } <= macos_tools
+    assert "mcp__agent-eyes__app" not in linux_tools
+    assert "mcp__agent-eyes__window" not in linux_tools
+    assert "mcp__agent-eyes__app" not in windows_tools
+    assert "mcp__agent-eyes__window" not in windows_tools
 
 
 def test_configure_preserves_unrelated_servers_and_creates_backup(tmp_path):
