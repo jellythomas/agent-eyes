@@ -90,12 +90,19 @@ class ElementRegistry:
 
     def register_element(self, element: UIElement) -> None:
         """Register a single element without clearing the full registry."""
-        self._elements[element.id] = element
+        self._put_bounded(element)
 
     def register_elements(self, elements: list[UIElement]) -> None:
         """Register multiple elements without clearing the full registry."""
         for el in elements:
-            self._elements[el.id] = el
+            self._put_bounded(el)
+
+    def _put_bounded(self, element: UIElement) -> None:
+        """Retain at most the newest 500 incrementally registered elements."""
+        self._elements.pop(element.id, None)
+        self._elements[element.id] = element
+        while len(self._elements) > _MAX_ELEMENTS:
+            self._elements.pop(next(iter(self._elements)))
 
     def count(self) -> int:
         return len(self._elements)

@@ -23,6 +23,7 @@ def _make_uia_element(
     has_keyboard_focus=False,
     rect=None,
     value=None,
+    is_password=False,
 ):
     el = MagicMock()
     el.CurrentName = name
@@ -31,6 +32,7 @@ def _make_uia_element(
     el.CurrentIsEnabled = is_enabled
     el.CurrentIsOffscreen = is_offscreen
     el.CurrentHasKeyboardFocus = has_keyboard_focus
+    el.CurrentIsPassword = is_password
 
     if rect is None:
         r = MagicMock()
@@ -257,6 +259,34 @@ class TestWindowsAdapterGetTree(unittest.TestCase):
         # At depth 1 we have child; grandchild is at depth 2 (> max_depth=1)
         self.assertEqual(len(tree.children[0].children), 0)
 
+    def test_browser_inventory_reads_every_top_level_window(self):
+        first = _make_uia_element(name="First", ctrl_type=50031, pid=22)
+        second = _make_uia_element(name="Second", ctrl_type=50031, pid=22)
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([first, second])
+
+        trees = adapter.get_browser_trees(22)
+
+        self.assertEqual([tree.name for tree in trees], ["First", "Second"])
+        self.assertEqual([tree.window_index for tree in trees], [0, 1])
+
+    def test_browser_inventory_prunes_document_descendants(self):
+        browser_tab = _make_uia_element(name="Browser tab", ctrl_type=50019, pid=22)
+        page_tab = _make_uia_element(name="Page tab", ctrl_type=50019, pid=22)
+        document = _make_uia_element(name="Page", ctrl_type=50029, pid=22)
+        document.FindAll.return_value = _make_element_array([page_tab])
+        window = _make_uia_element(name="Browser", ctrl_type=50031, pid=22)
+        window.FindAll.return_value = _make_element_array([browser_tab, document])
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([window])
+
+        tree = adapter.get_browser_trees(22)[0]
+        names = [child.name for child in tree.children]
+
+        self.assertIn("Browser tab", names)
+        self.assertNotIn("Page tab", names)
+        document.FindAll.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # WindowsAdapter: _element_to_ui — states and bounds
@@ -315,6 +345,23 @@ class TestWindowsAdapterElementToUI(unittest.TestCase):
         adapter = _make_windows_adapter_with_mock_uia()
         ui = adapter._element_to_ui(el, 0, 5)
         self.assertEqual(ui.value, "hello")
+
+    def test_password_value_is_never_requested_or_stored(self):
+        secret = "windows-password-secret-333a"
+        el = _make_uia_element(
+            name="Password",
+            ctrl_type=50004,
+            value=secret,
+            is_password=True,
+        )
+        adapter = _make_windows_adapter_with_mock_uia()
+
+        ui = adapter._element_to_ui(el, 0, 5)
+
+        self.assertEqual(ui.value, "")
+        self.assertIn("secure", ui.states)
+        self.assertNotIn(secret, ui.to_flat_line())
+        el.GetCurrentPattern.assert_not_called()
 
     def test_returns_none_on_exception(self):
         el = MagicMock()
@@ -447,6 +494,21 @@ class TestWindowsAdapterPerformAction(unittest.TestCase):
 
 class TestWindowsAdapterFocusAndValue(unittest.TestCase):
 
+    def test_native_identity_uses_uia_compare_elements(self):
+        from agent_eyes.adapters.base import UIElement
+
+        first_ref = object()
+        second_ref = object()
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.CompareElements.side_effect = lambda first, second: first is second
+
+        first = UIElement(id=1, role="edit", platform_ref=first_ref)
+        same = UIElement(id=2, role="edit", platform_ref=first_ref)
+        different = UIElement(id=3, role="edit", platform_ref=second_ref)
+
+        self.assertTrue(adapter.is_same_element(first, same))
+        self.assertFalse(adapter.is_same_element(first, different))
+
     def test_focus_calls_set_focus(self):
         native_el = MagicMock()
         from agent_eyes.adapters.base import UIElement
@@ -524,8 +586,13 @@ class TestWindowsInputBackendScroll(unittest.TestCase):
         backend._INPUT = MagicMock()
         backend._MOUSEINPUT = MagicMock()
         backend._KEYBDINPUT = MagicMock()
-        # Replace _send_input so ctypes.byref is never called
-        backend._send_input = MagicMock()
+        backend._move_input = MagicMock(
+            side_effect=lambda x, y: ("move", x, y)
+        )
+        backend._mouse_input = MagicMock(
+            side_effect=lambda flags, **kwargs: ("mouse", flags, kwargs)
+        )
+        backend._send_inputs = MagicMock(return_value=True)
         return backend
 
     def test_scroll_down_returns_true(self):
@@ -545,16 +612,16 @@ class TestWindowsInputBackendScroll(unittest.TestCase):
         backend = self._make_backend()
         with patch("agent_eyes.input_sim.time"):
             backend.scroll(500, 400, delta_x=0, delta_y=0)
-        # 1 move call + 3 wheel calls = 4 _send_input calls
-        self.assertEqual(backend._send_input.call_count, 4)
+        events = backend._send_inputs.call_args.args[0]
+        self.assertEqual(len(events), 4)
 
     def test_scroll_move_then_wheel_events(self):
         """scroll() first moves the mouse, then sends |delta_y| wheel events."""
         backend = self._make_backend()
         with patch("agent_eyes.input_sim.time"):
             backend.scroll(100, 200, delta_y=-5)
-        # 1 move + 5 wheel = 6
-        self.assertEqual(backend._send_input.call_count, 6)
+        events = backend._send_inputs.call_args.args[0]
+        self.assertEqual(len(events), 6)
 
     def test_scroll_returns_false_on_exception(self):
         from agent_eyes.input_sim import WindowsInputBackend
@@ -563,7 +630,9 @@ class TestWindowsInputBackendScroll(unittest.TestCase):
         backend._INPUT = MagicMock()
         backend._MOUSEINPUT = MagicMock()
         backend._KEYBDINPUT = MagicMock()
-        backend._send_input = MagicMock(side_effect=Exception("crash"))
+        backend._move_input = MagicMock(return_value=("move", 0, 0))
+        backend._mouse_input = MagicMock(return_value=("mouse", 0, {}))
+        backend._send_inputs = MagicMock(side_effect=Exception("crash"))
 
         result = backend.scroll(0, 0)
         self.assertFalse(result)
@@ -583,7 +652,13 @@ class TestWindowsInputBackendDrag(unittest.TestCase):
         backend._INPUT = MagicMock()
         backend._MOUSEINPUT = MagicMock()
         backend._KEYBDINPUT = MagicMock()
-        backend._send_input = MagicMock()
+        backend._move_input = MagicMock(
+            side_effect=lambda x, y: ("move", x, y)
+        )
+        backend._mouse_input = MagicMock(
+            side_effect=lambda flags, **kwargs: ("mouse", flags, kwargs)
+        )
+        backend._send_inputs = MagicMock(return_value=True)
         return backend
 
     def test_drag_returns_true(self):
@@ -595,17 +670,13 @@ class TestWindowsInputBackendDrag(unittest.TestCase):
     def test_drag_sends_mouse_down_and_up(self):
         """drag() must call _mouse_event with LEFTDOWN before LEFTUP."""
         backend = self._make_backend()
-        sent_flags = []
-
-        def capture_mouse_event(flags):
-            sent_flags.append(flags)
-
-        backend._mouse_event = capture_mouse_event
         with patch("agent_eyes.input_sim.time"):
             backend.drag(100, 100, 300, 200)
 
         MOUSEEVENTF_LEFTDOWN = 0x0002
         MOUSEEVENTF_LEFTUP = 0x0004
+        events = backend._send_inputs.call_args.args[0]
+        sent_flags = [event[1] for event in events if event[0] == "mouse"]
         self.assertIn(MOUSEEVENTF_LEFTDOWN, sent_flags)
         self.assertIn(MOUSEEVENTF_LEFTUP, sent_flags)
         self.assertLess(
@@ -627,7 +698,9 @@ class TestWindowsInputBackendDrag(unittest.TestCase):
         backend._INPUT = MagicMock()
         backend._MOUSEINPUT = MagicMock()
         backend._KEYBDINPUT = MagicMock()
-        backend._send_input = MagicMock(side_effect=Exception("crash"))
+        backend._move_input = MagicMock(return_value=("move", 0, 0))
+        backend._mouse_input = MagicMock(return_value=("mouse", 0, {}))
+        backend._send_inputs = MagicMock(side_effect=Exception("crash"))
 
         result = backend.drag(0, 0, 100, 100)
         self.assertFalse(result)

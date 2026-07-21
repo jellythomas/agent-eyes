@@ -125,3 +125,58 @@ class TestToFlatLine:
         el = UIElement(id=12, role="textbox", value="")
         result = el.to_flat_line()
         assert "value=" not in result
+
+    def test_long_or_multiline_fields_are_bounded(self):
+        el = UIElement(
+            id=13,
+            role="textbox",
+            name="name\n" + "n" * 500,
+            value="value\n" + "v" * 1000,
+        )
+
+        result = el.to_flat_line()
+
+        assert "\n" not in result
+        assert len(result) < 360
+        assert "…" in result
+
+    @pytest.mark.parametrize(
+        ("role", "states"),
+        [
+            ("textbox", ["focused", "secure"]),
+            ("password text", ["focused"]),
+            ("securetextfield", []),
+        ],
+    )
+    def test_secure_values_never_render_in_flat_output(self, role, states):
+        secret = "flat-output-secret-9f50"
+        el = UIElement(
+            id=14,
+            role=role,
+            name="Password",
+            value=secret,
+            states=states,
+        )
+
+        result = el.to_flat_line()
+
+        assert secret not in result
+        assert "value=" not in result
+
+
+class TestToTextSecurity:
+    def test_secure_values_never_render_in_tree_output(self):
+        secret = "tree-output-secret-e281"
+        child = UIElement(
+            id=2,
+            role="textbox",
+            name="Password",
+            value=secret,
+            states=["secure"],
+        )
+        root = UIElement(id=1, role="window", children=[child])
+
+        result = root.to_text()
+
+        assert secret not in result
+        assert "value=" not in result

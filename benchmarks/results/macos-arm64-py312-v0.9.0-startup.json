@@ -1,0 +1,27 @@
+{
+  "environment": {
+    "architecture": "arm64",
+    "executable": ".venv/bin/python",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.11"
+  },
+  "latency": {
+    "mcp_initialize_and_tools_list": {
+      "max_ms": 444.99,
+      "median_ms": 432.3,
+      "p95_ms": 437.04
+    },
+    "server_import": {
+      "max_ms": 505.01,
+      "median_ms": 449.41,
+      "p95_ms": 457.79
+    }
+  },
+  "protocol": {
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "samples": 30,
+    "warmups": 3
+  },
+  "schema_version": 1,
+  "tool_counts": [28]
+}

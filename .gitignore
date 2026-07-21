@@ -22,5 +22,4 @@ venv/
 Thumbs.db
 
 # Project
-uv.lock
 .claude/worktrees/

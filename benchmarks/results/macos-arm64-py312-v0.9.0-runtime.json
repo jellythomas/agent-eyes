@@ -1,0 +1,48 @@
+{
+  "context": {
+    "tool_count": 28,
+    "tools_list_compact_json_bytes": 12544
+  },
+  "correctness": {
+    "input_fixed_orchestration_sleeps": 0,
+    "singleflight_provider_calls": [1]
+  },
+  "environment": {
+    "agent_eyes": "0.9.0",
+    "architecture": "arm64",
+    "git_head": "8cc5a8e",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.11"
+  },
+  "formatting": {
+    "1000": {
+      "latency": {"max_ms": 3.425, "median_ms": 2.763, "p95_ms": 3.369},
+      "output_bytes": 1515,
+      "shown_targets": 10
+    },
+    "50": {
+      "latency": {"max_ms": 0.39, "median_ms": 0.171, "p95_ms": 0.322},
+      "output_bytes": 1512,
+      "shown_targets": 10
+    }
+  },
+  "latency": {
+    "cli_help": {"max_ms": 76.962, "median_ms": 74.878, "p95_ms": 76.839},
+    "cli_import": {"max_ms": 77.423, "median_ms": 69.17, "p95_ms": 76.273},
+    "coordinator_foreground_noop": {"max_ms": 0.001, "median_ms": 0.001, "p95_ms": 0.001},
+    "event_loop_heartbeat_lag": {"max_ms": 5.073, "median_ms": 1.129, "p95_ms": 3.402},
+    "fast_input_1000_char_composite": {"max_ms": 0.0, "median_ms": 0.0, "p95_ms": 0.0},
+    "immediate_event_completion": {"max_ms": 0.747, "median_ms": 0.296, "p95_ms": 0.572},
+    "provider_deadline_response": {"max_ms": 15.419, "median_ms": 11.275, "p95_ms": 15.2},
+    "singleflight_observation": {"max_ms": 0.456, "median_ms": 0.326, "p95_ms": 0.45},
+    "snapshot_resolve": {"max_ms": 0.001, "median_ms": 0.001, "p95_ms": 0.001}
+  },
+  "protocol": {
+    "concurrency": 32,
+    "fixture": "deterministic; no live browser or network latency",
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "samples": 30,
+    "warmups": 3
+  },
+  "schema_version": 1
+}

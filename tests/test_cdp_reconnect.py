@@ -1,145 +1,287 @@
-"""CDP auto-reconnect on disconnect."""
+"""Deterministic reconnect and replay-safety tests for persistent CDP sessions."""
+from __future__ import annotations
+
 import asyncio
+from unittest.mock import AsyncMock
+
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock, PropertyMock
+
 from agent_eyes.cdp_persistent import CDPConnection, CDPSession
+from agent_eyes.operation import OperationError, OperationErrorCode
 
 
-class TestCDPAutoReconnect:
-    def test_send_retries_once_on_connection_error(self):
-        """If send fails with ConnectionError, retry once after reconnect."""
-        loop = asyncio.new_event_loop()
+def _attach(
+    conn: CDPConnection,
+    target_id: str,
+    session_id: str,
+    *,
+    url: str = "https://example.com",
+) -> CDPSession:
+    conn._on_attached({
+        "sessionId": session_id,
+        "targetInfo": {
+            "targetId": target_id,
+            "type": "page",
+            "url": url,
+            "title": target_id,
+            "webSocketDebuggerUrl": "",
+        },
+    })
+    session = conn.get_session_for_target(target_id)
+    assert session is not None
+    return session
 
-        async def run():
-            conn = CDPConnection()
-            # Use the correct constructor: CDPSession(session_id, connection)
-            session = CDPSession("session-1", conn)
 
-            call_count = 0
-            async def mock_send_raw(sid, mid, method, params):
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1:
-                    raise ConnectionError("WebSocket closed")
-                return  # success on retry
+def test_non_idempotent_mutation_is_never_replayed_after_disconnect():
+    async def run() -> None:
+        conn = CDPConnection()
+        session = _attach(conn, "target-1", "session-old")
+        send_raw = AsyncMock(side_effect=ConnectionError("WebSocket closed"))
+        conn._send_raw = send_raw
+        conn.reconnect = AsyncMock()
 
-            conn._send_raw = mock_send_raw
-            conn.ensure_connected = AsyncMock()
-            # Mock the pending future resolution
-            session._pending = {}
+        with pytest.raises(RuntimeError, match="outcome is unknown.*not retried"):
+            await session.send("Page.navigate", {"url": "https://new.example"})
 
-            # The session should attempt reconnect
-            try:
-                # We can't fully test send() without a real WebSocket,
-                # but we can verify ensure_connected is called on failure
-                await asyncio.wait_for(
-                    session.send("Runtime.evaluate", {"expression": "1+1"}),
-                    timeout=3.0
-                )
-            except Exception:
-                pass  # Expected — we're testing the reconnect attempt
+        send_raw.assert_awaited_once()
+        conn.reconnect.assert_not_awaited()
 
-            conn.ensure_connected.assert_called_once()
+    asyncio.run(run())
 
-        loop.run_until_complete(run())
-        loop.close()
 
-    def test_reconnect_timeout_is_2s(self):
-        """Reconnect must timeout after 2 seconds, not hang."""
-        loop = asyncio.new_event_loop()
+def test_explicit_idempotent_read_rebinds_by_target_after_disconnect():
+    async def run() -> None:
+        conn = CDPConnection()
+        stale_session = _attach(conn, "target-1", "session-old")
+        sent_session_ids: list[str] = []
 
-        async def run():
-            conn = CDPConnection()
-
-            async def slow_connect():
-                await asyncio.sleep(10)
-
-            conn.ensure_connected = slow_connect
-
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(conn.ensure_connected(), timeout=2.0)
-
-        loop.run_until_complete(run())
-        loop.close()
-
-    def test_reconnect_failure_gives_clear_error(self):
-        """If reconnect fails, error message mentions Chrome."""
-        loop = asyncio.new_event_loop()
-
-        async def run():
-            conn = CDPConnection()
-
-            async def fail_connect():
-                raise ConnectionError("Port 9222 refused")
-
-            conn.ensure_connected = fail_connect
-            conn._connected = False
-
-            # Trying to reconnect should give actionable error
-            try:
-                await conn.ensure_connected()
-            except ConnectionError as e:
-                assert "9222" in str(e) or "refused" in str(e)
-
-        loop.run_until_complete(run())
-        loop.close()
-
-    def test_send_raises_clear_error_when_reconnect_fails(self):
-        """If send fails and reconnect also fails, raise RuntimeError mentioning Chrome."""
-        loop = asyncio.new_event_loop()
-
-        async def run():
-            conn = CDPConnection()
-            session = CDPSession("session-1", conn)
-
-            async def mock_send_raw(sid, mid, method, params):
+        async def send_raw(
+            session_id: str,
+            msg_id: int,
+            method: str,
+            params: dict,
+        ) -> None:
+            sent_session_ids.append(session_id)
+            if session_id == "session-old":
                 raise ConnectionError("WebSocket closed")
+            current = conn._sessions[session_id]
+            current._on_message({"id": msg_id, "result": {"value": 2}})
 
-            async def mock_reconnect():
-                raise ConnectionError("Port 9222 refused")
+        async def reconnect(failed_generation: int) -> None:
+            assert failed_generation == stale_session.generation
+            _attach(conn, "target-1", "session-new")
 
-            conn._send_raw = mock_send_raw
-            conn.ensure_connected = mock_reconnect
+        conn._send_raw = send_raw
+        conn.reconnect = AsyncMock(side_effect=reconnect)
 
-            with pytest.raises(RuntimeError) as exc_info:
-                await session.send("Runtime.evaluate", {"expression": "1+1"})
+        result = await stale_session.send(
+            "Runtime.evaluate",
+            {"expression": "1+1"},
+            idempotent=True,
+        )
 
-            error_msg = str(exc_info.value)
-            assert "CDP disconnected" in error_msg or "remote-debugging-port" in error_msg
+        assert result == {"value": 2}
+        assert sent_session_ids == ["session-old", "session-new"]
+        conn.reconnect.assert_awaited_once_with(stale_session.generation)
+        assert conn.get_session_for_target("target-1").session_id == "session-new"
 
-        loop.run_until_complete(run())
-        loop.close()
+    asyncio.run(run())
 
-    def test_send_succeeds_after_reconnect(self):
-        """If send fails with ConnectionError but reconnect succeeds, the retry succeeds."""
-        loop = asyncio.new_event_loop()
 
-        async def run():
-            conn = CDPConnection()
-            session = CDPSession("session-1", conn)
+def test_stale_session_object_forwards_later_commands_to_current_target_binding():
+    async def run() -> None:
+        conn = CDPConnection()
+        stale_session = _attach(conn, "target-1", "session-old")
+        sent_session_ids: list[str] = []
 
-            call_count = 0
+        async def send_raw(
+            session_id: str,
+            msg_id: int,
+            method: str,
+            params: dict,
+        ) -> None:
+            sent_session_ids.append(session_id)
+            current = conn._sessions[session_id]
+            current._on_message({"id": msg_id, "result": {"ok": True}})
 
-            async def mock_send_raw(sid, mid, method, params):
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1:
-                    raise ConnectionError("WebSocket closed")
-                # On retry, simulate Chrome responding by resolving the future
-                # Find the pending future for msg_id and resolve it
-                for msg_id, fut in list(session._pending.items()):
-                    if not fut.done():
-                        fut.set_result({"id": msg_id, "result": {"value": 2}})
+        _attach(conn, "target-1", "session-new")
+        conn._send_raw = send_raw
+        conn.reconnect = AsyncMock()
 
-            conn._send_raw = mock_send_raw
-            conn.ensure_connected = AsyncMock()
+        result = await stale_session.send("Runtime.evaluate", idempotent=True)
 
-            result = await asyncio.wait_for(
-                session.send("Runtime.evaluate", {"expression": "1+1"}),
-                timeout=3.0
+        assert result == {"ok": True}
+        assert sent_session_ids == ["session-new"]
+        conn.reconnect.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_stale_session_object_rejects_mutation_before_new_generation_dispatch():
+    async def run() -> None:
+        conn = CDPConnection()
+        stale_session = _attach(conn, "target-1", "session-old")
+        current_session = _attach(conn, "target-1", "session-new")
+        conn._send_raw = AsyncMock()
+
+        with pytest.raises(OperationError) as exc_info:
+            await stale_session.send(
+                "Input.insertText",
+                {"text": "must-not-move-generations"},
             )
-            assert result == {"value": 2}
-            assert call_count == 2
 
-        loop.run_until_complete(run())
-        loop.close()
+        assert exc_info.value.code is OperationErrorCode.STALE_SNAPSHOT
+        assert conn.get_session_for_target("target-1") is current_session
+        conn._send_raw.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_idempotent_read_never_retries_stale_session_when_target_is_missing():
+    async def run() -> None:
+        conn = CDPConnection()
+        stale_session = _attach(conn, "target-1", "session-old")
+        send_raw = AsyncMock(side_effect=ConnectionError("WebSocket closed"))
+        conn._send_raw = send_raw
+        conn.reconnect = AsyncMock()
+        conn.wait_for_session_for_target = AsyncMock(return_value=None)
+
+        with pytest.raises(RuntimeError, match="target target-1 did not reattach"):
+            await stale_session.send(
+                "Runtime.evaluate",
+                {"expression": "document.title"},
+                idempotent=True,
+            )
+
+        send_raw.assert_awaited_once()
+        conn.wait_for_session_for_target.assert_awaited_once_with("target-1")
+
+    asyncio.run(run())
+
+
+def test_idempotent_retry_requires_canonical_target_identity():
+    async def run() -> None:
+        conn = CDPConnection()
+        session = CDPSession("session-without-target", conn)
+        conn._send_raw = AsyncMock(side_effect=ConnectionError("WebSocket closed"))
+        conn.reconnect = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="has no target ID.*not retried"):
+            await session.send("Runtime.evaluate", idempotent=True)
+
+        conn.reconnect.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_reconnect_failure_is_reported_without_swallowing_exception():
+    async def run() -> None:
+        conn = CDPConnection()
+        session = _attach(conn, "target-1", "session-old")
+        conn._send_raw = AsyncMock(side_effect=ConnectionError("WebSocket closed"))
+        conn.reconnect = AsyncMock(side_effect=ConnectionError("Port 9222 refused"))
+
+        with pytest.raises(RuntimeError, match="Reconnect failed: Port 9222 refused"):
+            await session.send("Runtime.evaluate", idempotent=True)
+
+    asyncio.run(run())
+
+
+def test_reconnect_timeout_uses_immediate_fake_not_wall_clock_sleep():
+    async def run() -> None:
+        conn = CDPConnection()
+        session = _attach(conn, "target-1", "session-old")
+        conn._send_raw = AsyncMock(side_effect=ConnectionError("WebSocket closed"))
+        conn.reconnect = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        with pytest.raises(RuntimeError, match="Reconnect timed out"):
+            await session.send("Runtime.evaluate", idempotent=True)
+
+    asyncio.run(run())
+
+
+def test_disconnect_while_awaiting_response_does_not_replay_mutation():
+    async def run() -> None:
+        conn = CDPConnection()
+        session = _attach(conn, "target-1", "session-old")
+        send_count = 0
+
+        async def send_raw(
+            session_id: str,
+            msg_id: int,
+            method: str,
+            params: dict,
+        ) -> None:
+            nonlocal send_count
+            send_count += 1
+            session._pending[msg_id].set_exception(
+                RuntimeError("CDPConnection: read loop terminated")
+            )
+
+        conn._send_raw = send_raw
+        conn.reconnect = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="outcome is unknown.*not retried"):
+            await session.send("Input.insertText", {"text": "hello"})
+
+        assert send_count == 1
+        conn.reconnect.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_concurrent_reconnect_keeps_the_single_fresh_transport_open():
+    async def run() -> None:
+        class ProbeWebSocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        conn = CDPConnection()
+        failed_generation = 1
+        failed_transport = ProbeWebSocket()
+        reader_cancelled = asyncio.Event()
+        release_reader = asyncio.Event()
+        replacements: list[ProbeWebSocket] = []
+
+        async def blocked_reader() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                reader_cancelled.set()
+                await release_reader.wait()
+
+        async def install_replacement() -> None:
+            replacement = ProbeWebSocket()
+            replacements.append(replacement)
+            conn._ws = replacement
+            conn._connected = True
+            conn._generation += 1
+
+        conn._connected = True
+        conn._generation = failed_generation
+        conn._ws = failed_transport
+        conn._read_task = asyncio.create_task(blocked_reader())
+
+        # Patch both paths so this regression also fails against the former
+        # reconnect implementation, which re-entered public ensure_connected().
+        conn.ensure_connected = install_replacement
+        conn._ensure_connected_locked = install_replacement
+
+        first = asyncio.create_task(conn.reconnect())
+        await reader_cancelled.wait()
+        second = asyncio.create_task(conn.reconnect())
+        await asyncio.sleep(0)
+        release_reader.set()
+
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1.0)
+
+        assert len(replacements) == 1
+        assert conn._ws is replacements[0]
+        assert replacements[0].close_calls == 0
+        assert failed_transport.close_calls == 1
+        assert conn._generation == failed_generation + 1
+
+    asyncio.run(run())

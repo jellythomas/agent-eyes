@@ -2,10 +2,12 @@
 
 import json
 
-from .scanner import scan_ai_tools, scan_competitors
-from .state import is_first_run, mark_initialized
-from .competitors import CATEGORIES
+from agent_eyes import __version__
+
 from .configurator import apply_setup
+from .competitors import CATEGORIES
+from .scanner import scan_ai_tools, scan_competitors
+from .state import mark_initialized
 
 
 def handle_setup() -> str:
@@ -82,12 +84,6 @@ def handle_setup() -> str:
                 "found_in": loc_names,
             })
 
-    # Add "All" and "None" options
-    all_letter = chr(65 + option_idx)
-    none_letter = chr(66 + option_idx)
-    lines.append(f"\n    {all_letter}. ALL of the above")
-    lines.append(f"    {none_letter}. None (just add agent-eyes, keep existing)")
-
     # ── Claude Code specific: skills and agents
     cc_report = scan_report["by_tool"].get("claude-code", {})
     skill_comps = cc_report.get("skill_competitors", [])
@@ -112,13 +108,12 @@ def handle_setup() -> str:
                     )
                     agents_seen.add(ref["agent_file"])
 
-    # ── Quick Setup — compact choices with smart defaults
-    # Default: replace ALL competitors, configure ALL detected tools, global
-    all_comp_ids = [c["id"] for c in competitor_list]
+    # Normal setup coexists with unrelated tools. Competitor removal is not a
+    # setup side effect and therefore has no destructive default.
     all_tool_ids = [t["id"] for t in ai_tools]
     defaults = {
-        "replace": all_letter,
-        "replace_ids": all_comp_ids,
+        "replace": "keep",
+        "replace_ids": [],
         "tools": all_tool_ids,
         "level": "global",
     }
@@ -128,27 +123,17 @@ def handle_setup() -> str:
     lines.append("  Quick Setup")
     lines.append("=" * 60)
     lines.append("")
+    lines.append(
+        "Normal setup will coexist with detected tools; it will not remove MCP "
+        "entries, disable skills, or rewrite agent instructions."
+    )
+    lines.append("")
     lines.append("IMPORTANT: Present setup choices to the user using the BEST available UI.")
     lines.append("")
     lines.append("OPTION 1 — Native multi-choice (Claude Code):")
-    lines.append("If the AskUserQuestion tool is available, use it to present 3 questions:")
+    lines.append("If the AskUserQuestion tool is available, use it to present 2 questions:")
     lines.append("")
-    lines.append("  Question 1: \"Which competing MCP servers should agent-eyes replace?\"")
-    lines.append("    Header: \"Replace\"")
-    lines.append("    Options:")
-
-    # Build replace options dynamically
-    if len(competitor_list) == 1:
-        # Single competitor: All replaces just that one, so show specific options
-        lines.append(f"      - \"{competitor_list[0]['name']} (Recommended)\" → replace just this one")
-        lines.append(f"      - \"None\" → keep existing, just add agent-eyes")
-    else:
-        lines.append(f"      - \"All ({total} servers) (Recommended)\" → replace all competitors")
-        for c in competitor_list[:3]:  # Cap at 3 to fit AskUserQuestion's 4-option limit
-            lines.append(f"      - \"{c['name']} only\" → replace only this one")
-
-    lines.append("")
-    lines.append("  Question 2: \"Which AI tools should agent-eyes be configured in?\"")
+    lines.append("  Question 1: \"Which AI tools should agent-eyes be configured in?\"")
     lines.append("    Header: \"Tools\"")
     lines.append("    Options:")
     lines.append(f"      - \"All ({len(ai_tools)} tools) (Recommended)\" → " + ", ".join(
@@ -158,7 +143,7 @@ def handle_setup() -> str:
         for t in ai_tools[:3]:
             lines.append(f"      - \"{t['name']} only\"")
     lines.append("")
-    lines.append("  Question 3: \"What scope should the configuration be applied at?\"")
+    lines.append("  Question 2: \"What scope should the configuration be applied at?\"")
     lines.append("    Header: \"Level\"")
     lines.append("    Options:")
     lines.append("      - \"Global (Recommended)\" → available in all projects")
@@ -167,17 +152,16 @@ def handle_setup() -> str:
     lines.append("OPTION 2 — Text fallback (other AI tools):")
     lines.append("If AskUserQuestion is NOT available, present as compact text:")
     lines.append("─────────────────────────────────────────────")
-    lines.append(f"  Replace competitors?  [{all_letter}] " + " / ".join(
-        [f"({c['option']}) {c['name']}" for c in competitor_list]
-        + [f"({all_letter}) All", f"({none_letter}) None"]
-    ))
-    lines.append(f"  Configure in?         [All] " + " / ".join(
+    lines.append("  Configure in?         [All] " + " / ".join(
         [f"{t['id']}" for t in ai_tools]
     ))
-    lines.append(f"  Level?                [global] / project")
+    lines.append("  Level?                [global] / project")
     lines.append("─────────────────────────────────────────────")
     lines.append("")
-    lines.append("After user responds, call eyes_setup_apply with their choices.")
+    lines.append(
+        "After user responds, call eyes_setup_apply with replace_competitors: [] "
+        "and their client/scope choices. Set approved: true only after confirmation."
+    )
     lines.append("All changes are backed up automatically.")
 
     # Embed machine-readable data for the AI agent
@@ -198,6 +182,15 @@ def handle_setup_apply(args: dict) -> str:
     replace_competitors = args.get("replace_competitors", [])
     configure_tools = args.get("configure_tools", [])
     level = args.get("level", "global")
+    dry_run = bool(args.get("dry_run", False))
+    approved = args.get("approved")
+
+    if not dry_run and approved is not True:
+        return (
+            "Agent Eyes setup cancelled: explicit approval (approved: true) is required; "
+            "no changes were made."
+        )
+    consent = approved is True or dry_run
 
     if not configure_tools:
         return "ERROR: configure_tools is required (list of AI tool IDs to configure)"
@@ -212,19 +205,34 @@ def handle_setup_apply(args: dict) -> str:
         configure_tools=configure_tools,
         level=level,
         scan_report=scan_report,
+        dry_run=dry_run,
+        consent=consent,
     )
 
-    # Mark as initialized
-    mark_initialized(
-        version="0.3.1",
-        tools_configured=configure_tools,
-        competitors_replaced=replace_competitors,
-    )
+    if result.get("cancelled"):
+        return "Agent Eyes setup cancelled; no changes were made."
+
+    if not result.get("dry_run"):
+        configured_tools = [
+            str(change["tool"])
+            for change in result.get("changes", [])
+            if change.get("tool")
+        ]
+        if configured_tools:
+            mark_initialized(
+                version=__version__,
+                tools_configured=configured_tools,
+                competitors_replaced=[],
+            )
 
     # Format response
     lines = []
     lines.append("=" * 60)
-    lines.append("  agent-eyes setup — Changes Applied")
+    lines.append(
+        "  agent-eyes setup — Preview"
+        if result.get("dry_run")
+        else "  agent-eyes setup — Changes Applied"
+    )
     lines.append("=" * 60)
     lines.append("")
 
@@ -251,6 +259,9 @@ def handle_setup_apply(args: dict) -> str:
     lines.append("")
     lines.append(f"All backups saved to: {result['backups_dir']}")
     lines.append("")
-    lines.append("Setup complete! Restart your AI tool for changes to take effect.")
+    if result.get("dry_run"):
+        lines.append("Preview complete; no changes were made.")
+    else:
+        lines.append("Setup complete! Restart your AI tool for changes to take effect.")
 
     return "\n".join(lines)

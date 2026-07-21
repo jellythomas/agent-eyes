@@ -14,6 +14,7 @@ class LinuxAdapter(BaseAdapter):
     def __init__(self):
         self._atspi = None
         self._id_counter = 0
+        self._include_web_content = True
 
     def _next_id(self) -> int:
         self._id_counter += 1
@@ -90,6 +91,7 @@ class LinuxAdapter(BaseAdapter):
     def get_tree(self, pid: int, max_depth: int = 5,
                  is_browser: bool = False) -> UIElement | None:
         self._load()
+        self._include_web_content = True
         self.reset_ids()
         desktop = self._atspi.get_desktop(0)
 
@@ -111,6 +113,64 @@ class LinuxAdapter(BaseAdapter):
                 return self._atspi_to_ui(window, 0, max_depth)
 
         return self._atspi_to_ui(target_app, 0, max_depth)
+
+    def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        """Return every browser window tree while pruning page documents."""
+        self._load()
+        self.reset_ids()
+        self._include_web_content = False
+        desktop = self._atspi.get_desktop(0)
+
+        target_app = None
+        for index in range(desktop.get_child_count()):
+            app = desktop.get_child_at_index(index)
+            if app and app.get_process_id() == pid:
+                target_app = app
+                break
+        if target_app is None:
+            self._include_web_content = True
+            return []
+
+        try:
+            trees = []
+            for window_index in range(target_app.get_child_count()):
+                window = target_app.get_child_at_index(window_index)
+                if window is None:
+                    continue
+                self._in_web_area = False
+                tree = self._atspi_to_ui(window, 0, max_depth)
+                if tree is not None:
+                    tree.window_index = window_index
+                    trees.append(tree)
+            if not trees:
+                tree = self._atspi_to_ui(target_app, 0, max_depth)
+                if tree is not None:
+                    trees.append(tree)
+            return trees
+        finally:
+            self._include_web_content = True
+
+    def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:
+        if element.platform_ref is None:
+            return None
+        self._load()
+        self._include_web_content = True
+        self.reset_ids()
+        return self._atspi_to_ui(element.platform_ref, 0, max_depth)
+
+    def is_element_selected(self, element: UIElement) -> bool:
+        if element.platform_ref is None:
+            return False
+        self._load()
+        try:
+            states = element.platform_ref.get_state_set()
+            return bool(
+                states.contains(self._atspi.StateType.SELECTED)
+                or states.contains(self._atspi.StateType.FOCUSED)
+                or states.contains(self._atspi.StateType.ACTIVE)
+            )
+        except Exception:
+            return False
 
     # Roles worth exposing inside web content (interactive + structural)
     _WEB_INTERACTIVE_ROLES = frozenset({
@@ -137,6 +197,21 @@ class LinuxAdapter(BaseAdapter):
             return True
         return False
 
+    def _is_password_element(self, obj, role_name: str) -> bool:
+        """Identify AT-SPI password roles without depending on locale text."""
+        normalized_role = " ".join(
+            role_name.casefold().replace("_", " ").replace("-", " ").split()
+        )
+        if normalized_role == "password text":
+            return True
+        if normalized_role not in {"", "extended", "unknown"}:
+            return False
+        try:
+            password_role = self._atspi.Role.PASSWORD_TEXT
+            return obj.get_role() == password_role
+        except Exception:
+            return False
+
     def _atspi_to_ui(self, obj, depth: int, max_depth: int,
                      in_web_area: bool = False) -> UIElement | None:
         if depth > max_depth or obj is None:
@@ -148,34 +223,41 @@ class LinuxAdapter(BaseAdapter):
         try:
             role = obj.get_role_name() or "unknown"
             name = obj.get_name() or ""
+            is_secure = self._is_password_element(obj, role)
 
             # Detect entry into web content
             if role in ("document web", "document frame"):
                 in_web_area = True
                 self._in_web_area = True
-                max_depth = max(max_depth, depth + 20)
+                if getattr(self, "_include_web_content", True):
+                    max_depth = max(max_depth, depth + 20)
+                else:
+                    max_depth = depth
             description = obj.get_description() or ""
 
             # Value
             value = ""
-            try:
-                val_iface = obj.get_value()
-                if val_iface:
-                    value = str(val_iface.get_current_value())
-            except Exception:
-                pass
-            if not value:
+            if not is_secure:
                 try:
-                    text_iface = obj.get_text()
-                    if text_iface:
-                        char_count = text_iface.get_character_count()
-                        if char_count > 0:
-                            value = text_iface.get_text(0, min(char_count, 200))
+                    val_iface = obj.get_value()
+                    if val_iface:
+                        value = str(val_iface.get_current_value())
                 except Exception:
                     pass
+                if not value:
+                    try:
+                        text_iface = obj.get_text()
+                        if text_iface:
+                            char_count = text_iface.get_character_count()
+                            if char_count > 0:
+                                value = text_iface.get_text(0, min(char_count, 200))
+                    except Exception:
+                        pass
 
             # States
             states = []
+            if is_secure:
+                states.append("secure")
             try:
                 state_set = obj.get_state_set()
                 if state_set.contains(self._atspi.StateType.FOCUSED):
@@ -301,6 +383,41 @@ class LinuxAdapter(BaseAdapter):
             if component:
                 return component.grab_focus()
             return False
+        except Exception:
+            return False
+
+    def is_same_element(self, first: UIElement, second: UIElement) -> bool:
+        if first.platform_ref is None or second.platform_ref is None:
+            return False
+        try:
+            return bool(
+                first.platform_ref is second.platform_ref
+                or first.platform_ref == second.platform_ref
+            )
+        except Exception:
+            return False
+
+    def is_element_valid(self, element: UIElement) -> bool:
+        if element.platform_ref is None:
+            return False
+        try:
+            element.platform_ref.get_role_name()
+            return True
+        except Exception:
+            return False
+
+    def focus_window(self, window: UIElement) -> bool:
+        return self.focus_element(window)
+
+    def is_window_focused(self, window: UIElement) -> bool:
+        if window.platform_ref is None:
+            return False
+        try:
+            states = window.platform_ref.get_state_set()
+            return bool(
+                states.contains(self._atspi.StateType.ACTIVE)
+                or states.contains(self._atspi.StateType.FOCUSED)
+            )
         except Exception:
             return False
 
