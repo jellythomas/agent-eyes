@@ -74,7 +74,10 @@ jobs:
       - name: Compile source
         run: python -m compileall -q src
       - name: Run tests
-        run: python -m pytest -q
+        run: >-
+          python -m pytest -q
+          -o faulthandler_timeout=60
+          -o faulthandler_exit_on_timeout=true
 
   package:
     name: Build and inspect distributions
