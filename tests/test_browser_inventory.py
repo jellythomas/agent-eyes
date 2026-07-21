@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -373,6 +374,58 @@ def test_default_server_tab_listing_never_probes_shadow_provider(monkeypatch):
     server.cdp_client.is_available.assert_not_awaited()
 
 
+def test_concurrent_native_tab_listings_share_one_inventory_scan(monkeypatch):
+    from agent_eyes import server
+
+    adapter = object()
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def inventory(observed_adapter):
+        nonlocal calls
+        assert observed_adapter is adapter
+        calls += 1
+        started.set()
+        assert release.wait(timeout=2.0)
+        return [
+            BrowserTarget(
+                browser="Firefox",
+                pid=42,
+                title="Already open",
+                selected=True,
+            )
+        ]
+
+    monkeypatch.setattr(server, "native_adapter", adapter)
+    monkeypatch.setattr(server, "collect_browser_targets", inventory)
+
+    async def run() -> None:
+        tasks = [
+            asyncio.create_task(server._handle_list_tabs({}))
+            for _ in range(32)
+        ]
+        try:
+            assert await asyncio.to_thread(started.wait, 2.0)
+            key = (server._NATIVE_BROWSER_INVENTORY_FLIGHT, id(adapter))
+            for _ in range(100):
+                flight = server.coordinator._flights.get(key)
+                if flight is not None and flight.waiters == len(tasks):
+                    break
+                await asyncio.sleep(0)
+            assert server.coordinator._flights[key].waiters == len(tasks)
+            assert calls == 1
+        finally:
+            release.set()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert calls == 1
+        assert all("Already open" in result for result in results)
+        assert key not in server.coordinator._flights
+
+    asyncio.run(run())
+
+
 def test_explicit_shadow_tab_listing_may_probe_cdp(monkeypatch):
     from agent_eyes import server
 
@@ -387,6 +440,137 @@ def test_explicit_shadow_tab_listing_may_probe_cdp(monkeypatch):
     server.cdp_pool.ensure_connected.assert_awaited_once()
     assert "optional shadow provider" in output.lower()
     assert "restart" not in output.lower()
+
+
+def test_shadow_tab_probe_runs_while_native_inventory_is_blocked(monkeypatch):
+    from agent_eyes import server
+
+    tab = SimpleNamespace(
+        id="shadow-target-1",
+        title="Background page",
+        url="https://example.test",
+    )
+    native_started = asyncio.Event()
+    release_native = asyncio.Event()
+    shadow_finished = asyncio.Event()
+
+    async def blocked_native_inventory(*, budget):
+        assert budget.remaining() > 0
+        native_started.set()
+        await release_native.wait()
+        return []
+
+    async def legacy_tabs():
+        shadow_finished.set()
+        return [tab]
+
+    monkeypatch.setattr(server, "native_adapter", object())
+    monkeypatch.setattr(
+        server,
+        "_collect_native_browser_targets",
+        blocked_native_inventory,
+    )
+    monkeypatch.setattr(
+        server.cdp_pool,
+        "ensure_connected",
+        AsyncMock(side_effect=RuntimeError("offline")),
+    )
+    monkeypatch.setattr(server.cdp_pool, "_connected", False)
+    monkeypatch.setattr(
+        server.cdp_client,
+        "is_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(server.cdp_client, "list_tabs", legacy_tabs)
+
+    async def run() -> None:
+        task = asyncio.create_task(server._handle_list_tabs({"shadow": True}))
+        try:
+            await asyncio.wait_for(native_started.wait(), timeout=0.5)
+            await asyncio.wait_for(shadow_finished.wait(), timeout=0.5)
+            assert not task.done()
+        finally:
+            release_native.set()
+        output = await asyncio.wait_for(task, timeout=0.5)
+        assert "target_id=shadow-target-1" in output
+
+    asyncio.run(run())
+
+
+def test_legacy_shadow_inventory_is_not_starved_by_persistent_probe(monkeypatch):
+    from agent_eyes import server
+
+    persistent_started = asyncio.Event()
+    persistent_cancelled = asyncio.Event()
+    never_release = asyncio.Event()
+    tab = SimpleNamespace(
+        id="legacy-target-1",
+        title="Legacy page",
+        url="https://example.test/legacy",
+    )
+
+    async def blocked_persistent_probe():
+        persistent_started.set()
+        try:
+            await never_release.wait()
+        except asyncio.CancelledError:
+            persistent_cancelled.set()
+            raise
+
+    monkeypatch.setattr(server.cdp_pool, "_connected", False)
+    monkeypatch.setattr(server.cdp_pool, "ensure_connected", blocked_persistent_probe)
+    monkeypatch.setattr(
+        server.cdp_client,
+        "is_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        server.cdp_client,
+        "list_tabs",
+        AsyncMock(return_value=[tab]),
+    )
+    monkeypatch.setattr(server, "_as", None)
+
+    async def run() -> None:
+        tabs, provider = await asyncio.wait_for(
+            server._collect_explicit_shadow_tabs(),
+            timeout=0.5,
+        )
+        assert persistent_started.is_set()
+        assert persistent_cancelled.is_set()
+        assert tabs == [tab]
+        assert provider == "legacy"
+
+    asyncio.run(run())
+
+
+def test_empty_connected_persistent_inventory_does_not_hide_legacy_tabs(monkeypatch):
+    from agent_eyes import server
+
+    tab = SimpleNamespace(
+        id="legacy-target-while-persistent-empty",
+        title="Legacy fallback page",
+        url="https://example.test/fallback",
+    )
+    monkeypatch.setattr(server.cdp_pool, "_connected", True)
+    monkeypatch.setattr(server.cdp_pool, "list_tabs", MagicMock(return_value=[]))
+    monkeypatch.setattr(server.cdp_pool, "ensure_connected", AsyncMock())
+    monkeypatch.setattr(
+        server.cdp_client,
+        "is_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        server.cdp_client,
+        "list_tabs",
+        AsyncMock(return_value=[tab]),
+    )
+    monkeypatch.setattr(server, "_as", None)
+
+    tabs, provider = asyncio.run(server._collect_explicit_shadow_tabs())
+
+    assert tabs == [tab]
+    assert provider == "legacy"
 
 
 def test_explicit_shadow_tab_listing_emits_canonical_target_id(monkeypatch):

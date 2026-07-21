@@ -42,10 +42,15 @@ def test_compact_catalog_preserves_native_first_and_shadow_consent_cues():
         assert "shadow=true" in description
         assert "explicit" in description
 
+    explicit_shadow_only = {"web_tree", "js", "dialog", "upload", "pierce"}
     for tool in TOOLS:
         shadow = tool.inputSchema["properties"].get("shadow")
         if shadow is not None:
-            assert shadow["default"] is False
+            if tool.name in explicit_shadow_only:
+                assert shadow["enum"] == [True]
+                assert "default" not in shadow
+            else:
+                assert shadow["default"] is False
             description = tool.description.lower()
             assert "shadow=true" in description
             assert "explicit" in description

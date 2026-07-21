@@ -104,3 +104,26 @@ def test_non_json_and_recursive_arguments_fail_closed():
     for arguments in ({"value": object()}, recursive):
         with pytest.raises(InputValidationError, match="finite JSON"):
             validate_tool_arguments({"type": "object"}, arguments)
+
+
+def test_conditional_requirement_is_enforced_only_when_condition_matches():
+    schema = {
+        "type": "object",
+        "properties": {
+            "shadow": {"type": "boolean"},
+            "target_id": {"type": "string"},
+        },
+        "if": {
+            "properties": {"shadow": {"enum": [True]}},
+            "required": ["shadow"],
+        },
+        "then": {"required": ["target_id"]},
+        "additionalProperties": False,
+    }
+
+    validate_tool_arguments(schema, {})
+    validate_tool_arguments(schema, {"shadow": False})
+    validate_tool_arguments(schema, {"shadow": True, "target_id": "target-1"})
+
+    with pytest.raises(InputValidationError, match="arguments.target_id is required"):
+        validate_tool_arguments(schema, {"shadow": True})

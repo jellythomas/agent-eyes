@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from mcp.types import CallToolResult
 
@@ -67,6 +68,14 @@ def permission_required_report():
     )
 
 
+def missing_input_report():
+    return probe_readiness(
+        native_provider=AvailableNative(),
+        input_provider=None,
+        persistent_executable=Path("/stable/agent-eyes"),
+    )
+
+
 def test_server_identifies_agent_eyes_version():
     from agent_eyes import server
 
@@ -127,6 +136,35 @@ def test_blocked_runtime_action_reports_actual_readiness_status(monkeypatch):
     assert isinstance(result, CallToolResult)
     assert result.isError is True
     assert result.content[0].text.startswith("permission_required:")
+
+
+def test_native_read_only_action_is_not_blocked_by_missing_input(monkeypatch):
+    from agent_eyes import server
+
+    dispatch = AsyncMock(return_value="native tree")
+    monkeypatch.setattr(server, "_runtime_readiness", missing_input_report())
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+
+    result = asyncio.run(server.call_tool("tree", {"pid": 1}))
+
+    assert result[0].text == "native tree"
+    dispatch.assert_awaited_once_with("tree", {"pid": 1})
+
+
+def test_input_action_is_blocked_when_only_input_capability_is_missing(monkeypatch):
+    from agent_eyes import server
+
+    dispatch = AsyncMock(side_effect=AssertionError("dispatch must not run"))
+    monkeypatch.setattr(server, "_runtime_readiness", missing_input_report())
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+
+    result = asyncio.run(server.call_tool("press_key", {"key": "Enter"}))
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.content[0].text.startswith("setup_required:")
+    assert "input" in result.content[0].text
+    dispatch.assert_not_awaited()
 
 
 def test_status_is_derived_from_live_readiness(monkeypatch):

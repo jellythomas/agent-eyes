@@ -397,7 +397,9 @@ def test_release_is_robust_and_exactly_once_for_every_eviction_path(eviction_pat
 
 def test_ten_thousand_create_invalidate_cycles_retain_no_provider_references():
     class ProviderReference:
-        pass
+        def __init__(self) -> None:
+            self.payload = bytearray(4 * 1024)
+            self.payload[0] = 1
 
     survivors: weakref.WeakSet[ProviderReference] = weakref.WeakSet()
     released = 0
@@ -407,6 +409,7 @@ def test_ten_thousand_create_invalidate_cycles_retain_no_provider_references():
         released += 1
 
     store = ObservationStore(max_snapshots=4)
+    maximum_live_snapshots = 0
     for revision in range(10_000):
         provider_reference = ProviderReference()
         survivors.add(provider_reference)
@@ -419,6 +422,7 @@ def test_ten_thousand_create_invalidate_cycles_retain_no_provider_references():
             elements=[_record(1, provider_reference)],
             release=release,
         )
+        maximum_live_snapshots = max(maximum_live_snapshots, len(store._snapshots))
         del provider_reference
         assert store.invalidate_target(
             provider="native",
@@ -430,6 +434,7 @@ def test_ten_thousand_create_invalidate_cycles_retain_no_provider_references():
 
     assert released == 10_000
     assert len(survivors) == 0
+    assert maximum_live_snapshots == 1
     assert store._snapshots == {}
 
 

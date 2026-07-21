@@ -5,7 +5,7 @@ import asyncio
 import math
 import queue
 import threading
-from collections import deque
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass
@@ -136,7 +136,8 @@ class ProviderWorker:
         self._shutdown_timeout = float(shutdown_timeout)
         self._executor = _DaemonSerialExecutor(f"agent-eyes-{name}")
         self._guard = threading.Lock()
-        self._waiters: deque[_LaneWaiter] = deque()
+        # OrderedDict keeps FIFO handoff while allowing O(1) cancellation unlinking.
+        self._waiters: OrderedDict[asyncio.Future[None], _LaneWaiter] = OrderedDict()
         self._occupied = False
         self._active: ConcurrentFuture[object] | None = None
         self._closed = False
@@ -155,7 +156,7 @@ class ProviderWorker:
         operation: str,
         state: ProviderCallState | None = None,
     ) -> _T:
-        """Run one sync call; a timed-out call retains the lane until it finishes."""
+        """Run one sync call; timed-out active work retains its lane until finished."""
         if not operation:
             raise ValueError("operation name is required")
         self._ensure_open()
@@ -242,7 +243,7 @@ class ProviderWorker:
                 self._occupied = True
                 return
             waiter = _LaneWaiter(loop=loop, future=loop.create_future())
-            self._waiters.append(waiter)
+            self._waiters[waiter.future] = waiter
 
         try:
             if budget is None:
@@ -256,6 +257,7 @@ class ProviderWorker:
             should_handoff = False
             with self._guard:
                 waiter.active = False
+                self._waiters.pop(waiter.future, None)
                 if waiter.granted:
                     waiter.granted = False
                     should_handoff = True
@@ -278,7 +280,7 @@ class ProviderWorker:
     def _release_lane(self) -> None:
         with self._guard:
             while self._waiters:
-                waiter = self._waiters.popleft()
+                _future, waiter = self._waiters.popitem(last=False)
                 if (
                     not waiter.active
                     or waiter.future.done()

@@ -135,7 +135,38 @@ def test_every_targeted_shadow_tool_accepts_one_bounded_stable_target_id():
     upload = by_name["upload"]
     assert upload["properties"]["snapshot"]["maxLength"] == 128
     assert "snapshot" in upload["required"]
-    assert by_name["fill_form"]["properties"]["snapshot"]["maxLength"] == 128
+    for name in ("fill_form", "subtree"):
+        assert by_name[name]["properties"]["snapshot"]["maxLength"] == 128
+        assert "snapshot" in by_name[name]["required"]
+
+
+def test_shadow_only_contracts_require_explicit_mode_and_target():
+    from agent_eyes.server import TOOLS
+
+    by_name = {tool.name: tool.inputSchema for tool in TOOLS}
+    for name in ("web_tree", "js", "dialog", "pierce"):
+        schema = by_name[name]
+        assert {"shadow", "target_id"} <= set(schema["required"])
+        assert schema["properties"]["shadow"]["enum"] == [True]
+        assert "default" not in schema["properties"]["shadow"]
+
+    upload = by_name["upload"]
+    assert "shadow" in upload["required"]
+    assert upload["properties"]["shadow"]["enum"] == [True]
+    assert "target_id" in by_name["shadow"]["required"]
+
+
+def test_dual_mode_shadow_contracts_conditionally_require_target_id():
+    from agent_eyes.server import TOOLS
+
+    by_name = {tool.name: tool.inputSchema for tool in TOOLS}
+    for name in ("navigate", "press_key", "wait", "close_tab", "scroll", "drag"):
+        schema = by_name[name]
+        assert schema["if"] == {
+            "properties": {"shadow": {"enum": [True]}},
+            "required": ["shadow"],
+        }
+        assert schema["then"] == {"required": ["target_id"]}
 
 
 def test_preserves_stricter_existing_bounds_and_rejects_invalid_tools():

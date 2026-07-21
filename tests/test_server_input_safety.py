@@ -132,19 +132,51 @@ def test_call_tool_accepts_bounded_shadow_target_id(monkeypatch):
         "web_tree",
         {"shadow": True, "target_id": "target-7"},
     )
+    readiness.assert_not_awaited()
 
 
-def test_web_tree_without_shadow_is_an_mcp_error_not_advisory_success(monkeypatch):
+def test_web_tree_without_explicit_shadow_contract_fails_before_readiness(monkeypatch):
     from agent_eyes import server
 
-    monkeypatch.setattr(
-        server,
-        "_ensure_runtime_readiness",
-        AsyncMock(return_value=SimpleNamespace(core_ready=True)),
-    )
+    readiness = AsyncMock(side_effect=AssertionError("readiness must not run"))
+    monkeypatch.setattr(server, "_ensure_runtime_readiness", readiness)
 
     result = asyncio.run(server.call_tool("web_tree", {}))
 
     assert isinstance(result, CallToolResult)
     assert result.isError is True
-    assert "MODE_MISMATCH" in _result_text(result)
+    assert "Invalid input" in _result_text(result)
+    assert "required" in _result_text(result)
+    readiness.assert_not_awaited()
+
+
+def test_dual_mode_shadow_calls_require_target_before_readiness_or_dispatch(monkeypatch):
+    from agent_eyes import server
+
+    readiness = AsyncMock(side_effect=AssertionError("readiness must not run"))
+    dispatch = AsyncMock(side_effect=AssertionError("dispatch must not run"))
+    monkeypatch.setattr(server, "_ensure_runtime_readiness", readiness)
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+
+    cases = {
+        "navigate": {"url": "https://example.test", "shadow": True},
+        "press_key": {"key": "Enter", "shadow": True},
+        "wait": {"shadow": True},
+        "close_tab": {"shadow": True},
+        "scroll": {"shadow": True},
+        "drag": {
+            "from_x": 1,
+            "from_y": 2,
+            "to_x": 3,
+            "to_y": 4,
+            "shadow": True,
+        },
+    }
+    for name, arguments in cases.items():
+        result = asyncio.run(server.call_tool(name, arguments))
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert "arguments.target_id is required" in _result_text(result)
+
+    readiness.assert_not_awaited()
+    dispatch.assert_not_awaited()

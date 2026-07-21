@@ -6,8 +6,6 @@ shadow providers; they are never a prerequisite for visible computer use.
 """
 from __future__ import annotations
 
-import json
-import hashlib
 import sys
 import time
 import asyncio
@@ -39,26 +37,9 @@ from .provider_worker import ProviderCallState, ProviderWorker
 from .result_format import BoundedResultFormatter, bounded_json_utf8_size
 from .input_validation import InputValidationError, validate_tool_arguments
 from .tool_contract import expose_shadow_target_ids, harden_tool_schemas
-from .browser_inventory import (
-    best_browser_target,
-    collect_browser_targets,
-    format_browser_targets,
-    sanitize_url_for_display,
-    select_browser_target,
-)
 from . import platform_utils as _pu
 from .__init__ import __version__
 from .js_bridge import build_ax_tree_script, merge_pierced_nodes
-from .native_events import run_native_action_until, wait_for_native_element
-from .setup.readiness import (
-    ReadinessReport,
-    compose_readiness_report,
-    load_input_provider,
-    load_native_provider,
-    probe_input_capability,
-    probe_native_capability,
-)
-
 # AppleScript is macOS-only — import conditionally
 if sys.platform == "darwin":
     from . import applescript as _as
@@ -114,7 +95,95 @@ async def _with_timeout(coro, seconds: float, operation: str):
 # ── Platform detection ──────────────────────────────────────────────
 def _get_native_adapter() -> BaseAdapter | None:
     """Return the current platform adapter without mutating the runtime."""
+    from .setup.readiness import load_native_provider
+
     return load_native_provider()
+
+
+def load_input_provider():
+    """Load physical input lazily while preserving the server test seam."""
+    from .setup.readiness import load_input_provider as _load_input_provider
+
+    return _load_input_provider()
+
+
+def probe_native_capability(native_provider, *, platform_name=None):
+    """Probe native access lazily while preserving the server test seam."""
+    from .setup.readiness import probe_native_capability as _probe_native_capability
+
+    return _probe_native_capability(native_provider, platform_name=platform_name)
+
+
+def probe_input_capability(input_provider):
+    """Probe physical input lazily while preserving the server test seam."""
+    from .setup.readiness import probe_input_capability as _probe_input_capability
+
+    return _probe_input_capability(input_provider)
+
+
+def compose_readiness_report(**kwargs):
+    """Compose readiness lazily so importing the MCP server stays fast."""
+    from .setup.readiness import compose_readiness_report as _compose_readiness_report
+
+    return _compose_readiness_report(**kwargs)
+
+
+async def run_native_action_until(*args, **kwargs):
+    """Observe native action completion without loading providers at startup."""
+    from .native_events import run_native_action_until as _run_native_action_until
+
+    return await _run_native_action_until(*args, **kwargs)
+
+
+async def wait_for_native_element(*args, **kwargs):
+    """Wait for native elements without loading event backends at startup."""
+    from .native_events import wait_for_native_element as _wait_for_native_element
+
+    return await _wait_for_native_element(*args, **kwargs)
+
+
+def collect_browser_targets(adapter, *, tree_depth: int = 8):
+    """Inventory foreground browser targets without startup-time policy imports."""
+    from .browser_inventory import collect_browser_targets as _collect_browser_targets
+
+    return _collect_browser_targets(adapter, tree_depth=tree_depth)
+
+
+def best_browser_target(targets, query: str, *, minimum_score: int = 60):
+    """Select the strongest reusable target through the lazy inventory policy."""
+    from .browser_inventory import best_browser_target as _best_browser_target
+
+    return _best_browser_target(targets, query, minimum_score=minimum_score)
+
+
+def select_browser_target(adapter, target):
+    """Select one native target through the lazy inventory policy."""
+    from .browser_inventory import select_browser_target as _select_browser_target
+
+    return _select_browser_target(adapter, target)
+
+
+def sanitize_url_for_display(value: str) -> str:
+    """Redact a URL through the lazy inventory policy."""
+    from .browser_inventory import sanitize_url_for_display as _sanitize_url_for_display
+
+    return _sanitize_url_for_display(value)
+
+
+def format_browser_targets(
+    targets,
+    *,
+    query: str = "",
+    max_query_results: int = 10,
+) -> str:
+    """Render browser inventory through the lazy inventory policy."""
+    from .browser_inventory import format_browser_targets as _format_browser_targets
+
+    return _format_browser_targets(
+        targets,
+        query=query,
+        max_query_results=max_query_results,
+    )
 
 
 # ── Server setup ────────────────────────────────────────────────────
@@ -127,7 +196,7 @@ system_worker = ProviderWorker("system")
 _result_formatter = BoundedResultFormatter()
 native_adapter: BaseAdapter | None = None
 _input_backend: object | None = None
-_runtime_readiness: ReadinessReport | None = None
+_runtime_readiness = None
 _runtime_readiness_lock = threading.Lock()
 _runtime_async_locks_guard = threading.Lock()
 _runtime_async_locks: weakref.WeakKeyDictionary[
@@ -1087,8 +1156,85 @@ for _tool in TOOLS:
 
 
 _READINESS_STATUS_TOOLS = frozenset({"status", "install_check"})
-_READINESS_GATED_TOOLS = frozenset(tool.name for tool in TOOLS) - _READINESS_STATUS_TOOLS
 _TOOL_SCHEMAS = {tool.name: tool.inputSchema for tool in TOOLS}
+_NATIVE_CAPABILITY = "native_access"
+_INPUT_CAPABILITY = "input"
+_NATIVE_ONLY_TOOLS = frozenset(
+    {
+        "list_apps",
+        "tree",
+        "focused",
+        "subtree",
+        "context",
+        "window",
+        "type",
+        "fill_form",
+        "wait",
+    }
+)
+_INPUT_ONLY_TOOLS = frozenset({"press_key", "scroll", "drag"})
+
+
+def _required_runtime_capabilities(name: str, arguments: dict) -> frozenset[str]:
+    """Return only the local execution-plane capabilities needed by this call."""
+    if name in _READINESS_STATUS_TOOLS or arguments.get("shadow", False):
+        return frozenset()
+    if name in _NATIVE_ONLY_TOOLS:
+        return frozenset({_NATIVE_CAPABILITY})
+    if name in _INPUT_ONLY_TOOLS:
+        return frozenset({_INPUT_CAPABILITY})
+    if name == "find":
+        return (
+            frozenset({_NATIVE_CAPABILITY})
+            if arguments.get("pid") is not None
+            else frozenset()
+        )
+    if name == "click":
+        if arguments.get("x") is not None and arguments.get("y") is not None:
+            return frozenset({_INPUT_CAPABILITY})
+        return frozenset({_NATIVE_CAPABILITY})
+    if name == "hover":
+        if arguments.get("x") is not None and arguments.get("y") is not None:
+            return frozenset({_INPUT_CAPABILITY})
+        return frozenset({_NATIVE_CAPABILITY, _INPUT_CAPABILITY})
+    if name == "list_tabs":
+        return frozenset({_NATIVE_CAPABILITY})
+    if name in {"navigate", "new_tab"}:
+        url = str(arguments.get("url", "about:blank"))
+        query = str(arguments.get("query", "")).strip()
+        should_reuse = bool(arguments.get("reuse_existing", True))
+        if should_reuse and (query or url != "about:blank"):
+            return frozenset({_NATIVE_CAPABILITY})
+        return frozenset()
+    if name == "close_tab":
+        return frozenset({_NATIVE_CAPABILITY, _INPUT_CAPABILITY})
+    return frozenset()
+
+
+def _unavailable_runtime_capabilities(report, required: frozenset[str]) -> list:
+    """Resolve unavailable required probes, tolerating narrow test doubles."""
+    if not required:
+        return []
+    capability = getattr(report, "capability", None)
+    if callable(capability):
+        return [probe for name in sorted(required) if not (probe := capability(name)).available]
+    return [] if bool(getattr(report, "core_ready", False)) else sorted(required)
+
+
+def _runtime_capability_error(unavailable: list) -> str:
+    permission_required = any(
+        getattr(probe, "status", "") == "permission_required"
+        for probe in unavailable
+    )
+    status = "permission_required" if permission_required else "setup_required"
+    names = ", ".join(
+        getattr(probe, "name", str(probe))
+        for probe in unavailable
+    )
+    return (
+        f"{status}: Required runtime capability unavailable: {names}.\n"
+        "Recovery: agent-eyes setup"
+    )
 
 
 @app.list_tools()
@@ -1107,14 +1253,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 isError=True,
             )
         validate_tool_arguments(schema, arguments)
-        if name in _READINESS_GATED_TOOLS:
+        required_capabilities = _required_runtime_capabilities(name, arguments)
+        if required_capabilities:
             runtime_readiness = await _ensure_runtime_readiness()
-            if not runtime_readiness.core_ready:
-                bounded = _result_formatter.format(
-                    f"{runtime_readiness.status.value}: "
-                    f"{runtime_readiness.to_text()}\n"
-                    "Recovery: agent-eyes setup"
-                )
+            unavailable = _unavailable_runtime_capabilities(
+                runtime_readiness,
+                required_capabilities,
+            )
+            if unavailable:
+                bounded = _result_formatter.format(_runtime_capability_error(unavailable))
                 return CallToolResult(
                     content=[
                         TextContent(
@@ -1221,7 +1368,7 @@ async def _dispatch(name: str, args: dict) -> str:
 
 
 # ── Native handlers ─────────────────────────────────────────────────
-async def _ensure_runtime_readiness(*, refresh: bool = False) -> ReadinessReport:
+async def _ensure_runtime_readiness(*, refresh: bool = False):
     """Await real provider readiness without blocking the MCP event loop."""
     global native_adapter, _input_backend, _runtime_readiness
 
@@ -1290,7 +1437,7 @@ async def _ensure_runtime_readiness(*, refresh: bool = False) -> ReadinessReport
         return report
 
 
-async def _refresh_runtime_readiness() -> ReadinessReport:
+async def _refresh_runtime_readiness():
     """Refresh permissions without installation, network, or browser probes."""
     return await _ensure_runtime_readiness(refresh=True)
 
@@ -2666,13 +2813,18 @@ async def _handle_type_resolved(
     if not keyboard_injected and input_available and element.bounds:
         x, y, w, h = element.bounds
         cx, cy = x + w // 2, y + h // 2
+
+        def exact_element_at_position() -> UIElement | None:
+            hit = native_adapter.element_at_position(cx, cy)
+            if hit is None or not native_adapter.is_same_element(element, hit):
+                return None
+            return hit
+
         hit = await native_worker.run(
-            lambda: native_adapter.element_at_position(cx, cy),
+            exact_element_at_position,
             budget=operation_budget,
             operation="native coordinate target verification",
         )
-        if hit is None or not native_adapter.is_same_element(element, hit):
-            hit = None
         if hit is None:
             return (
                 f"ERROR: type [{element_id}]: FOCUS_MISMATCH: target bounds no "
@@ -2800,6 +2952,27 @@ async def _handle_get_focused_async() -> str:
 _cached_tabs: list = []
 _tabs_lock = asyncio.Lock()  # Protects _cached_tabs from concurrent mutation
 _native_target_cache: dict[str, object] = {}
+_NATIVE_BROWSER_INVENTORY_FLIGHT = "native-browser-inventory"
+
+
+async def _collect_native_browser_targets(
+    *,
+    budget: OperationBudget,
+) -> list:
+    """Coalesce concurrent full accessibility scans into one provider call."""
+
+    async def collect() -> list:
+        return await native_worker.run(
+            lambda: collect_browser_targets(native_adapter),
+            budget=OperationBudget.start(5.0),
+            operation="foreground browser inventory",
+        )
+
+    return await coordinator.observe(
+        (_NATIVE_BROWSER_INVENTORY_FLIGHT, id(native_adapter)),
+        collect,
+        budget=budget,
+    )
 
 
 def _invalidate_native_mutation_state(
@@ -2908,6 +3081,8 @@ async def _get_cdp_session(
 
 async def _persistent_document_revision(session) -> int:
     """Return a deterministic revision for the current top-level document."""
+    import hashlib
+
     frame_result = await session.send("Page.getFrameTree", idempotent=True)
     document_result = await session.send(
         "DOM.getDocument",
@@ -3019,18 +3194,118 @@ async def _assert_persistent_snapshot_current(
         )
 
 
+async def _collect_explicit_shadow_tabs() -> tuple[list, str]:
+    """Return the first usable explicitly requested shadow inventory."""
+    if cdp_pool.is_connected:
+        tabs = cdp_pool.list_tabs()
+        if tabs:
+            return tabs, "persistent"
+
+    async def persistent_tabs() -> list:
+        budget = OperationBudget.start(5.0)
+        await budget.wait_for(
+            cdp_pool.ensure_connected(),
+            operation="persistent shadow tab inventory",
+        )
+        return cdp_pool.list_tabs() if cdp_pool.is_connected else []
+
+    async def legacy_tabs() -> list:
+        budget = OperationBudget.start(5.0)
+        available = await budget.wait_for(
+            cdp_client.is_available(),
+            operation="legacy shadow capability check",
+        )
+        if not available:
+            return []
+        return await budget.wait_for(
+            cdp_client.list_tabs(),
+            operation="legacy shadow tab inventory",
+        )
+
+    async def apple_tabs() -> list:
+        return await apple_worker.run(
+            lambda: _get_applescript_tabs(force=True),
+            budget=OperationBudget.start(5.0),
+            operation="Apple Events tab inventory",
+        )
+
+    provider_tasks = {
+        "persistent": asyncio.create_task(persistent_tabs()),
+        "legacy": asyncio.create_task(legacy_tabs()),
+    }
+    if sys.platform == "darwin" and _as is not None:
+        provider_tasks["apple-events"] = asyncio.create_task(apple_tabs())
+
+    pending = set(provider_tasks.values())
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for provider in ("persistent", "legacy", "apple-events"):
+                task = provider_tasks.get(provider)
+                if task not in done:
+                    continue
+                try:
+                    tabs = task.result()
+                except Exception as exc:
+                    logger.debug(
+                        "Explicit %s tab inventory unavailable (%s)",
+                        provider,
+                        type(exc).__name__,
+                    )
+                    continue
+                if tabs:
+                    return tabs, provider
+        return [], ""
+    finally:
+        for task in provider_tasks.values():
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*provider_tasks.values(), return_exceptions=True)
+
+
 async def _handle_list_tabs(args: dict) -> str:
     """List foreground browser state; CDP is an explicit shadow-only add-on."""
     global _cached_tabs, _native_target_cache
 
     query = str(args.get("query", "")).strip()
     max_results = max(1, min(int(args.get("max_results", 10)), 50))
-    budget = OperationBudget.start(5.0)
-    native_targets = await native_worker.run(
-        lambda: collect_browser_targets(native_adapter),
-        budget=budget,
-        operation="foreground browser inventory",
-    )
+    shadow_requested = bool(args.get("shadow", False))
+
+    if native_adapter is None and not shadow_requested:
+        return "ERROR: The foreground native accessibility provider is unavailable."
+
+    async def collect_optional_native_targets() -> list:
+        try:
+            return await _collect_native_browser_targets(
+                budget=OperationBudget.start(5.0)
+            )
+        except Exception as exc:
+            logger.debug(
+                "Foreground inventory unavailable during explicit shadow listing (%s)",
+                type(exc).__name__,
+            )
+            return []
+
+    shadow_tabs = []
+    shadow_provider = ""
+    if shadow_requested:
+        if native_adapter is None:
+            shadow_tabs, shadow_provider = await _collect_explicit_shadow_tabs()
+            native_targets = []
+        else:
+            native_targets, shadow_result = await asyncio.gather(
+                collect_optional_native_targets(),
+                _collect_explicit_shadow_tabs(),
+            )
+            shadow_tabs, shadow_provider = shadow_result
+    else:
+        native_targets = await _collect_native_browser_targets(
+            budget=OperationBudget.start(5.0)
+        )
+
     _native_target_cache = {target.identifier: target for target in native_targets}
     native_result = format_browser_targets(
         native_targets,
@@ -3038,46 +3313,8 @@ async def _handle_list_tabs(args: dict) -> str:
         max_query_results=max_results,
     )
 
-    if not args.get("shadow", False):
+    if not shadow_requested:
         return native_result
-
-    # Explicit shadow mode may probe the persistent provider, then the legacy
-    # per-request provider. Normal foreground inventory never enters this path.
-    try:
-        await budget.wait_for(
-            cdp_pool.ensure_connected(),
-            operation="persistent shadow tab inventory",
-        )
-    except Exception as exc:
-        logger.debug(
-            "Explicit shadow tab inventory unavailable (%s)",
-            type(exc).__name__,
-        )
-
-    shadow_tabs = []
-    shadow_provider = ""
-    if cdp_pool.is_connected:
-        shadow_tabs = cdp_pool.list_tabs()
-        shadow_provider = "persistent"
-    else:
-        available = await budget.wait_for(
-            cdp_client.is_available(),
-            operation="legacy shadow capability check",
-        )
-        if available:
-            shadow_tabs = await budget.wait_for(
-                cdp_client.list_tabs(),
-                operation="legacy shadow tab inventory",
-            )
-            shadow_provider = "legacy"
-        elif sys.platform == "darwin" and _as is not None:
-            shadow_tabs = await apple_worker.run(
-                lambda: _get_applescript_tabs(force=True),
-                budget=budget,
-                operation="Apple Events tab inventory",
-            )
-            if shadow_tabs:
-                shadow_provider = "apple-events"
 
     if shadow_tabs:
         # Persistent sessions own their own live target inventory. Mixing those
@@ -3589,6 +3826,9 @@ async def _handle_get_web_tree(args: dict) -> str:
         and _as is not None
     ):
         def load_apple_tree():
+            import hashlib
+            import json
+
             if not _as.is_available():
                 return None, None, 0, ""
             apple_target, resolve_error = _resolve_applescript_target(target_id)
@@ -4498,11 +4738,7 @@ async def _handle_new_tab(args: dict) -> str:
         query = url
 
     if not shadow and args.get("reuse_existing", True) and query:
-        native_targets = await native_worker.run(
-            lambda: collect_browser_targets(native_adapter),
-            budget=budget,
-            operation="foreground browser inventory",
-        )
+        native_targets = await _collect_native_browser_targets(budget=budget)
         existing = best_browser_target(native_targets, query)
         if existing is not None:
             try:
@@ -4598,11 +4834,7 @@ async def _handle_close_tab(args: dict) -> str:
                 budget=budget,
                 operation_manages_deadline=True,
             )
-        targets = await native_worker.run(
-            lambda: collect_browser_targets(native_adapter),
-            budget=budget,
-            operation="foreground browser inventory",
-        )
+        targets = await _collect_native_browser_targets(budget=budget)
         target_id = str(args.get("target_id", "")).strip()
         title_query = str(args.get("title", "")).strip()
         if target_id:
@@ -4800,8 +5032,84 @@ async def _handle_dialog(args: dict) -> str:
     )
 
 
-async def _handle_file_upload(args: dict) -> str:
+def _upload_security_path_key(path) -> str:
+    """Return a stable comparison key for an already-canonical filesystem path."""
     import os
+    import unicodedata
+
+    normalized = os.path.normcase(os.path.normpath(os.fspath(path)))
+    return unicodedata.normalize("NFC", normalized).casefold()
+
+
+def _path_matches_protected_upload_root(candidate, root) -> bool:
+    """Fail closed when a canonical file is inside or aliases a protected root."""
+    import os
+    import pathlib
+
+    try:
+        resolved_root = pathlib.Path(root).resolve(strict=False)
+        candidate_key = _upload_security_path_key(candidate)
+        root_key = _upload_security_path_key(resolved_root)
+        if pathlib.Path(candidate_key).is_relative_to(pathlib.Path(root_key)):
+            return True
+        resolved_root.stat()
+    except FileNotFoundError:
+        # A missing protected root cannot alias an existing candidate. The
+        # case-folded lexical check above still protects case aliases.
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+    for ancestor in (candidate, *candidate.parents):
+        try:
+            if os.path.samefile(ancestor, resolved_root):
+                return True
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def _validate_upload_paths(files, *, home=None) -> tuple[list[str], str]:
+    """Resolve regular upload files and reject protected filesystem aliases."""
+    import os
+    import pathlib
+    import stat
+
+    resolved_home = pathlib.Path.home() if home is None else pathlib.Path(home)
+    blocked_roots = [
+        resolved_home / ".ssh",
+        resolved_home / ".aws",
+        resolved_home / ".gnupg",
+        resolved_home / ".config" / "gcloud",
+        resolved_home / ".config" / "op",
+        resolved_home / ".kube",
+        resolved_home / ".docker",
+        resolved_home / ".netrc",
+        resolved_home / ".npmrc",
+        resolved_home / ".pypirc",
+        resolved_home / ".gem" / "credentials",
+        pathlib.Path("/etc"),
+    ]
+    validated_paths: list[str] = []
+    for path in files:
+        try:
+            candidate = pathlib.Path(os.path.abspath(os.fspath(path))).resolve(
+                strict=True
+            )
+            if not stat.S_ISREG(candidate.stat().st_mode):
+                return [], "missing"
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return [], "missing"
+        if any(
+            _path_matches_protected_upload_root(candidate, root)
+            for root in blocked_roots
+        ):
+            return [], "protected"
+        validated_paths.append(str(candidate))
+    return validated_paths, ""
+
+
+async def _handle_file_upload(args: dict) -> str:
 
     if not args.get("shadow", False):
         return (
@@ -4830,33 +5138,7 @@ async def _handle_file_upload(args: dict) -> str:
     budget = OperationBudget.start(5.0)
 
     def validate_paths() -> tuple[list[str], str]:
-        import pathlib
-
-        home = pathlib.Path.home()
-        blocked_prefixes = [
-            home / ".ssh",
-            home / ".aws",
-            home / ".gnupg",
-            home / ".config" / "gcloud",
-            home / ".config" / "op",
-            home / ".kube",
-            home / ".docker",
-            home / ".netrc",
-            home / ".npmrc",
-            home / ".pypirc",
-            home / ".gem" / "credentials",
-            pathlib.Path("/etc"),
-        ]
-        validated_paths: list[str] = []
-        for path in files:
-            absolute = os.path.realpath(os.path.abspath(path))
-            if not os.path.isfile(absolute):
-                return [], "missing"
-            absolute_path = pathlib.Path(absolute)
-            if any(absolute_path.is_relative_to(prefix) for prefix in blocked_prefixes):
-                return [], "protected"
-            validated_paths.append(absolute)
-        return validated_paths, ""
+        return _validate_upload_paths(files)
 
     validated, validation_error = await system_worker.run(
         validate_paths,

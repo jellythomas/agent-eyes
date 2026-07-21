@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 
 import pytest
@@ -103,6 +104,25 @@ def test_wait_for_preserves_provider_timeout_error_when_budget_remains():
             await budget.wait_for(provider(), operation="provider call")
 
         assert budget.remaining() > 4.0
+
+    asyncio.run(run())
+
+
+def test_wait_for_closes_unstarted_coroutine_when_budget_is_already_expired():
+    async def provider() -> None:
+        return None
+
+    async def run() -> None:
+        awaitable = provider()
+
+        with pytest.raises(OperationError) as exc_info:
+            await OperationBudget.start(0.0).wait_for(
+                awaitable,
+                operation="expired provider",
+            )
+
+        assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
+        assert inspect.getcoroutinestate(awaitable) == inspect.CORO_CLOSED
 
     asyncio.run(run())
 

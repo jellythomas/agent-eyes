@@ -285,3 +285,131 @@ def test_concurrent_reconnect_keeps_the_single_fresh_transport_open():
         assert conn._generation == failed_generation + 1
 
     asyncio.run(run())
+
+
+def test_reconnect_retires_failed_generation_before_target_reattach():
+    async def run() -> None:
+        class ProbeWebSocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        conn = CDPConnection()
+        failed_generation = 7
+        failed_transport = ProbeWebSocket()
+        replacement = ProbeWebSocket()
+        conn._generation = failed_generation
+        conn._connected = True
+        conn._ws = failed_transport
+
+        _attach(conn, "target-kept", "session-kept-old")
+        removed = _attach(conn, "target-closed", "session-closed")
+        pending = asyncio.get_running_loop().create_future()
+        removed._pending[42] = pending
+        removed.on_event("Page.loadEventFired", lambda _params: None)
+        removed._enabled_domains.add("Page")
+
+        async def install_replacement() -> None:
+            assert conn._sessions == {}
+            assert conn._tabs == []
+            assert conn._tab_by_target == {}
+            conn._generation += 1
+            conn._connected = True
+            conn._ws = replacement
+            _attach(conn, "target-kept", "session-kept-new")
+
+        conn._ensure_connected_locked = install_replacement
+
+        await conn.reconnect(failed_generation)
+
+        assert failed_transport.close_calls == 1
+        assert conn._ws is replacement
+        assert [tab.id for tab in conn.list_tabs()] == ["target-kept"]
+        assert conn.get_session_for_target("target-closed") is None
+        assert list(conn._sessions) == ["session-kept-new"]
+        assert list(conn._tab_by_target) == ["target-kept"]
+        assert isinstance(pending.exception(), RuntimeError)
+        assert removed._pending == {}
+        assert removed._event_handlers == {}
+        assert removed._enabled_domains == set()
+
+    asyncio.run(run())
+
+
+def test_late_failed_generation_does_not_retire_newer_disconnected_state():
+    async def run() -> None:
+        class ProbeWebSocket:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+        conn = CDPConnection()
+        newer_transport = ProbeWebSocket()
+        conn._generation = 2
+        conn._connected = False
+        conn._ws = newer_transport
+        current = _attach(conn, "target-current", "session-current")
+        ensure_calls = 0
+
+        async def unexpected_replacement() -> None:
+            nonlocal ensure_calls
+            ensure_calls += 1
+
+        conn._ensure_connected_locked = unexpected_replacement
+
+        await conn.reconnect(failed_generation=1)
+
+        assert ensure_calls == 0
+        assert newer_transport.close_calls == 0
+        assert conn._ws is newer_transport
+        assert conn.get_session_for_target("target-current") is current
+
+    asyncio.run(run())
+
+
+def test_one_thousand_reconnects_keep_only_current_generation_state():
+    async def run() -> None:
+        class ProbeWebSocket:
+            async def close(self) -> None:
+                return None
+
+        conn = CDPConnection()
+        conn._generation = 1
+        conn._connected = True
+        conn._ws = ProbeWebSocket()
+        _attach(conn, "target-live", "session-live-1")
+
+        async def install_replacement() -> None:
+            conn._generation += 1
+            conn._connected = True
+            conn._ws = ProbeWebSocket()
+            _attach(
+                conn,
+                "target-live",
+                f"session-live-{conn._generation}",
+            )
+
+        conn._ensure_connected_locked = install_replacement
+
+        for cycle in range(1_000):
+            _attach(
+                conn,
+                f"target-closed-{cycle}",
+                f"session-closed-{cycle}",
+            )
+            failed_generation = conn._generation
+
+            await conn.reconnect(failed_generation)
+
+            assert [tab.id for tab in conn.list_tabs()] == ["target-live"]
+            assert len(conn._sessions) == 1
+            assert len(conn._tab_by_target) == 1
+            current = conn.get_session_for_target("target-live")
+            assert current is not None
+            assert current.generation == conn._generation
+
+    asyncio.run(run())

@@ -16,7 +16,12 @@ from agent_eyes.cdp import (
     _PIERCED_CONTROL_SELECTOR,
     _PIERCED_SELECTOR_DEPTH,
 )
-from agent_eyes.cdp_persistent import CDPConnection, CDPSession, ChromeTab
+from agent_eyes.cdp_persistent import (
+    _DOM_DESCRIBE_CONCURRENCY,
+    CDPConnection,
+    CDPSession,
+    ChromeTab,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -258,6 +263,74 @@ class TestCDPSessionDomSearch:
 
             session.enable_domain.assert_awaited_once_with("DOM")
             assert [node["backendNodeId"] for node in nodes] == [111, 112]
+
+        asyncio.run(run())
+
+    def test_concurrent_searches_bound_shared_socket_and_preserve_results(self):
+        async def run():
+            connection = CDPConnection()
+            connection._generation = 1
+            connection._on_attached(
+                {
+                    "sessionId": "session-a",
+                    "targetInfo": {
+                        "targetId": "target-a",
+                        "type": "page",
+                    },
+                }
+            )
+            connection._on_attached(
+                {
+                    "sessionId": "session-b",
+                    "targetInfo": {
+                        "targetId": "target-b",
+                        "type": "page",
+                    },
+                }
+            )
+            first = connection.get_session_for_target("target-a")
+            second = connection.get_session_for_target("target-b")
+            assert first is not None
+            assert second is not None
+
+            in_flight = 0
+            peak_in_flight = 0
+
+            def protocol(start: int):
+                async def send(method, params=None, *, idempotent=False):
+                    nonlocal in_flight, peak_in_flight
+                    if method == "DOM.performSearch":
+                        return {"searchId": f"search-{start}", "resultCount": 500}
+                    if method == "DOM.getSearchResults":
+                        return {"nodeIds": list(range(start, start + 500))}
+                    if method == "DOM.describeNode":
+                        assert idempotent is True
+                        in_flight += 1
+                        peak_in_flight = max(peak_in_flight, in_flight)
+                        await asyncio.sleep(0)
+                        in_flight -= 1
+                        return {"node": {"nodeId": params["nodeId"]}}
+                    if method == "DOM.discardSearchResults":
+                        return {}
+                    raise AssertionError(method)
+
+                return send
+
+            first.enable_domain = AsyncMock()
+            second.enable_domain = AsyncMock()
+            first.send = AsyncMock(side_effect=protocol(1))
+            second.send = AsyncMock(side_effect=protocol(501))
+
+            first_nodes, second_nodes = await asyncio.gather(
+                first.search_dom("button", max_results=500),
+                second.search_dom("button", max_results=500),
+            )
+
+            assert peak_in_flight == _DOM_DESCRIBE_CONCURRENCY
+            assert [node["nodeId"] for node in first_nodes] == list(range(1, 501))
+            assert [node["nodeId"] for node in second_nodes] == list(
+                range(501, 1_001)
+            )
 
         asyncio.run(run())
 

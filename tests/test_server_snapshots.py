@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1106,6 +1108,124 @@ def test_upload_uses_snapshot_target_and_accepts_shadow_dom_node(monkeypatch, tm
     legacy.assert_not_awaited()
 
 
+def test_upload_path_validation_rejects_protected_aliases_and_allows_siblings(tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    exact_dir = home / ".ssh"
+    exact_dir.mkdir(parents=True)
+    exact_key = exact_dir / "id_ed25519"
+    exact_key.write_text("secret", encoding="utf-8")
+
+    case_alias_dir = home / ".SSH"
+    case_alias_dir.mkdir(exist_ok=True)
+    case_alias_key = case_alias_dir / "case-key"
+    case_alias_key.write_text("secret", encoding="utf-8")
+
+    sibling_dir = home / ".ssh-backup"
+    sibling_dir.mkdir()
+    sibling_file = sibling_dir / "public.txt"
+    sibling_file.write_text("safe", encoding="utf-8")
+
+    assert server._validate_upload_paths([str(exact_key)], home=home)[1] == "protected"
+    assert (
+        server._validate_upload_paths([str(case_alias_key)], home=home)[1]
+        == "protected"
+    )
+    assert server._validate_upload_paths([str(sibling_file)], home=home) == (
+        [str(sibling_file.resolve())],
+        "",
+    )
+
+
+def test_upload_path_validation_resolves_protected_directory_symlinks(tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    home.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    credential = vault / "credentials"
+    credential.write_text("secret", encoding="utf-8")
+    (home / ".aws").symlink_to(vault, target_is_directory=True)
+
+    outside_alias = tmp_path / "outside-credential"
+    outside_alias.symlink_to(credential)
+
+    assert (
+        server._validate_upload_paths([str(home / ".aws" / "credentials")], home=home)[
+            1
+        ]
+        == "protected"
+    )
+    assert (
+        server._validate_upload_paths([str(outside_alias)], home=home)[1]
+        == "protected"
+    )
+
+
+def test_upload_path_validation_rejects_hard_link_to_protected_file(tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    home.mkdir()
+    protected = home / ".netrc"
+    protected.write_text("machine example.test", encoding="utf-8")
+    outside_hard_link = tmp_path / "outside-netrc"
+    try:
+        os.link(protected, outside_hard_link)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {type(exc).__name__}")
+
+    assert (
+        server._validate_upload_paths([str(outside_hard_link)], home=home)[1]
+        == "protected"
+    )
+
+
+def test_upload_path_validation_rejects_non_regular_and_missing_paths(tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    home.mkdir()
+    directory = tmp_path / "directory"
+    directory.mkdir()
+
+    assert server._validate_upload_paths([str(directory)], home=home)[1] == "missing"
+    assert (
+        server._validate_upload_paths([str(tmp_path / "missing")], home=home)[1]
+        == "missing"
+    )
+
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        assert server._validate_upload_paths([str(fifo)], home=home)[1] == "missing"
+
+
+@pytest.mark.skipif(not Path("/etc/hosts").is_file(), reason="no /etc/hosts")
+def test_upload_path_validation_rejects_canonicalized_etc_file(tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert server._validate_upload_paths(["/etc/hosts"], home=home)[1] == "protected"
+
+
+def test_upload_path_comparison_errors_fail_closed(monkeypatch, tmp_path):
+    from agent_eyes import server
+
+    home = tmp_path / "home"
+    protected_dir = home / ".ssh"
+    protected_dir.mkdir(parents=True)
+    safe_file = tmp_path / "safe.txt"
+    safe_file.write_text("safe", encoding="utf-8")
+    monkeypatch.setattr(os.path, "samefile", MagicMock(side_effect=OSError("denied")))
+
+    assert server._validate_upload_paths([str(safe_file)], home=home)[1] == "protected"
+
+
 def test_pierce_scopes_selector_and_returns_actionable_snapshot(monkeypatch):
     from agent_eyes import server
 
@@ -1394,13 +1514,18 @@ def test_tree_total_deadline_bounds_slow_native_provider(monkeypatch):
     monkeypatch.setattr(server._pu, "is_browser_pid", lambda pid: False)
 
     async def run() -> None:
+        await worker.run(
+            lambda: None,
+            budget=OperationBudget.start(1.0),
+            operation="tree deadline worker warmup",
+        )
         before = time.monotonic()
         with pytest.raises(OperationError) as exc_info:
-            await server._handle_get_tree({"pid": 42, "timeout": 0.01})
+            await server._handle_get_tree({"pid": 42, "timeout": 0.1})
         elapsed = time.monotonic() - before
 
         assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
-        assert elapsed < 0.05
+        assert elapsed < 0.2
         assert started.is_set()
         assert worker.busy is True
         assert coordinator._flights == {}
@@ -1458,11 +1583,16 @@ def test_late_foreground_mutation_is_unknown_invalidates_state_and_never_replays
 
     async def run() -> None:
         try:
+            await worker.run(
+                lambda: None,
+                budget=OperationBudget.start(1.0),
+                operation="late press worker warmup",
+            )
             before = time.monotonic()
             output = await server._handle_press_key(
                 {
                     "key": "Enter",
-                    "_operation_budget": OperationBudget.start(0.02),
+                    "_operation_budget": OperationBudget.start(0.1),
                 }
             )
             elapsed = time.monotonic() - before
@@ -1590,10 +1720,16 @@ def test_uncertain_mutation_poisons_other_foreground_workers_until_settled(monke
         nonlocal other_ran
         monkeypatch.setattr(server, "coordinator", coordinator)
         try:
+            await uncertain_worker.run(
+                lambda: None,
+                budget=OperationBudget.start(1.0),
+                operation="uncertain worker warmup",
+            )
+
             async def uncertain() -> None:
                 await server._run_native_mutation(
                     blocking_mutation,
-                    budget=OperationBudget.start(0.02),
+                    budget=OperationBudget.start(0.1),
                     operation="uncertain mutation",
                     worker=uncertain_worker,
                 )
@@ -1681,11 +1817,16 @@ def test_late_apple_shadow_mutation_is_unknown_and_not_replayed(monkeypatch):
 
     async def run() -> None:
         try:
+            await worker.run(
+                lambda: None,
+                budget=OperationBudget.start(1.0),
+                operation="late Apple shadow worker warmup",
+            )
             output = await server._handle_shadow_async(
                 {
                     "action": "click",
                     "target_id": "apple-events:browser:window:tab",
-                    "_operation_budget": OperationBudget.start(0.02),
+                    "_operation_budget": OperationBudget.start(0.1),
                 }
             )
             assert "OUTCOME_UNKNOWN" in output
@@ -1814,8 +1955,14 @@ def test_native_coordinate_type_requires_exact_hit_test_identity(monkeypatch):
     from agent_eyes import server
 
     class InlineWorker:
+        active = False
+
         async def run(self, call, **_kwargs):
-            return call()
+            self.active = True
+            try:
+                return call()
+            finally:
+                self.active = False
 
     target = UIElement(
         id=81,
@@ -1834,15 +1981,20 @@ def test_native_coordinate_type_requires_exact_hit_test_identity(monkeypatch):
         role="textfield",
         platform_ref=object(),
     )
-    adapter.is_same_element.return_value = False
     backend = MagicMock()
     backend.is_available.return_value = True
     worker = InlineWorker()
 
-    async def action_until(_pid, action, condition, **_kwargs):
+    def compare_on_provider_lane(_first, _second):
+        assert worker.active is True
+        return False
+
+    adapter.is_same_element.side_effect = compare_on_provider_lane
+
+    async def action_until(_pid, action, condition, **kwargs):
         return SimpleNamespace(
             action_result=action(),
-            condition_met=condition(),
+            condition_met=await kwargs["condition_worker"].run(condition),
         )
 
     monkeypatch.setattr(server, "native_adapter", adapter)

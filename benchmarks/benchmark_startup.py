@@ -33,16 +33,25 @@ def _summary(samples: list[float]) -> dict[str, float]:
 
 
 def _cold_import_sample() -> float:
-    started = time.perf_counter()
-    subprocess.run(
-        [sys.executable, "-c", "import agent_eyes.server"],
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "started = time.perf_counter(); "
+                "import agent_eyes.server; "
+                "print((time.perf_counter() - started) * 1000)"
+            ),
+        ],
         check=True,
         cwd=_PROJECT_ROOT,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        text=True,
         timeout=10,
     )
-    return (time.perf_counter() - started) * 1000
+    return float(completed.stdout.strip())
 
 
 async def _mcp_tools_list_sample(errlog: TextIO) -> tuple[float, int]:
@@ -56,7 +65,8 @@ async def _mcp_tools_list_sample(errlog: TextIO) -> tuple[float, int]:
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             result = await session.list_tools()
-    return (time.perf_counter() - started) * 1000, len(result.tools)
+            elapsed = (time.perf_counter() - started) * 1000
+    return elapsed, len(result.tools)
 
 
 async def _benchmark(samples: int, warmups: int) -> dict[str, object]:
@@ -75,7 +85,7 @@ async def _benchmark(samples: int, warmups: int) -> dict[str, object]:
                 tool_counts.add(tool_count)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "environment": {
             "platform": platform.platform(),
             "architecture": platform.machine(),
@@ -86,6 +96,8 @@ async def _benchmark(samples: int, warmups: int) -> dict[str, object]:
             "warmups": warmups,
             "samples": samples,
             "percentile": "sorted[ceil(0.95*n)-1]",
+            "server_import_clock": "inside fresh interpreter; process lifecycle excluded",
+            "mcp_clock": "process launch through tools/list response; cleanup excluded",
         },
         "latency": {
             "server_import": _summary(import_latencies),

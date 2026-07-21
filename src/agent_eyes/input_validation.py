@@ -44,6 +44,12 @@ def validate_tool_arguments(
 
 
 def _validate(schema: Mapping[str, Any], value: Any, *, path: str) -> None:
+    conditional = schema.get("if")
+    if isinstance(conditional, Mapping):
+        branch = schema.get("then") if _matches(conditional, value) else schema.get("else")
+        if isinstance(branch, Mapping):
+            _validate(branch, value, path=path)
+
     expected = schema.get("type")
     if expected is not None:
         _validate_type(expected, value, path=path)
@@ -86,6 +92,14 @@ def _validate(schema: Mapping[str, Any], value: Any, *, path: str) -> None:
             raise InputValidationError(f"{path} must be at least {minimum}")
         if maximum is not None and value > maximum:
             raise InputValidationError(f"{path} must be at most {maximum}")
+
+
+def _matches(schema: Mapping[str, Any], value: Any) -> bool:
+    try:
+        _validate(schema, value, path="condition")
+    except InputValidationError:
+        return False
+    return True
 
 
 def _validate_type(expected: Any, value: Any, *, path: str) -> None:

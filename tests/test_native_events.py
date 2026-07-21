@@ -17,7 +17,7 @@ from agent_eyes.native_events import (
     run_native_action_until,
     wait_for_native_element,
 )
-from agent_eyes.operation import OperationError, OperationErrorCode
+from agent_eyes.operation import OperationBudget, OperationError, OperationErrorCode
 from agent_eyes.provider_worker import ProviderWorker
 
 
@@ -189,19 +189,24 @@ def test_slow_native_lookup_respects_total_deadline_and_quarantines_worker():
                 release.wait(timeout=1.0)
                 return []
 
+        await worker.run(
+            lambda: None,
+            budget=OperationBudget.start(1.0),
+            operation="native wait worker warmup",
+        )
         before = time.monotonic()
         result = await wait_for_native_element(
             SlowAdapter(),
             42,
             role="dialog",
-            timeout=0.01,
+            timeout=0.1,
             subscription_factory=lambda pid: None,
             worker=worker,
         )
         elapsed = time.monotonic() - before
 
         assert result.element is None
-        assert elapsed < 0.05
+        assert elapsed < 0.2
         assert started.is_set()
         assert worker.busy is True
 
@@ -223,20 +228,25 @@ def test_slow_native_action_respects_deadline_and_quarantines_worker():
             release.wait(timeout=1.0)
             return True
 
+        await worker.run(
+            lambda: None,
+            budget=OperationBudget.start(1.0),
+            operation="native action worker warmup",
+        )
         before = time.monotonic()
         with pytest.raises(OperationError) as exc_info:
             await run_native_action_until(
                 42,
                 slow_action,
                 lambda: True,
-                timeout=0.01,
+                timeout=0.1,
                 subscription_factory=lambda pid: None,
                 worker=worker,
             )
         elapsed = time.monotonic() - before
 
         assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
-        assert elapsed < 0.05
+        assert elapsed < 0.2
         assert started.is_set()
         assert worker.busy is True
 

@@ -30,6 +30,30 @@ _SHADOW_TARGET_TOOLS = frozenset(
     }
 )
 
+_EXPLICIT_SHADOW_ONLY_TOOLS = frozenset(
+    {
+        "web_tree",
+        "js",
+        "dialog",
+        "upload",
+        "pierce",
+    }
+)
+
+_REQUIRED_SHADOW_TARGET_TOOLS = frozenset(
+    {
+        "web_tree",
+        "js",
+        "dialog",
+        "shadow",
+        "pierce",
+    }
+)
+
+_CONDITIONAL_SHADOW_TARGET_TOOLS = _SHADOW_TARGET_TOOLS - _REQUIRED_SHADOW_TARGET_TOOLS
+
+_REQUIRED_SNAPSHOT_TOOLS = frozenset({"upload", "fill_form", "subtree"})
+
 
 _T = TypeVar("_T")
 
@@ -127,10 +151,25 @@ def expose_shadow_target_ids(tools: Iterable[_T]) -> list[_T]:
                     "description": "Snapshot token returned by tree/web_tree",
                 },
             )
-        if name == "upload":
-            required = schema.setdefault("required", [])
-            if "snapshot" not in required:
-                required.append("snapshot")
+        required = schema.setdefault("required", [])
+        if name in _REQUIRED_SNAPSHOT_TOOLS and "snapshot" not in required:
+            required.append("snapshot")
+        if name in _REQUIRED_SHADOW_TARGET_TOOLS and "target_id" not in required:
+            required.append("target_id")
+        if name in _CONDITIONAL_SHADOW_TARGET_TOOLS:
+            schema["if"] = {
+                "properties": {"shadow": {"enum": [True]}},
+                "required": ["shadow"],
+            }
+            schema["then"] = {"required": ["target_id"]}
+        if name in _EXPLICIT_SHADOW_ONLY_TOOLS:
+            shadow = properties.get("shadow")
+            if not isinstance(shadow, dict):
+                raise TypeError(f"{name} must expose a shadow property")
+            shadow.pop("default", None)
+            shadow["enum"] = [True]
+            if "shadow" not in required:
+                required.append("shadow")
     return prepared
 
 

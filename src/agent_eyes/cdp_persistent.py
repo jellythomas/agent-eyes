@@ -39,6 +39,7 @@ _DEFAULT_PORT = 9222
 _COMMAND_TIMEOUT_SECONDS = 15.0
 _RECONNECT_TIMEOUT_SECONDS = 2.0
 _REATTACH_TIMEOUT_SECONDS = 2.0
+_DOM_DESCRIBE_CONCURRENCY = 8
 
 
 def _is_connection_error(exc: Exception) -> bool:
@@ -88,6 +89,7 @@ class CDPSession:
         *,
         target_id: str = "",
         generation: int = 0,
+        dom_describe_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self.session_id = session_id
         self.target_id = target_id
@@ -96,6 +98,11 @@ class CDPSession:
         self._pending: dict[int, asyncio.Future] = {}
         self._event_handlers: dict[str, list] = {}
         self._enabled_domains: set[str] = set()
+        self._dom_describe_semaphore = (
+            dom_describe_semaphore
+            if dom_describe_semaphore is not None
+            else asyncio.Semaphore(_DOM_DESCRIBE_CONCURRENCY)
+        )
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -411,17 +418,12 @@ class CDPSession:
             if not isinstance(node_ids, list):
                 raise RuntimeError("DOM.getSearchResults returned invalid node IDs")
 
-            descriptions = await asyncio.gather(
-                *(
-                    self.send(
-                        "DOM.describeNode",
-                        {"nodeId": node_id, "depth": 0},
-                        idempotent=True,
-                    )
-                    for node_id in node_ids[:max_results]
-                    if isinstance(node_id, int) and not isinstance(node_id, bool)
-                )
-            )
+            valid_node_ids = [
+                node_id
+                for node_id in node_ids[:max_results]
+                if isinstance(node_id, int) and not isinstance(node_id, bool)
+            ]
+            descriptions = await self._describe_search_nodes(valid_node_ids)
             return [
                 description["node"]
                 for description in descriptions
@@ -438,6 +440,40 @@ class CDPSession:
                     "Could not discard DOM search state (exception_type=%s)",
                     type(exc).__name__,
                 )
+
+    async def _describe_search_nodes(self, node_ids: list[int]) -> list[dict]:
+        """Describe search results with bounded pressure on the shared socket."""
+        if not node_ids:
+            return []
+
+        descriptions: list[dict | None] = [None] * len(node_ids)
+        pending = iter(enumerate(node_ids))
+
+        async def worker() -> None:
+            for index, node_id in pending:
+                async with self._dom_describe_semaphore:
+                    descriptions[index] = await self.send(
+                        "DOM.describeNode",
+                        {"nodeId": node_id, "depth": 0},
+                        idempotent=True,
+                    )
+
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(_DOM_DESCRIBE_CONCURRENCY, len(node_ids)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except BaseException:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+        return [
+            description
+            for description in descriptions
+            if description is not None
+        ]
 
     async def get_pierced_dom(
         self,
@@ -706,6 +742,9 @@ class CDPConnection:
         self._read_task: asyncio.Task | None = None
         self._browser_pending: dict[int, asyncio.Future] = {}  # browser-level commands
         self._connect_lock = asyncio.Lock()
+        self._dom_describe_semaphore = asyncio.Semaphore(
+            _DOM_DESCRIBE_CONCURRENCY
+        )
 
     # ── Properties ────────────────────────────────────────────────────
 
@@ -816,7 +855,7 @@ class CDPConnection:
         )
 
         async with self._connect_lock:
-            if self._connected and self._generation != reconnect_generation:
+            if self._generation != reconnect_generation:
                 return
 
             self._mark_disconnected(reconnect_generation)
@@ -845,6 +884,7 @@ class CDPConnection:
                         type(exc).__name__,
                     )
 
+            self._retire_transport_generation(reconnect_generation)
             await self._ensure_connected_locked()
 
     def _mark_disconnected(self, failed_generation: int | None = None) -> None:
@@ -1100,6 +1140,7 @@ class CDPConnection:
                 self,
                 target_id=target_id,
                 generation=self._generation,
+                dom_describe_semaphore=self._dom_describe_semaphore,
             )
             self._sessions[session_id] = session
 
@@ -1191,6 +1232,32 @@ class CDPConnection:
             if not future.done():
                 future.set_exception(error)
         session._pending.clear()
+        session._event_handlers.clear()
+        session._enabled_domains.clear()
+
+    def _retire_transport_generation(self, generation: int) -> None:
+        """Remove session and tab state owned by a retired transport."""
+        retired_session_ids = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.generation <= generation
+        ]
+        for session_id in retired_session_ids:
+            self._retire_session(
+                session_id,
+                "CDP transport was retired during reconnect",
+            )
+
+        for target_id, tab in list(self._tab_by_target.items()):
+            session = self._sessions.get(tab.session_id)
+            if session is None or session.target_id != target_id:
+                self._tab_by_target.pop(target_id, None)
+
+        self._tabs[:] = [
+            tab
+            for tab in self._tabs
+            if self._tab_by_target.get(tab.id) is tab
+        ]
 
     # ── Internal: port discovery ──────────────────────────────────────
 

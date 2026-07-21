@@ -67,6 +67,8 @@ print(json.dumps({
     "native_adapter": server.native_adapter is None,
     "input_backend": server._input_backend is None,
     "readiness": server._runtime_readiness is None,
+    "native_events_imported": "agent_eyes.native_events" in sys.modules,
+    "browser_inventory_imported": "agent_eyes.browser_inventory" in sys.modules,
     "application_services_imported": "ApplicationServices" in sys.modules,
     "quartz_imported": "Quartz" in sys.modules,
 }))
@@ -86,6 +88,8 @@ print(json.dumps({
         "native_adapter": True,
         "input_backend": True,
         "readiness": True,
+        "native_events_imported": False,
+        "browser_inventory_imported": False,
         "application_services_imported": False,
         "quartz_imported": False,
     }

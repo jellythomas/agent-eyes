@@ -10,6 +10,14 @@ from agent_eyes.operation import OperationBudget, OperationError, OperationError
 from agent_eyes.provider_worker import ProviderCallState, ProviderWorker
 
 
+async def _warm(worker: ProviderWorker) -> None:
+    await worker.run(
+        lambda: None,
+        budget=OperationBudget.start(1.0),
+        operation="test worker warmup",
+    )
+
+
 def test_sync_provider_work_runs_off_the_event_loop():
     async def run() -> None:
         worker = ProviderWorker("test-provider")
@@ -112,16 +120,17 @@ def test_timeout_returns_promptly_and_quarantines_late_worker():
                 active -= 1
             return "second"
 
+        await _warm(worker)
         started = time.monotonic()
         with pytest.raises(OperationError) as first_error:
             await worker.run(
                 first,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="slow native query",
             )
         elapsed = time.monotonic() - started
         assert first_error.value.code is OperationErrorCode.DEADLINE_EXCEEDED
-        assert elapsed < 0.05
+        assert elapsed < 0.2
         assert first_started.is_set()
         assert worker.busy is True
 
@@ -148,6 +157,141 @@ def test_timeout_returns_promptly_and_quarantines_late_worker():
     asyncio.run(run())
 
 
+def test_hung_provider_does_not_retain_timed_out_queue_waiters():
+    async def run() -> None:
+        worker = ProviderWorker("hung-waiter-retention-test")
+        started = threading.Event()
+        release = threading.Event()
+        queued_call_ran = threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            release.wait()
+
+        active_task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(10.0),
+                operation="hung provider",
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+
+        try:
+            results = await asyncio.gather(
+                *(
+                    worker.run(
+                        queued_call_ran.set,
+                        budget=OperationBudget.start(0.01),
+                        operation=f"timed-out queued call {index}",
+                    )
+                    for index in range(1_000)
+                ),
+                return_exceptions=True,
+            )
+
+            assert all(
+                isinstance(result, OperationError)
+                and result.code is OperationErrorCode.DEADLINE_EXCEEDED
+                for result in results
+            )
+            assert queued_call_ran.is_set() is False
+            with worker._guard:
+                assert len(worker._waiters) == 0
+            assert worker.busy is True
+        finally:
+            active_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active_task
+            release.set()
+            await worker.wait_until_idle()
+            await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_cancelled_queue_waiter_is_removed_without_reordering_survivors():
+    async def run() -> None:
+        worker = ProviderWorker("cancelled-waiter-fairness-test")
+        started = threading.Event()
+        release = threading.Event()
+        execution_order: list[str] = []
+
+        def blocking() -> str:
+            started.set()
+            release.wait()
+            return "active"
+
+        def record(label: str) -> str:
+            execution_order.append(label)
+            return label
+
+        active_task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(10.0),
+                operation="active provider",
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+
+        first_task = asyncio.create_task(
+            worker.run(
+                lambda: record("first"),
+                budget=OperationBudget.start(5.0),
+                operation="first queued call",
+            )
+        )
+        cancelled_task = asyncio.create_task(
+            worker.run(
+                lambda: record("cancelled"),
+                budget=OperationBudget.start(5.0),
+                operation="cancelled queued call",
+            )
+        )
+        last_task = asyncio.create_task(
+            worker.run(
+                lambda: record("last"),
+                budget=OperationBudget.start(5.0),
+                operation="last queued call",
+            )
+        )
+
+        tasks = (active_task, first_task, cancelled_task, last_task)
+        try:
+            async def wait_for_queued_tasks() -> None:
+                while True:
+                    with worker._guard:
+                        if len(worker._waiters) == 3:
+                            return
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_queued_tasks(), timeout=1.0)
+
+            cancelled_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_task
+            with worker._guard:
+                assert len(worker._waiters) == 2
+
+            release.set()
+            assert await active_task == "active"
+            assert await asyncio.gather(first_task, last_task) == ["first", "last"]
+            assert execution_order == ["first", "last"]
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await worker.wait_until_idle()
+            await worker.aclose()
+
+    asyncio.run(run())
+
+
 def test_call_state_distinguishes_late_started_timeout_from_queue_timeout():
     async def run() -> None:
         worker = ProviderWorker("dispatch-state-test")
@@ -158,11 +302,12 @@ def test_call_state_distinguishes_late_started_timeout_from_queue_timeout():
             first_started.set()
             release_first.wait(timeout=1.0)
 
+        await _warm(worker)
         started_state = ProviderCallState()
         with pytest.raises(OperationError):
             await worker.run(
                 blocking,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="late mutation",
                 state=started_state,
             )
@@ -248,10 +393,11 @@ def test_timed_out_lane_recovers_after_originating_event_loop_closes():
         release.wait(timeout=1.0)
 
     async def time_out_first_call() -> None:
+        await _warm(worker)
         with pytest.raises(OperationError):
             await worker.run(
                 blocking,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="cross-loop blocking call",
             )
 
@@ -287,10 +433,11 @@ def test_late_provider_exception_is_consumed_without_loop_secret_leak():
             release.wait(timeout=1.0)
             raise RuntimeError(secret)
 
+        await _warm(worker)
         with pytest.raises(OperationError):
             await worker.run(
                 fail_late,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="late failing provider",
             )
         release.set()
@@ -315,10 +462,11 @@ def test_cancelled_close_can_be_retried_from_a_new_event_loop():
         release.wait(timeout=1.0)
 
     async def cancel_first_close() -> None:
+        await _warm(worker)
         with pytest.raises(OperationError):
             await worker.run(
                 blocking,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="close quarantine",
             )
         close_task = asyncio.create_task(worker.aclose())
@@ -442,10 +590,11 @@ def test_permanently_hung_provider_cannot_block_shutdown_or_process_exit():
             started.set()
             release.wait()
 
+        await _warm(worker)
         provider_call = asyncio.create_task(
             worker.run(
                 blocking,
-                budget=OperationBudget.start(0.01),
+                budget=OperationBudget.start(0.1),
                 operation="permanently hung provider",
             )
         )

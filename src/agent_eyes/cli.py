@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 import os
 import sys
 from enum import IntEnum
-from pathlib import Path
-from typing import Sequence
 
 from agent_eyes import __version__
 
@@ -32,7 +29,7 @@ class ExitCode(IntEnum):
     CANCELLED = 5
 
 
-def _add_profile(parser: argparse.ArgumentParser) -> None:
+def _add_profile(parser) -> None:
     parser.add_argument(
         "--profile",
         choices=("standard", "full"),
@@ -41,11 +38,11 @@ def _add_profile(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_output(parser: argparse.ArgumentParser) -> None:
+def _add_output(parser) -> None:
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
 
-def _add_mutation_controls(parser: argparse.ArgumentParser) -> None:
+def _add_mutation_controls(parser) -> None:
     parser.add_argument("--yes", action="store_true", help="Approve the displayed user-level plan")
     parser.add_argument(
         "--non-interactive",
@@ -55,7 +52,7 @@ def _add_mutation_controls(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Display the plan without changing anything")
 
 
-def _add_clients(parser: argparse.ArgumentParser) -> None:
+def _add_clients(parser) -> None:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
         "--client",
@@ -69,7 +66,9 @@ def _add_clients(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="agent-eyes",
         description="Model-independent, native-first computer use over MCP",
@@ -126,7 +125,7 @@ def _status_exit(status: str) -> ExitCode:
     return ExitCode.OK
 
 
-def _run_serve(args: argparse.Namespace) -> int:
+def _run_serve(args) -> int:
     import logging
 
     level_name = getattr(args, "log_level", "info").upper()
@@ -137,7 +136,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     return int(result) if isinstance(result, int) else int(ExitCode.OK)
 
 
-def _run_doctor(args: argparse.Namespace) -> int:
+def _run_doctor(args) -> int:
     import json
 
     from agent_eyes.setup.readiness import ReadinessStore, probe_current_readiness
@@ -166,7 +165,7 @@ def _render_install_plan(plan) -> str:
     return f"- {plan.description}\n  Command: {command}"
 
 
-def _emit_error(args: argparse.Namespace, message: str, code: ExitCode) -> int:
+def _emit_error(args, message: str, code: ExitCode) -> int:
     import json
 
     if getattr(args, "json", False):
@@ -176,8 +175,10 @@ def _emit_error(args: argparse.Namespace, message: str, code: ExitCode) -> int:
     return int(code)
 
 
-def _is_transient_environment_launcher(executable: Path) -> bool:
+def _is_transient_environment_launcher(executable) -> bool:
     """Return whether a PATH launcher belongs to the active virtual environment."""
+    from pathlib import Path
+
     if sys.prefix == sys.base_prefix:
         return False
     environment_bin = Path(sys.prefix) / (
@@ -191,11 +192,12 @@ def _is_transient_environment_launcher(executable: Path) -> bool:
     return executable.parent.resolve() == environment_bin or launcher.parent == environment_bin
 
 
-def _persistent_executable() -> Path | None:
+def _persistent_executable():
+    from pathlib import Path
     import shutil
     import subprocess
 
-    candidates: list[Path] = []
+    candidates = []
     uv = shutil.which("uv")
     if uv:
         try:
@@ -230,7 +232,7 @@ def _persistent_executable() -> Path | None:
     return unique[0] if unique else None
 
 
-def _launcher_matches_current(executable: Path | None) -> bool:
+def _launcher_matches_current(executable) -> bool:
     """Return whether a persistent launcher reports this exact Agent Eyes version."""
     import subprocess
 
@@ -262,7 +264,7 @@ def _launcher_matches_current(executable: Path | None) -> bool:
     return matches
 
 
-def _probe_persistent_readiness(executable: Path, profile: str):
+def _probe_persistent_readiness(executable, profile: str):
     """Ask the installed launcher to verify its own provider environment."""
     import json
     import subprocess
@@ -298,7 +300,7 @@ def _probe_persistent_readiness(executable: Path, profile: str):
     return ReadinessReport.from_dict(payload)
 
 
-def _prepare_install(*, repair: bool) -> tuple[Path, object | None]:
+def _prepare_install(*, repair: bool):
     """Resolve a current launcher or a manager-specific install target and plan."""
     from agent_eyes.setup.install import (
         build_install_plan,
@@ -326,7 +328,7 @@ def _prepare_install(*, repair: bool) -> tuple[Path, object | None]:
     return executable, plan
 
 
-def _run_install(args: argparse.Namespace) -> int:
+def _run_install(args) -> int:
     import json
     import subprocess
 
@@ -407,7 +409,7 @@ def _run_install(args: argparse.Namespace) -> int:
     return int(ExitCode.OK)
 
 
-def _client_targets(client_ids: Sequence[str] | None) -> list[dict]:
+def _client_targets(client_ids: list[str] | None) -> list[dict]:
     from agent_eyes.setup.scanner import _ai_tool_definitions, scan_ai_tools
 
     detected_ids = {tool["id"] for tool in scan_ai_tools()}
@@ -419,7 +421,7 @@ def _client_targets(client_ids: Sequence[str] | None) -> list[dict]:
     return [definitions[client_id] for client_id in sorted(selected)]
 
 
-def _config_plan(targets: Sequence[dict]) -> list[dict]:
+def _config_plan(targets: list[dict]) -> list[dict]:
     result = []
     for target in targets:
         location = target["config_locations"].get("global_mcp")
@@ -444,8 +446,10 @@ def _config_plan(targets: Sequence[dict]) -> list[dict]:
     return result
 
 
-def _skill_plan(targets: Sequence[dict]) -> list[dict]:
+def _skill_plan(targets: list[dict]) -> list[dict]:
     """Return canonical skill artifacts for clients that support skills."""
+    from pathlib import Path
+
     result = []
     for target in targets:
         if not target.get("supports_skills", False):
@@ -474,14 +478,16 @@ def _skill_plan(targets: Sequence[dict]) -> list[dict]:
     return result
 
 
-def _client_change_plan(targets: Sequence[dict]) -> list[dict]:
+def _client_change_plan(targets: list[dict]) -> list[dict]:
     return [*_config_plan(targets), *_skill_plan(targets)]
 
 
 def _preflight_client_configs(
-    config_plan: Sequence[dict],
-    executable: Path,
+    config_plan: list[dict],
+    executable,
 ):
+    from pathlib import Path
+
     from agent_eyes.setup.configurator import preflight_mcp_file, preflight_text_file
     from agent_eyes.setup.templates.openai_skill import OPENAI_YAML
     from agent_eyes.setup.templates.skill import SKILL_MD
@@ -539,8 +545,8 @@ def _config_results(prepared, *, apply: bool) -> list[dict]:
 
 
 def _apply_client_configs(
-    config_plan: Sequence[dict],
-    executable: Path,
+    config_plan: list[dict],
+    executable,
     *,
     dry_run: bool,
 ) -> list[dict]:
@@ -548,7 +554,7 @@ def _apply_client_configs(
     return _config_results(prepared, apply=not dry_run)
 
 
-def _run_init(args: argparse.Namespace) -> int:
+def _run_init(args) -> int:
     import json
 
     executable = _persistent_executable()
@@ -619,7 +625,7 @@ def _run_init(args: argparse.Namespace) -> int:
     return int(ExitCode.OK)
 
 
-def _run_setup(args: argparse.Namespace) -> int:
+def _run_setup(args) -> int:
     import json
     import subprocess
 
@@ -738,7 +744,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     return int(_status_exit(report.status.value))
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     if args.command is None:
         args.command = "serve"

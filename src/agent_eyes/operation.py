@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -92,6 +93,17 @@ class OperationBudget:
         *,
         operation: str = "operation",
     ) -> _T:
+        remaining = self.remaining()
+        if remaining <= 0.0:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            elif isinstance(awaitable, asyncio.Future):
+                awaitable.cancel()
+            raise OperationError(
+                OperationErrorCode.DEADLINE_EXCEEDED,
+                f"{operation} exceeded its deadline",
+            )
+
         async def preserve_provider_timeout() -> _T:
             try:
                 return await awaitable
@@ -101,7 +113,7 @@ class OperationBudget:
         try:
             return await asyncio.wait_for(
                 preserve_provider_timeout(),
-                timeout=self.remaining(),
+                timeout=remaining,
             )
         except _ProviderTimeout as exc:
             provider_error = exc.__cause__
