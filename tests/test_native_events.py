@@ -298,37 +298,53 @@ def test_native_action_can_dispatch_and_observe_on_distinct_affinity_lanes():
 
 def test_slow_observer_cleanup_cannot_extend_total_deadline():
     async def run():
+        deadline_consumed = threading.Event()
+        registration_completed = asyncio.Event()
         cleanup_started = asyncio.Event()
         release_cleanup = asyncio.Event()
+        cleanup_completed = asyncio.Event()
+
+        def clock() -> float:
+            return 1.0 if deadline_consumed.is_set() else 0.0
 
         class SlowCleanupSubscription(FakeSubscription):
             async def aclose(self) -> None:
                 cleanup_started.set()
                 await release_cleanup.wait()
                 self.closed = True
+                cleanup_completed.set()
 
         subscription = SlowCleanupSubscription()
+        budget = OperationBudget.start(1.0, clock=clock)
 
         async def factory(pid: int):
+            registration_completed.set()
             return subscription
+
+        def condition() -> bool:
+            deadline_consumed.set()
+            return True
 
         result = await asyncio.wait_for(
             run_native_action_until(
                 42,
                 lambda: True,
-                lambda: True,
-                timeout=0.01,
+                condition,
+                timeout=1.0,
                 subscription_factory=factory,
+                budget=budget,
             ),
             timeout=1.0,
         )
 
         assert result.condition_met is True
+        assert registration_completed.is_set()
+        assert budget.expired is True
         assert cleanup_started.is_set()
         assert subscription.closed is False
 
         release_cleanup.set()
-        await asyncio.sleep(0)
+        await asyncio.wait_for(cleanup_completed.wait(), timeout=1.0)
         assert subscription.closed is True
 
     asyncio.run(run())

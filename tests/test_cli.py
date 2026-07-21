@@ -394,9 +394,10 @@ def test_codex_config_and_skills_apply_in_one_transaction(tmp_path, monkeypatch)
 
     assert seen == [("toml", "skill", "skill-metadata")]
     assert all(item["applied"] for item in changes)
-    assert f'command = "{executable}"' in (tmp_path / "config.toml").read_text(
-        encoding="utf-8"
+    configured = configurator._toml.loads(
+        (tmp_path / "config.toml").read_text(encoding="utf-8")
     )
+    assert configured["mcp_servers"]["agent-eyes"]["command"] == str(executable)
     assert (
         tmp_path / "skills" / "agent-eyes" / "SKILL.md"
     ).read_text(encoding="utf-8") == SKILL_MD

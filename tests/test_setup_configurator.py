@@ -1065,7 +1065,7 @@ def test_concurrent_processes_apply_the_same_plan_once_and_remain_idempotent(tmp
             process.join(timeout=15)
             assert process.exitcode == 0
 
-        assert all(error is None for _, _, _, error in results)
+        assert all(error is None for _, _, _, error in results), results
         assert sum(applied for applied, _, _, _ in results) == 1
         assert json.loads(path.read_text())["mcpServers"][
             "agent-eyes"

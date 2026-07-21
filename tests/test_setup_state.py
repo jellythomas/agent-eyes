@@ -195,7 +195,10 @@ def test_readiness_lock_retargeted_after_validation_fails_without_touching_targe
         validate_then_retarget,
     )
 
-    with pytest.raises(RuntimeError, match="could not be opened safely"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Readiness lock (?:could not be opened safely|must not be a symlink)",
+    ):
         state.save_state({"initialized": False})
 
     assert victim.read_text() == "keep"

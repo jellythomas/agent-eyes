@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -13,6 +14,9 @@ from agent_eyes.setup.install import (
     select_install_manager,
 )
 from agent_eyes.setup import install
+
+
+_LAUNCHER_NAME = "agent-eyes.exe" if sys.platform == "win32" else "agent-eyes"
 
 
 @pytest.fixture(autouse=True)
@@ -125,7 +129,7 @@ def test_manager_specific_launcher_resolution_does_not_prefer_other_manager(
 ):
     pipx_bin = tmp_path / "pipx-bin"
     pipx_bin.mkdir()
-    expected = pipx_bin / "agent-eyes"
+    expected = pipx_bin / _LAUNCHER_NAME
     expected.write_text("#!/bin/sh\n")
     monkeypatch.setenv("PIPX_BIN_DIR", str(pipx_bin))
 

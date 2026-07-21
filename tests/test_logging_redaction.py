@@ -41,17 +41,6 @@ class _OneMessageWebSocket:
         return self._message
 
 
-class _ElementAdapter:
-    def find_elements(
-        self,
-        pid: int,
-        role: str = "",
-        name: str = "",
-        value: str = "",
-    ) -> list[object]:
-        return []
-
-
 def test_legacy_cdp_logs_do_not_disclose_ws_hosts_or_exception_messages(
     monkeypatch,
     caplog,
@@ -245,6 +234,8 @@ def test_native_event_logs_redact_registration_exception_messages(caplog):
     subscription._run_backend = fail_thread
 
     async def run() -> None:
+        element = object()
+
         async def fail_action_factory(_pid: int) -> None:
             raise RuntimeError(action_error_secret)
 
@@ -259,14 +250,15 @@ def test_native_event_logs_redact_registration_exception_messages(caplog):
             subscription_factory=fail_action_factory,
         )
         assert result.condition_met is True
-        await wait_for_native_element(
-            _ElementAdapter(),
+        wait_result = await wait_for_native_element(
+            SimpleNamespace(
+                find_elements=lambda *_args, **_kwargs: [element],
+            ),
             19,
-            timeout=0.01,
+            timeout=1.0,
             subscription_factory=fail_wait_factory,
-            fallback_initial_interval=0.001,
-            fallback_max_interval=0.001,
         )
+        assert wait_result.element is element
 
     with caplog.at_level(logging.DEBUG, logger="agent-eyes.native-events"):
         subscription._thread_entry()
@@ -275,7 +267,18 @@ def test_native_event_logs_redact_registration_exception_messages(caplog):
     assert thread_error_secret not in caplog.text
     assert action_error_secret not in caplog.text
     assert wait_error_secret not in caplog.text
-    assert caplog.text.count("RuntimeError") >= 3
+    messages = {
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent-eyes.native-events"
+    }
+    assert {
+        "Native event registration failed for PID 17 "
+        "(exception_type=RuntimeError)",
+        "Native action events unavailable for PID 18 "
+        "(exception_type=RuntimeError)",
+        "Native events unavailable for PID 19 (exception_type=RuntimeError)",
+    } <= messages
 
 
 def test_applescript_tab_matching_logs_redact_urls_and_titles(monkeypatch, caplog):
