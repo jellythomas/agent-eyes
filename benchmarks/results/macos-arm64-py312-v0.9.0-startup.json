@@ -7,21 +7,23 @@
   },
   "latency": {
     "mcp_initialize_and_tools_list": {
-      "max_ms": 444.99,
-      "median_ms": 432.3,
-      "p95_ms": 437.04
+      "max_ms": 353.53,
+      "median_ms": 284.36,
+      "p95_ms": 319.39
     },
     "server_import": {
-      "max_ms": 505.01,
-      "median_ms": 449.41,
-      "p95_ms": 457.79
+      "max_ms": 297.66,
+      "median_ms": 265.08,
+      "p95_ms": 286.58
     }
   },
   "protocol": {
     "percentile": "sorted[ceil(0.95*n)-1]",
+    "server_import_clock": "inside fresh interpreter; process lifecycle excluded",
+    "mcp_clock": "process launch through tools/list response; cleanup excluded",
     "samples": 30,
     "warmups": 3
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "tool_counts": [28]
 }

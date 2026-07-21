@@ -182,13 +182,19 @@ samples after 3 warmups, and p95=`sorted[ceil(0.95*n)-1]`.
 
 | Gate | Before | 0.9.0 | Change |
 |---|---:|---:|---:|
-| Server import p95 | 592.70 ms | 457.79 ms | 22.8% lower |
-| MCP initialize + tools/list p95 | 584.30 ms | 437.04 ms | 25.2% lower |
-| Immediate event completion p95 | 4.750 ms | 0.572 ms | 88.0% lower |
-| Format 1,000 targets p95 | 6.839 ms | 3.369 ms | 50.7% lower |
-| Compact tool-catalog bytes | 18,881 | 12,544 | 33.6% lower |
+| Server import p95 | Not comparable* | 286.58 ms | Passes <=450 ms gate |
+| MCP initialize + tools/list p95 | Not comparable* | 319.39 ms | Passes <=500 ms gate |
+| Immediate event completion p95 | 4.750 ms | 0.494 ms | 89.6% lower |
+| Format 1,000 targets p95 | 6.839 ms | 3.311 ms | 51.6% lower |
+| Compact tool-catalog bytes | 18,881 | 13,291 | 29.6% lower |
 | Provider calls for 32 identical observations | 32 | 1 | 96.9% fewer |
 | CDP enrichment, 60 elements / 1 ms RTT | 182 round trips | 61 round trips | 66.5% fewer; 2.92x measured speedup |
+
+*Startup schema 2 measures the named operation boundaries: server import time
+inside a fresh interpreter, and MCP process launch through the tools/list
+response. The schema 1 baseline also included interpreter lifecycle and MCP
+transport cleanup, so its startup values are retained as history but are not a
+like-for-like comparison.
 
 The journey benchmark asserts that an existing YouTube target is activated with
 zero new tabs and zero implicit shadow probes, and that an absent target opens
@@ -202,6 +208,13 @@ uv run python benchmarks/benchmark_cdp_bounds.py
 uv run python benchmarks/benchmark_journeys.py
 uv run python benchmarks/stress_concurrency.py
 ```
+
+The stress run also warms the allocator, then measures current process RSS
+before and after 10,000 deterministic `ObservationStore` create/invalidate
+cycles. Each cycle owns and releases one 4 KiB provider payload, the store may
+retain at most one live snapshot, and RSS growth must not exceed the greater of
+10 MiB or 5% of its baseline. Linux reads `/proc/self/statm`, Windows reads the
+process working set, and other supported Unix hosts use `ps` RSS.
 
 Machine-readable results and the baseline protocol are under
 `benchmarks/results/` and `benchmarks/baselines/`.
@@ -240,8 +253,8 @@ For pipx installations, use `pipx upgrade agent-eyes`. To remove the executable,
 
 ```bash
 uv sync --all-groups
-uv run pytest -q
-uv run pytest --cov=agent_eyes.coordinator --cov=agent_eyes.input_validation --cov=agent_eyes.observations --cov=agent_eyes.operation --cov=agent_eyes.tool_contract --cov-report=term-missing tests/test_coordinator_concurrency.py tests/test_input_validation.py tests/test_observation_store.py tests/test_operation_budget.py tests/test_tool_contract.py
+uv run python -m pytest -q
+uv run python -m pytest --cov=agent_eyes.coordinator --cov=agent_eyes.input_validation --cov=agent_eyes.observations --cov=agent_eyes.operation --cov=agent_eyes.tool_contract --cov-report=term-missing tests/test_coordinator_concurrency.py tests/test_input_validation.py tests/test_observation_store.py tests/test_operation_budget.py tests/test_tool_contract.py
 uvx ruff check src benchmarks
 uvx bandit -r src -q -ll
 uv run agent-eyes doctor --verbose
