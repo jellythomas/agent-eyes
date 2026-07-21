@@ -7,7 +7,7 @@ README = Path(__file__).parents[1] / "README.md"
 
 
 def test_readme_uses_canonical_guided_setup_commands():
-    content = README.read_text()
+    content = README.read_text(encoding="utf-8")
 
     assert "uvx agent-eyes setup" in content
     assert "agent-eyes doctor" in content
@@ -17,7 +17,7 @@ def test_readme_uses_canonical_guided_setup_commands():
 
 
 def test_readme_removes_obsolete_model_and_chrome_specific_setup():
-    content = README.read_text()
+    content = README.read_text(encoding="utf-8")
 
     assert "/agent-eyes-init" not in content
     assert "install.json" not in content
@@ -25,7 +25,7 @@ def test_readme_removes_obsolete_model_and_chrome_specific_setup():
 
 
 def test_readme_documents_foreground_browser_reuse_and_explicit_shadow():
-    content = README.read_text().lower()
+    content = README.read_text(encoding="utf-8").lower()
 
     assert "reuse" in content
     assert "open tabs" in content
@@ -34,7 +34,7 @@ def test_readme_documents_foreground_browser_reuse_and_explicit_shadow():
 
 
 def test_readme_documents_readiness_and_recovery():
-    content = README.read_text()
+    content = README.read_text(encoding="utf-8")
 
     assert "setup_required" in content
     assert "permission_required" in content
@@ -43,7 +43,7 @@ def test_readme_documents_readiness_and_recovery():
 
 
 def test_readme_documents_event_completion_stable_targets_and_safe_config():
-    content = README.read_text().lower()
+    content = README.read_text(encoding="utf-8").lower()
 
     assert "axobserver" in content
     assert "ui automation" in content
@@ -55,7 +55,7 @@ def test_readme_documents_event_completion_stable_targets_and_safe_config():
 
 
 def test_readme_documents_attach_before_setup_without_in_mcp_installation():
-    content = README.read_text().lower()
+    content = README.read_text(encoding="utf-8").lower()
 
     assert "attach the mcp before running setup" in content
     assert "stdio handshake still completes" in content
@@ -63,7 +63,7 @@ def test_readme_documents_attach_before_setup_without_in_mcp_installation():
 
 
 def test_readme_reports_platform_aware_catalog_and_reproducible_benchmarks():
-    content = README.read_text()
+    content = README.read_text(encoding="utf-8")
 
     assert "28 tools on macOS and 26 on Windows/Linux" in content
     assert "benchmarks/benchmark_startup.py" in content

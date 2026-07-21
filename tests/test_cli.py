@@ -13,6 +13,9 @@ import pytest
 from agent_eyes import __version__
 
 
+_LAUNCHER_NAME = "agent-eyes.exe" if sys.platform == "win32" else "agent-eyes"
+
+
 def test_cli_import_does_not_import_server():
     sys.modules.pop("agent_eyes.cli", None)
     sys.modules.pop("agent_eyes.server", None)
@@ -72,9 +75,9 @@ def test_persistent_executable_keeps_stable_shim_path(tmp_path, monkeypatch):
     tool_dir = tmp_path / "tools" / "agent-eyes" / "bin"
     bin_dir.mkdir()
     tool_dir.mkdir(parents=True)
-    target = tool_dir / "agent-eyes"
+    target = tool_dir / _LAUNCHER_NAME
     target.write_text("#!/bin/sh\n")
-    shim = bin_dir / "agent-eyes"
+    shim = bin_dir / _LAUNCHER_NAME
     shim.symlink_to(target)
 
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
@@ -93,7 +96,11 @@ def test_persistent_executable_rejects_active_virtualenv_path_launcher(
     from agent_eyes import cli
 
     environment = tmp_path / ".venv"
-    launcher = environment / ("Scripts" if sys.platform == "win32" else "bin") / "agent-eyes"
+    launcher = (
+        environment
+        / ("Scripts" if sys.platform == "win32" else "bin")
+        / _LAUNCHER_NAME
+    )
     launcher.parent.mkdir(parents=True)
     launcher.write_text("launcher")
     monkeypatch.setenv("PIPX_BIN_DIR", str(tmp_path / "pipx-bin"))
@@ -117,7 +124,7 @@ def test_persistent_executable_keeps_manager_launcher_inside_active_environment(
     environment = tmp_path / "tool-environment"
     bin_dir = environment / ("Scripts" if sys.platform == "win32" else "bin")
     bin_dir.mkdir(parents=True)
-    launcher = bin_dir / "agent-eyes"
+    launcher = bin_dir / _LAUNCHER_NAME
     launcher.write_text("launcher")
     monkeypatch.setattr(cli.sys, "prefix", str(environment))
     monkeypatch.setattr(cli.sys, "base_prefix", str(tmp_path / "python"))
@@ -147,8 +154,8 @@ def test_persistent_executable_prefers_current_pipx_over_stale_uv(
     pipx_bin = tmp_path / "pipx-bin"
     uv_bin.mkdir()
     pipx_bin.mkdir()
-    stale = uv_bin / "agent-eyes"
-    current = pipx_bin / "agent-eyes"
+    stale = uv_bin / _LAUNCHER_NAME
+    current = pipx_bin / _LAUNCHER_NAME
     stale.write_text("stale")
     current.write_text("current")
     monkeypatch.setenv("PIPX_BIN_DIR", str(pipx_bin))
@@ -387,11 +394,15 @@ def test_codex_config_and_skills_apply_in_one_transaction(tmp_path, monkeypatch)
 
     assert seen == [("toml", "skill", "skill-metadata")]
     assert all(item["applied"] for item in changes)
-    assert f'command = "{executable}"' in (tmp_path / "config.toml").read_text()
-    assert (tmp_path / "skills" / "agent-eyes" / "SKILL.md").read_text() == SKILL_MD
+    assert f'command = "{executable}"' in (tmp_path / "config.toml").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        tmp_path / "skills" / "agent-eyes" / "SKILL.md"
+    ).read_text(encoding="utf-8") == SKILL_MD
     assert (
         tmp_path / "skills" / "agent-eyes" / "agents" / "openai.yaml"
-    ).read_text() == OPENAI_YAML
+    ).read_text(encoding="utf-8") == OPENAI_YAML
 
 
 def test_skill_aware_dry_run_writes_nothing(tmp_path):
@@ -494,6 +505,11 @@ def test_setup_skips_healthy_install_and_emits_one_json_document(
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not reinstall")),
     )
     monkeypatch.setattr(readiness, "probe_current_readiness", lambda **kwargs: report)
+    monkeypatch.setattr(
+        cli,
+        "_probe_persistent_readiness",
+        lambda executable, profile: report,
+    )
     monkeypatch.setattr(readiness.ReadinessStore, "save", lambda self, value: None)
     monkeypatch.setattr(state, "mark_initialized", lambda *args: None)
 
@@ -546,6 +562,11 @@ def test_setup_uses_selected_managers_launcher_after_install(
 
     monkeypatch.setattr(install, "resolve_persistent_executable", resolve)
     monkeypatch.setattr(readiness, "probe_current_readiness", lambda **kwargs: report)
+    monkeypatch.setattr(
+        cli,
+        "_probe_persistent_readiness",
+        lambda executable, profile: report,
+    )
     monkeypatch.setattr(readiness.ReadinessStore, "save", lambda self, value: None)
     monkeypatch.setattr(state, "mark_initialized", lambda *args: None)
 
@@ -602,6 +623,11 @@ def test_setup_repairs_current_launcher_when_live_dependencies_are_missing(
         readiness,
         "probe_current_readiness",
         lambda **kwargs: next(reports),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_persistent_readiness",
+        lambda executable, profile: next(reports),
     )
     monkeypatch.setattr(readiness.ReadinessStore, "save", lambda self, value: None)
     monkeypatch.setattr(state, "mark_initialized", lambda *args: None)

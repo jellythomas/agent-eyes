@@ -182,7 +182,11 @@ def test_formatter_replaces_lone_surrogates_with_valid_utf8():
     assert "\ud800" not in result.text
 
 
-@pytest.mark.parametrize("value", ["x" * 10_000_000, "\\" * 10_000_000])
+@pytest.mark.parametrize(
+    "value",
+    ["x" * 10_000_000, "\\" * 10_000_000],
+    ids=("plain", "escaped"),
+)
 def test_json_size_peak_memory_is_bounded_for_one_huge_string(value):
     tracemalloc.start()
     try:

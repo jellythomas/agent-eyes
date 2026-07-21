@@ -122,6 +122,42 @@ def test_setup_lock_rejects_a_hard_link_without_mutating_target(tmp_path):
     assert target.stat().st_mode == original_mode
 
 
+def test_windows_setup_lock_has_bounded_nonblocking_acquisition(tmp_path):
+    class Stream:
+        def seek(self, _offset):
+            return None
+
+        def read(self, _count):
+            return b"\0"
+
+        def fileno(self):
+            return 17
+
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.modes: list[int] = []
+
+        def locking(self, _fd, mode, _nbytes):
+            self.modes.append(mode)
+            raise OSError("persistent lock failure")
+
+    msvcrt = Msvcrt()
+    lock_path = tmp_path / ".setup.lock"
+
+    with pytest.raises(RuntimeError, match="Timed out waiting for setup lock"):
+        state._acquire_windows_setup_lock(
+            Stream(),
+            msvcrt,
+            label="Setup lock",
+            path=lock_path,
+            timeout=0,
+        )
+
+    assert msvcrt.modes == [msvcrt.LK_NBLCK]
+
+
 def test_state_save_never_opens_a_symlinked_readiness_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "_state_dir", lambda: tmp_path)
     victim = tmp_path / "unrelated"

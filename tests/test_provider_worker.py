@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections import OrderedDict
 
 import pytest
 
@@ -417,6 +418,200 @@ def test_timed_out_lane_recovers_after_originating_event_loop_closes():
 
     assert asyncio.run(reuse()) == "recovered"
     asyncio.run(worker.aclose())
+
+
+def test_abandoned_cross_loop_handoff_is_reclaimed():
+    worker = ProviderWorker("abandoned-handoff-test")
+    started = threading.Event()
+    release = threading.Event()
+    handoff_dropped = threading.Event()
+    abandoned_task = None
+    first_loop = asyncio.new_event_loop()
+
+    async def abandon_handoff():
+        nonlocal abandoned_task
+
+        def blocking() -> None:
+            started.set()
+            release.wait(timeout=1.0)
+
+        active_task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(1.0),
+                operation="active cross-loop call",
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+
+        abandoned_task = asyncio.create_task(
+            worker.run(
+                lambda: "must not run",
+                budget=OperationBudget.start(1.0),
+                operation="abandoned cross-loop waiter",
+            )
+        )
+        while True:
+            with worker._guard:
+                if len(worker._waiters) == 1:
+                    break
+            await asyncio.sleep(0)
+
+        original_call_soon_threadsafe = first_loop.call_soon_threadsafe
+
+        def drop_provider_handoff(callback, *args, context=None):
+            if (
+                getattr(callback, "__self__", None) is worker
+                and getattr(callback, "__func__", None)
+                is ProviderWorker._resolve_waiter
+            ):
+                handoff_dropped.set()
+                return None
+            return original_call_soon_threadsafe(
+                callback,
+                *args,
+                context=context,
+            )
+
+        first_loop.call_soon_threadsafe = drop_provider_handoff
+        release.set()
+        await active_task
+        while not handoff_dropped.is_set():
+            await asyncio.sleep(0)
+
+    first_loop.run_until_complete(abandon_handoff())
+    assert abandoned_task is not None
+    abandoned_task._log_destroy_pending = False
+    recovery_queued = threading.Event()
+    recovery_completed = threading.Event()
+    recovery_errors: list[BaseException] = []
+
+    class ObservedWaiters(OrderedDict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            recovery_queued.set()
+
+    with worker._guard:
+        worker._waiters = ObservedWaiters(worker._waiters)
+
+    def recover() -> None:
+        try:
+            asyncio.run(worker.wait_until_idle())
+        except BaseException as exc:
+            recovery_errors.append(exc)
+        finally:
+            recovery_completed.set()
+
+    recovery_thread = threading.Thread(target=recover, daemon=True)
+    recovery_thread.start()
+    queued_before_close = recovery_queued.wait(timeout=1.0)
+    first_loop.close()
+    recovered_without_third_caller = recovery_completed.wait(timeout=0.5)
+    try:
+        if recovery_thread.is_alive():
+            asyncio.run(worker.wait_until_idle())
+        recovery_thread.join(timeout=1.0)
+
+        assert queued_before_close is True
+        assert recovered_without_third_caller is True
+        assert recovery_thread.is_alive() is False
+        assert recovery_errors == []
+
+        async def reuse() -> str:
+            return await worker.run(
+                lambda: "recovered",
+                budget=OperationBudget.start(1.0),
+                operation="recovered after abandoned handoff",
+            )
+
+        assert asyncio.run(reuse()) == "recovered"
+    finally:
+        asyncio.run(worker.aclose())
+        abandoned_task.get_coro().close()
+
+
+def test_idle_waiter_keeps_fifo_position_during_handoff_liveness_checks():
+    async def run() -> None:
+        worker = ProviderWorker("idle-waiter-fairness-test")
+        started = threading.Event()
+        release = threading.Event()
+        completion_order: list[str] = []
+        liveness_rechecked = asyncio.Event()
+        recheck_count = 0
+
+        def blocking() -> str:
+            started.set()
+            release.wait(timeout=1.0)
+            return "active"
+
+        original_reclaim = worker._reclaim_abandoned_handoff
+
+        def observe_reclaim() -> bool:
+            nonlocal recheck_count
+            recheck_count += 1
+            if recheck_count >= 2:
+                liveness_rechecked.set()
+            return original_reclaim()
+
+        worker._reclaim_abandoned_handoff = observe_reclaim
+        active_task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(1.0),
+                operation="active provider call",
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 1.0)
+
+        async def wait_for_idle() -> None:
+            await worker.wait_until_idle()
+            completion_order.append("idle")
+
+        idle_task = asyncio.create_task(wait_for_idle())
+
+        async def wait_for_queue_size(size: int) -> None:
+            while True:
+                with worker._guard:
+                    if len(worker._waiters) == size:
+                        return
+                await asyncio.sleep(0)
+
+        tasks = [active_task, idle_task]
+        try:
+            await asyncio.wait_for(wait_for_queue_size(1), timeout=1.0)
+            with worker._guard:
+                idle_future = next(iter(worker._waiters))
+
+            trailing_task = asyncio.create_task(
+                worker.run(
+                    lambda: completion_order.append("trailing"),
+                    budget=OperationBudget.start(1.0),
+                    operation="trailing provider call",
+                )
+            )
+            tasks.append(trailing_task)
+            await asyncio.wait_for(wait_for_queue_size(2), timeout=1.0)
+            await asyncio.wait_for(liveness_rechecked.wait(), timeout=1.0)
+
+            with worker._guard:
+                queued_futures = list(worker._waiters)
+            assert queued_futures[0] is idle_future
+
+            release.set()
+            assert await active_task == "active"
+            await asyncio.gather(idle_task, trailing_task)
+            assert completion_order == ["idle", "trailing"]
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await worker.wait_until_idle()
+            await worker.aclose()
+
+    asyncio.run(run())
 
 
 def test_late_provider_exception_is_consumed_without_loop_secret_leak():

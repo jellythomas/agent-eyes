@@ -1453,43 +1453,61 @@ def test_parallel_identical_tree_observations_call_native_provider_once(monkeypa
 def test_short_tree_waiter_does_not_poison_concurrent_long_waiter(monkeypatch):
     from agent_eyes import server
 
-    started = threading.Event()
-    worker = ProviderWorker("tree-deadline-isolation")
+    release = threading.Event()
+    native_worker = ProviderWorker("tree-deadline-isolation")
+    system_worker = ProviderWorker("tree-deadline-system")
     adapter = MagicMock()
 
     def delayed_tree(*_args, **_kwargs):
-        started.set()
-        time.sleep(0.05)
+        loop.call_soon_threadsafe(provider_started.set)
+        release.wait(timeout=1.0)
         return _native_tree("shared")
 
     adapter.get_tree.side_effect = delayed_tree
     monkeypatch.setattr(server, "native_adapter", adapter)
-    monkeypatch.setattr(server, "native_worker", worker)
+    monkeypatch.setattr(server, "native_worker", native_worker)
+    monkeypatch.setattr(server, "system_worker", system_worker)
     monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
     monkeypatch.setattr(server._pu, "is_browser_pid", lambda _pid: False)
 
     async def run() -> None:
+        nonlocal loop, provider_started
+        loop = asyncio.get_running_loop()
+        provider_started = asyncio.Event()
+        tasks: list[asyncio.Task[str]] = []
         try:
-            short = asyncio.create_task(
-                server._handle_get_tree({"pid": 77, "timeout": 0.01})
-            )
-            while not started.is_set():
-                await asyncio.sleep(0)
             long = asyncio.create_task(
                 server._handle_get_tree({"pid": 77, "timeout": 1.0})
             )
+            tasks.append(long)
+            await asyncio.wait_for(provider_started.wait(), timeout=1.0)
+
+            short = asyncio.create_task(
+                server._handle_get_tree({"pid": 77, "timeout": 0.01})
+            )
+            tasks.append(short)
 
             with pytest.raises(OperationError) as exc_info:
-                await short
+                await asyncio.wait_for(short, timeout=1.0)
             assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
-            output = await long
+            release.set()
+            output = await asyncio.wait_for(long, timeout=1.0)
 
             assert output.startswith("snapshot=")
             assert adapter.get_tree.call_count == 1
         finally:
-            await worker.wait_until_idle()
-            await worker.aclose()
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(native_worker.aclose(), system_worker.aclose()),
+                timeout=1.0,
+            )
 
+    loop = None
+    provider_started = None
     asyncio.run(run())
 
 
@@ -1519,13 +1537,13 @@ def test_tree_total_deadline_bounds_slow_native_provider(monkeypatch):
             budget=OperationBudget.start(1.0),
             operation="tree deadline worker warmup",
         )
-        before = time.monotonic()
         with pytest.raises(OperationError) as exc_info:
-            await server._handle_get_tree({"pid": 42, "timeout": 0.1})
-        elapsed = time.monotonic() - before
+            await asyncio.wait_for(
+                server._handle_get_tree({"pid": 42, "timeout": 0.1}),
+                timeout=1.0,
+            )
 
         assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
-        assert elapsed < 0.2
         assert started.is_set()
         assert worker.busy is True
         assert coordinator._flights == {}

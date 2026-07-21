@@ -279,6 +279,7 @@ def test_readiness_lock_rejects_symlink_without_touching_target(tmp_path):
     victim = tmp_path / "victim"
     victim.write_bytes(b"do not touch")
     victim.chmod(0o644)
+    original_mode = stat.S_IMODE(victim.stat().st_mode)
     lock_path = tmp_path / ".readiness.lock"
     lock_path.symlink_to(victim)
 
@@ -287,7 +288,7 @@ def test_readiness_lock_rejects_symlink_without_touching_target(tmp_path):
             pass
 
     assert victim.read_bytes() == b"do not touch"
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert stat.S_IMODE(victim.stat().st_mode) == original_mode
 
 
 def test_windows_readiness_lock_has_bounded_nonblocking_acquisition():

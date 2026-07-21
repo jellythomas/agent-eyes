@@ -16,6 +16,7 @@ from .operation import OperationBudget, OperationError
 
 _T = TypeVar("_T")
 _STOP = object()
+_HANDOFF_LIVENESS_TIMEOUT_SECONDS = 0.05
 
 
 class _DaemonSerialExecutor:
@@ -138,6 +139,7 @@ class ProviderWorker:
         self._guard = threading.Lock()
         # OrderedDict keeps FIFO handoff while allowing O(1) cancellation unlinking.
         self._waiters: OrderedDict[asyncio.Future[None], _LaneWaiter] = OrderedDict()
+        self._handoff: _LaneWaiter | None = None
         self._occupied = False
         self._active: ConcurrentFuture[object] | None = None
         self._closed = False
@@ -236,17 +238,41 @@ class ProviderWorker:
     ) -> None:
         loop = asyncio.get_running_loop()
         waiter: _LaneWaiter | None = None
+        recover_stale_handoff = False
         with self._guard:
             if self._closed and not allow_closed:
                 raise RuntimeError(f"{self._name} provider worker is closed")
+            handoff = self._handoff
+            if handoff is not None and (
+                not handoff.active
+                or handoff.future.cancelled()
+                or handoff.loop.is_closed()
+            ):
+                handoff.active = False
+                handoff.granted = False
+                self._handoff = None
+                if not self._waiters:
+                    return
+                recover_stale_handoff = True
             if not self._occupied:
                 self._occupied = True
                 return
             waiter = _LaneWaiter(loop=loop, future=loop.create_future())
             self._waiters[waiter.future] = waiter
 
+        if recover_stale_handoff:
+            self._release_lane()
+
         try:
             if budget is None:
+                while not waiter.future.done():
+                    done, _pending = await asyncio.wait(
+                        (waiter.future,),
+                        timeout=_HANDOFF_LIVENESS_TIMEOUT_SECONDS,
+                    )
+                    if done:
+                        break
+                    self._reclaim_abandoned_handoff()
                 await waiter.future
             else:
                 await budget.wait_for(
@@ -260,11 +286,19 @@ class ProviderWorker:
                 self._waiters.pop(waiter.future, None)
                 if waiter.granted:
                     waiter.granted = False
+                    if self._handoff is waiter:
+                        self._handoff = None
                     should_handoff = True
             if should_handoff:
                 self._release_lane()
+            else:
+                self._reclaim_abandoned_handoff()
             raise
-        waiter.active = False
+        with self._guard:
+            waiter.active = False
+            waiter.granted = False
+            if self._handoff is waiter:
+                self._handoff = None
 
     def _complete_call(self, future: ConcurrentFuture[object]) -> None:
         """Consume late exceptions privately and release the cross-loop lane."""
@@ -286,8 +320,10 @@ class ProviderWorker:
                     or waiter.future.done()
                     or waiter.loop.is_closed()
                 ):
+                    waiter.active = False
                     continue
                 waiter.granted = True
+                self._handoff = waiter
                 try:
                     waiter.loop.call_soon_threadsafe(
                         self._resolve_waiter,
@@ -296,20 +332,46 @@ class ProviderWorker:
                 except RuntimeError:
                     waiter.active = False
                     waiter.granted = False
+                    if self._handoff is waiter:
+                        self._handoff = None
                     continue
                 return
             self._occupied = False
 
+    def _reclaim_abandoned_handoff(self) -> bool:
+        """Recover ownership reserved for a waiter whose event loop disappeared."""
+        should_handoff = False
+        with self._guard:
+            handoff = self._handoff
+            if handoff is None or (
+                handoff.active
+                and not handoff.future.cancelled()
+                and not handoff.loop.is_closed()
+            ):
+                return False
+            handoff.active = False
+            handoff.granted = False
+            self._handoff = None
+            if self._waiters:
+                should_handoff = True
+            else:
+                self._occupied = False
+        if should_handoff:
+            self._release_lane()
+        return True
+
     def _resolve_waiter(self, waiter: _LaneWaiter) -> None:
-        if waiter.future.done():
-            should_handoff = False
-            with self._guard:
+        should_handoff = False
+        with self._guard:
+            if self._handoff is not waiter:
+                return
+            if waiter.future.done() or not waiter.active:
                 waiter.active = False
-                if waiter.granted:
-                    waiter.granted = False
-                    should_handoff = True
-            if should_handoff:
-                self._release_lane()
+                waiter.granted = False
+                self._handoff = None
+                should_handoff = True
+        if should_handoff:
+            self._release_lane()
             return
         waiter.future.set_result(None)
 

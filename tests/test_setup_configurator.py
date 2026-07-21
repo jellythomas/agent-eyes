@@ -1055,19 +1055,35 @@ def test_concurrent_processes_apply_the_same_plan_once_and_remain_idempotent(tmp
         for _ in range(2)
     ]
 
-    for process in processes:
-        process.start()
-    results = [queue.get(timeout=15) for _ in processes]
-    for process in processes:
-        process.join(timeout=15)
-        assert process.exitcode == 0
+    started_processes = []
+    try:
+        for process in processes:
+            process.start()
+            started_processes.append(process)
+        results = [queue.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
 
-    assert all(error is None for _, _, _, error in results)
-    assert sum(applied for applied, _, _, _ in results) == 1
-    assert json.loads(path.read_text())["mcpServers"]["agent-eyes"] == get_mcp_entry(
-        EXECUTABLE
-    )
-    assert len(list(backups.glob("*.bak"))) == 1
+        assert all(error is None for _, _, _, error in results)
+        assert sum(applied for applied, _, _, _ in results) == 1
+        assert json.loads(path.read_text())["mcpServers"][
+            "agent-eyes"
+        ] == get_mcp_entry(EXECUTABLE)
+        assert len(list(backups.glob("*.bak"))) == 1
+    finally:
+        for process in started_processes:
+            if process.is_alive():
+                process.terminate()
+        for process in started_processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            if not process.is_alive():
+                process.close()
+        queue.close()
+        queue.join_thread()
 
 
 def test_backups_are_private_and_unique(tmp_path):

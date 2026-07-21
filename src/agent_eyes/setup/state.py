@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import stat
-import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,9 @@ from .readiness import (
     ReadinessStateError,
     ReadinessStore,
     SCHEMA_VERSION,
+    _READINESS_LOCK_TIMEOUT_SECONDS,
     _READINESS_THREAD_LOCK,
+    _acquire_windows_file_lock,
 )
 
 
@@ -44,6 +45,23 @@ def _validate_readiness_lock_target() -> None:
         raise RuntimeError(f"Readiness lock must not be a symlink: {lock_path}")
     if lock_path.exists() and not lock_path.is_file():
         raise RuntimeError(f"Readiness lock must be a regular file: {lock_path}")
+
+
+def _acquire_windows_setup_lock(
+    stream,
+    msvcrt_module,
+    *,
+    label: str,
+    path: Path,
+    timeout: float = _READINESS_LOCK_TIMEOUT_SECONDS,
+) -> None:
+    """Acquire a Windows setup lock without retrying permanent errors forever."""
+    try:
+        _acquire_windows_file_lock(stream, msvcrt_module, timeout=timeout)
+    except ReadinessStateError as exc:
+        raise RuntimeError(
+            f"Timed out waiting for {label.lower()}: {path}"
+        ) from exc
 
 
 @contextmanager
@@ -80,17 +98,12 @@ def _exclusive_file_lock(path: Path, *, label: str) -> Iterator[None]:
                 if os.name == "nt":
                     import msvcrt
 
-                    stream.seek(0)
-                    if stream.read(1) == b"":
-                        stream.write(b"\0")
-                        stream.flush()
-                    while True:
-                        stream.seek(0)
-                        try:
-                            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                            break
-                        except OSError:
-                            time.sleep(0.05)
+                    _acquire_windows_setup_lock(
+                        stream,
+                        msvcrt,
+                        label=label,
+                        path=path,
+                    )
                     try:
                         yield
                     finally:
