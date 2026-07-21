@@ -1,9 +1,9 @@
 """macOS accessibility adapter using AXUIElement API via PyObjC."""
 from __future__ import annotations
 
-import functools
 import re
 import sys
+from collections import defaultdict
 from .base import BaseAdapter, UIElement, AppInfo
 
 
@@ -15,6 +15,9 @@ class MacOSAdapter(BaseAdapter):
         self._quartz = None
         self._cocoa = None
         self._id_counter = 0
+        self._include_web_content = True
+        self._traversed_elements = 0
+        self._visited_element_keys: set[int] = set()
 
     def _next_id(self) -> int:
         self._id_counter += 1
@@ -22,7 +25,12 @@ class MacOSAdapter(BaseAdapter):
 
     def reset_ids(self):
         self._id_counter = 0
+        self._reset_traversal_state()
+
+    def _reset_traversal_state(self) -> None:
         self._in_web_area = False
+        self._traversed_elements = 0
+        self._visited_element_keys.clear()
 
     def is_available(self) -> bool:
         if sys.platform != "darwin":
@@ -52,13 +60,15 @@ class MacOSAdapter(BaseAdapter):
         return False, (
             "Accessibility permission NOT granted. "
             "Go to System Settings > Privacy & Security > Accessibility "
-            "and add your terminal app (Terminal, iTerm2, etc.)."
+            "and enable the app that launches Agent Eyes "
+            "(for example Codex, Claude, Terminal, or iTerm)."
         )
 
     def list_apps(self) -> list[AppInfo]:
         self._load()
         workspace = self._cocoa.NSWorkspace.sharedWorkspace()
         running_apps = workspace.runningApplications()
+        window_titles = self._window_titles_by_pid()
 
         apps = []
         for app in running_apps:
@@ -71,19 +81,14 @@ class MacOSAdapter(BaseAdapter):
             bundle_id = app.bundleIdentifier() or ""
             is_front = app.isActive()
 
-            # Get window titles via AX API
-            windows = []
-            ax_app = self._ax.AXUIElementCreateApplication(pid)
-            err, ax_windows = self._ax.AXUIElementCopyAttributeValue(
-                ax_app, "AXWindows", None
+            # One WindowServer snapshot supplies titles for every process.
+            # Fall back to AX only when the snapshot itself is unavailable
+            # (for example when window metadata is restricted by the OS).
+            windows = (
+                list(window_titles.get(pid, ()))
+                if window_titles is not None
+                else self._ax_window_titles(pid)
             )
-            if err == 0 and ax_windows:
-                for w in ax_windows:
-                    err2, title = self._ax.AXUIElementCopyAttributeValue(
-                        w, "AXTitle", None
-                    )
-                    if err2 == 0 and title:
-                        windows.append(str(title))
 
             apps.append(AppInfo(
                 pid=pid,
@@ -95,12 +100,80 @@ class MacOSAdapter(BaseAdapter):
 
         return sorted(apps, key=lambda a: (not a.is_frontmost, a.name))
 
+    def _window_titles_by_pid(self) -> dict[int, list[str]] | None:
+        """Read all normal-window titles with one WindowServer call."""
+        try:
+            records = self._quartz.CGWindowListCopyWindowInfo(
+                self._quartz.kCGWindowListOptionAll,
+                self._quartz.kCGNullWindowID,
+            )
+        except Exception:
+            return None
+        if records is None:
+            return None
+
+        titles: dict[int, list[str]] = defaultdict(list)
+        saw_title = False
+        for record in records:
+            try:
+                if int(record.get(self._quartz.kCGWindowLayer, -1)) != 0:
+                    continue
+                pid = int(record.get(self._quartz.kCGWindowOwnerPID, 0))
+                title = str(record.get(self._quartz.kCGWindowName, "") or "").strip()
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0 or not title:
+                continue
+            saw_title = True
+            if title not in titles[pid]:
+                titles[pid].append(title)
+
+        # An entirely title-less result usually means metadata access is not
+        # available. Preserve the AX fallback in that environment.
+        return dict(titles) if saw_title else None
+
+    def _ax_window_titles(self, pid: int) -> list[str]:
+        """Fallback title lookup for systems without WindowServer metadata."""
+        ax_app = self._ax.AXUIElementCreateApplication(pid)
+        windows = self._read_attr(ax_app, "AXWindows") or []
+        titles = []
+        for window in self._as_sequence(windows):
+            if self._normalized_role(window) == "application":
+                continue
+            title = self._read_attr(window, "AXTitle")
+            clean_title = str(title or "").strip()
+            if clean_title and clean_title not in titles:
+                titles.append(clean_title)
+        return titles
+
     def _read_attr(self, element, attr: str) -> any:
         """Safely read an accessibility attribute."""
         err, val = self._ax.AXUIElementCopyAttributeValue(element, attr, None)
         if err == 0 and val is not None:
             return val
         return None
+
+    @staticmethod
+    def _as_sequence(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            return []
+        try:
+            return list(value)
+        except TypeError:
+            return [value]
+
+    def _normalized_role(self, element) -> str:
+        raw_role = self._read_attr(element, "AXRole")
+        return str(raw_role or "").removeprefix("AX").casefold()
+
+    @staticmethod
+    def _element_key(element) -> int:
+        try:
+            return hash(element)
+        except TypeError:
+            return id(element)
 
     # Roles worth exposing inside web content (interactive + structural)
     _WEB_INTERACTIVE_ROLES = frozenset({
@@ -119,6 +192,15 @@ class MacOSAdapter(BaseAdapter):
         "group", "statictext", "image", "separator", "unknown",
         "layoutarea", "layoutitem", "matte", "ruler",
         "rulermarker", "splitter", "growarea", "relevanceindicator",
+    })
+    _BROWSER_PRUNE_ROLES = frozenset({
+        "menu", "menubar", "menubaritem", "menuitem",
+    })
+    _BROWSER_DOCUMENT_ROLES = frozenset({
+        "document", "documentframe", "documentweb", "webarea",
+    })
+    _BROWSER_ACTION_ROLES = frozenset({
+        "button", "pagetab", "radio", "radiobutton", "tab", "tabitem",
     })
 
     def _should_include_web_element(self, role: str, name: str, actions: list) -> bool:
@@ -169,6 +251,7 @@ class MacOSAdapter(BaseAdapter):
     # Hard cap on elements to prevent runaway traversal on complex pages
     _MAX_ELEMENTS = 1000
     _WEB_MAX_ELEMENTS = 3000
+    _BROWSER_MAX_ELEMENTS = 500
 
     def _element_to_ui(self, ax_el, depth: int, max_depth: int,
                        in_web_area: bool = False) -> UIElement | None:
@@ -179,9 +262,20 @@ class MacOSAdapter(BaseAdapter):
         """
         if depth > max_depth:
             return None
-        cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
-        if self._id_counter >= cap:
+
+        element_key = self._element_key(ax_el)
+        if element_key in self._visited_element_keys:
             return None
+
+        browser_inventory = not getattr(self, "_include_web_content", True)
+        if browser_inventory:
+            cap = self._BROWSER_MAX_ELEMENTS
+        else:
+            cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
+        if self._traversed_elements >= cap:
+            return None
+        self._visited_element_keys.add(element_key)
+        self._traversed_elements += 1
 
         # Single IPC call for all attributes (~1.3ms vs ~11ms for individual calls)
         attrs = self._batch_read_attrs(ax_el)
@@ -193,13 +287,25 @@ class MacOSAdapter(BaseAdapter):
         if role in ("unknown", ""):
             return None
 
+        # Browser inventory never needs application menus. Avoid both the
+        # output noise and hundreds of native IPC calls below the menu bar.
+        if browser_inventory and role in self._BROWSER_PRUNE_ROLES:
+            return None
+
         # Detect entry into web content — dynamically extend depth
-        if role == "webarea":
+        if role == "webarea" or (
+            browser_inventory and role in self._BROWSER_DOCUMENT_ROLES
+        ):
             in_web_area = True
             self._in_web_area = True
-            # Web content needs deeper traversal. Extend depth budget by 20
-            # from current position (buttons are 3-5 levels below AXWebArea).
-            max_depth = max(max_depth, depth + 20)
+            if not browser_inventory:
+                # Web content needs deeper traversal. Extend depth budget by 20
+                # from current position (buttons are 3-5 levels below AXWebArea).
+                max_depth = max(max_depth, depth + 20)
+            else:
+                # Browser inventory needs only browser chrome. Keep the web-area
+                # node as a boundary marker and never traverse page content.
+                max_depth = depth
 
         name = str(attrs.get("AXTitle") or "")
         if not name:
@@ -209,8 +315,14 @@ class MacOSAdapter(BaseAdapter):
         if not name:
             name = str(attrs.get("AXRoleDescription") or "")
 
+        subrole = str(attrs.get("AXSubrole") or "")
+        is_secure = "securetextfield" in subrole.casefold().replace("ax", "")
         value_raw = attrs.get("AXValue")
-        value = str(value_raw)[:200] if value_raw is not None else ""
+        value = (
+            str(value_raw)[:200]
+            if value_raw is not None and not is_secure
+            else ""
+        )
 
         # States (from batch-read values)
         states = []
@@ -222,15 +334,15 @@ class MacOSAdapter(BaseAdapter):
             states.append("selected")
         # Detect secure text fields (NSSecureTextField) — these block CGEvent
         # keyboard injection via EnableSecureEventInput(). Must use set_value.
-        subrole = str(attrs.get("AXSubrole") or "")
-        if "securetextfield" in subrole.lower().replace("ax", ""):
+        if is_secure:
             states.append("secure")
 
         # Actions (still a separate call — no batch API for this)
         actions = []
-        err, action_names = self._ax.AXUIElementCopyActionNames(ax_el, None)
-        if err == 0 and action_names:
-            actions = [str(a).replace("AX", "").lower() for a in action_names]
+        if not browser_inventory or role in self._BROWSER_ACTION_ROLES:
+            err, action_names = self._ax.AXUIElementCopyActionNames(ax_el, None)
+            if err == 0 and action_names:
+                actions = [str(a).replace("AX", "").lower() for a in action_names]
 
         # Bounds (from batch-read position/size)
         bounds = None
@@ -323,6 +435,7 @@ class MacOSAdapter(BaseAdapter):
     def get_tree(self, pid: int, max_depth: int = 5,
                  is_browser: bool = False) -> UIElement | None:
         self._load()
+        self._include_web_content = True
         self.reset_ids()
         ax_app = self._ax.AXUIElementCreateApplication(pid)
 
@@ -344,6 +457,81 @@ class MacOSAdapter(BaseAdapter):
             return self._element_to_ui(ax_app, 0, max_depth)
 
         return self._element_to_ui(ax_window, 0, max_depth)
+
+    def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        """Return all browser window trees without traversing web documents."""
+        self._load()
+        self.reset_ids()
+        self._include_web_content = False
+        ax_app = self._ax.AXUIElementCreateApplication(pid)
+
+        from ..platform_utils import is_browser_pid
+        if is_browser_pid(pid):
+            self.force_browser_accessibility(pid)
+
+        try:
+            windows = self._browser_window_roots(ax_app)
+            trees = []
+            for window_index, window in windows:
+                # Bound each window independently so one complex window cannot
+                # consume the traversal budget for every later window.
+                self._reset_traversal_state()
+                tree = self._element_to_ui(window, 0, max_depth)
+                if tree is not None:
+                    tree.window_index = window_index
+                    trees.append(tree)
+            return trees
+        finally:
+            self._include_web_content = True
+
+    def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:
+        if element.platform_ref is None:
+            return None
+        self._load()
+        self._include_web_content = True
+        self.reset_ids()
+        return self._element_to_ui(element.platform_ref, 0, max_depth)
+
+    def is_element_selected(self, element: UIElement) -> bool:
+        if element.platform_ref is None:
+            return False
+        self._load()
+        try:
+            if bool(self._read_attr(element.platform_ref, "AXSelected")):
+                return True
+            if bool(self._read_attr(element.platform_ref, "AXFocused")):
+                return True
+            value = self._read_attr(element.platform_ref, "AXValue")
+            return isinstance(value, (bool, int, float)) and bool(value)
+        except Exception:
+            return False
+
+    def _browser_window_roots(self, ax_app) -> list[tuple[int, object]]:
+        """Return unique AX window roots, rejecting app/menu proxy cycles."""
+        roots: list[tuple[int, object]] = []
+        seen: set[int] = set()
+
+        def add(index: int, candidate) -> None:
+            if candidate is None:
+                return
+            key = self._element_key(candidate)
+            if key in seen:
+                return
+            role = self._normalized_role(candidate)
+            if role in {"", "application", "menu", "menubar", "menuitem"}:
+                return
+            seen.add(key)
+            roots.append((index, candidate))
+
+        for index, window in enumerate(
+            self._as_sequence(self._read_attr(ax_app, "AXWindows"))
+        ):
+            add(index, window)
+
+        if not roots:
+            add(0, self._read_attr(ax_app, "AXFocusedWindow"))
+            add(0, self._read_attr(ax_app, "AXMainWindow"))
+        return roots
 
     def find_elements(
         self, pid: int, role: str = "", name: str = "", value: str = ""
@@ -406,6 +594,46 @@ class MacOSAdapter(BaseAdapter):
             element.platform_ref, "AXFocused", True
         )
         return err == 0
+
+    def is_same_element(self, first: UIElement, second: UIElement) -> bool:
+        """Compare AXUIElement identity through Core Foundation."""
+        self._load()
+        if first.platform_ref is None or second.platform_ref is None:
+            return False
+        try:
+            return bool(self._ax.CFEqual(first.platform_ref, second.platform_ref))
+        except Exception:
+            return False
+
+    def focus_window(self, window: UIElement) -> bool:
+        """Raise one exact AX window reference."""
+        self._load()
+        if window.platform_ref is None:
+            return False
+        try:
+            return self._ax.AXUIElementPerformAction(
+                window.platform_ref,
+                "AXRaise",
+            ) == 0
+        except Exception:
+            return False
+
+    def is_window_focused(self, window: UIElement) -> bool:
+        """Compare the app's AXFocusedWindow with the requested window."""
+        self._load()
+        if window.platform_ref is None:
+            return False
+        try:
+            err, pid = self._ax.AXUIElementGetPid(window.platform_ref, None)
+            if err != 0 or not pid:
+                return False
+            app = self._ax.AXUIElementCreateApplication(pid)
+            focused = self._read_attr(app, "AXFocusedWindow")
+            return focused is not None and bool(
+                self._ax.CFEqual(window.platform_ref, focused)
+            )
+        except Exception:
+            return False
 
     def set_value(self, element: UIElement, value: str) -> bool:
         self._load()

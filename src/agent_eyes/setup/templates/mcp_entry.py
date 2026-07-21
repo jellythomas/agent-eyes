@@ -2,58 +2,66 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 
-def get_mcp_entry() -> dict:
+
+def _executable_path(executable: str | Path) -> str:
+    path = Path(executable).expanduser()
+    if not path.is_absolute():
+        raise ValueError("Agent Eyes MCP executable must be an absolute path")
+    return str(path)
+
+
+def get_mcp_entry(executable: str | Path) -> dict:
     """Return the agent-eyes MCP server config entry.
 
     Works for: Claude Desktop, Claude Code, Cursor, Cline, Roo Code, Windsurf.
     """
     return {
-        "command": "uvx",
-        "args": ["agent-eyes"],
+        "command": _executable_path(executable),
+        "args": ["serve"],
     }
 
 
-def get_mcp_entry_zed() -> dict:
+def get_mcp_entry_zed(executable: str | Path) -> dict:
     """Return agent-eyes config for Zed (uses different structure)."""
     return {
         "source": "custom",
-        "command": "uvx",
-        "args": ["agent-eyes"],
+        "command": _executable_path(executable),
+        "args": ["serve"],
     }
 
 
 # ── Tool list for Claude Code agent definitions ─────────────────────
 
 AGENT_EYES_TOOLS = [
-    "mcp__agent-eyes__eyes_status",
-    "mcp__agent-eyes__eyes_context",
-    "mcp__agent-eyes__eyes_list_apps",
-    "mcp__agent-eyes__eyes_get_focused",
-    "mcp__agent-eyes__eyes_get_tree",
-    "mcp__agent-eyes__eyes_get_subtree",
-    "mcp__agent-eyes__eyes_find",
-    "mcp__agent-eyes__eyes_element_at",
-    "mcp__agent-eyes__eyes_get_ocr_hints",
-    "mcp__agent-eyes__eyes_click",
-    "mcp__agent-eyes__eyes_type",
-    "mcp__agent-eyes__eyes_press_key",
-    "mcp__agent-eyes__eyes_hover",
-    "mcp__agent-eyes__eyes_scroll",
-    "mcp__agent-eyes__eyes_drag",
-    "mcp__agent-eyes__eyes_fill_form",
-    "mcp__agent-eyes__eyes_file_upload",
-    "mcp__agent-eyes__eyes_wait_for",
-    "mcp__agent-eyes__eyes_app",
-    "mcp__agent-eyes__eyes_window",
-    "mcp__agent-eyes__eyes_list_chrome_tabs",
-    "mcp__agent-eyes__eyes_get_web_tree",
-    "mcp__agent-eyes__eyes_navigate",
-    "mcp__agent-eyes__eyes_evaluate",
-    "mcp__agent-eyes__eyes_new_tab",
-    "mcp__agent-eyes__eyes_close_tab",
-    "mcp__agent-eyes__eyes_handle_dialog",
-    "mcp__agent-eyes__eyes_shadow",
+    "mcp__agent-eyes__status",
+    "mcp__agent-eyes__list_apps",
+    "mcp__agent-eyes__tree",
+    "mcp__agent-eyes__find",
+    "mcp__agent-eyes__click",
+    "mcp__agent-eyes__type",
+    "mcp__agent-eyes__focused",
+    "mcp__agent-eyes__list_tabs",
+    "mcp__agent-eyes__web_tree",
+    "mcp__agent-eyes__navigate",
+    "mcp__agent-eyes__js",
+    "mcp__agent-eyes__press_key",
+    "mcp__agent-eyes__wait",
+    "mcp__agent-eyes__new_tab",
+    "mcp__agent-eyes__close_tab",
+    "mcp__agent-eyes__dialog",
+    "mcp__agent-eyes__upload",
+    "mcp__agent-eyes__scroll",
+    "mcp__agent-eyes__drag",
+    "mcp__agent-eyes__fill_form",
+    "mcp__agent-eyes__hover",
+    "mcp__agent-eyes__app",
+    "mcp__agent-eyes__subtree",
+    "mcp__agent-eyes__window",
+    "mcp__agent-eyes__context",
+    "mcp__agent-eyes__shadow",
+    "mcp__agent-eyes__pierce",
 ]
 
 

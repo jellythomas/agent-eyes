@@ -1,26 +1,33 @@
 """Cross-platform utilities for agent-eyes.
 
-Provides platform-agnostic browser detection, CDP auto-discovery,
-and Chrome launch instructions. Works on macOS, Linux, and Windows.
+Provides platform-agnostic browser detection, optional CDP discovery,
+and URL opening. Works on macOS, Linux, and Windows.
 """
 from __future__ import annotations
 
 import functools
+import logging
 import os
-import socket
 import sys
 import subprocess
-import time
 from pathlib import Path
+
+
+logger = logging.getLogger("agent-eyes")
 
 
 # ── Browser detection ──────────────────────────────────────────────
 
-# Known Chromium-based browser process names (lowercase)
-_CHROMIUM_BROWSERS = (
+# Known browser process names (lowercase). This is used only to tell native
+# accessibility adapters to retain web-document content; it does not select a
+# browser protocol or debugging endpoint.
+_BROWSER_PROCESSES = (
     "google chrome", "google-chrome", "chrome", "chromium", "chromium-browser",
-    "brave", "brave browser", "microsoft edge", "msedge", "arc",
+    "brave", "brave browser", "brave-browser", "microsoft edge", "microsoft-edge", "msedge", "arc",
     "vivaldi", "opera", "opera gx",
+    "safari", "safari technology preview", "firefox", "firefox developer edition",
+    "librewolf", "waterfox", "floorp", "zen", "zen browser", "zen-browser",
+    "duckduckgo", "orion", "dia",
 )
 
 
@@ -63,9 +70,11 @@ def _get_process_name_windows(pid: int) -> str:
 
 
 def is_browser_pid(pid: int) -> bool:
-    """Check if a PID belongs to a Chromium-based browser. Cross-platform."""
-    name = get_process_name(pid).lower()
-    return any(b in name for b in _CHROMIUM_BROWSERS)
+    """Check if a PID belongs to a known browser family. Cross-platform."""
+    executable = Path(get_process_name(pid)).name.casefold()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    return executable in _BROWSER_PROCESSES
 
 
 # ── CDP auto-discovery ─────────────────────────────────────────────
@@ -201,25 +210,16 @@ def open_url_in_browser(url: str) -> tuple[bool, str]:
     """Open a URL in the system browser. Works on macOS, Windows, Linux.
 
     Uses Python's stdlib ``webbrowser`` module which handles all platform
-    detection internally. If Chrome is already running, it opens a new tab.
+    detection internally and respects the user's selected default browser.
     Returns (success: bool, message: str).
     """
     import webbrowser
 
     try:
-        # Try Chrome/Chromium first via registered browser names
-        for name in ("google-chrome", "chrome", "chromium", "chromium-browser"):
-            try:
-                browser = webbrowser.get(name)
-                if browser.open_new_tab(url):
-                    return True, f"Opened in Chrome: {url}"
-            except webbrowser.Error:
-                continue
-
-        # Fallback to system default browser
         if webbrowser.open_new_tab(url):
-            return True, f"Opened in default browser: {url}"
+            return True, "Opened the requested URL in the default browser."
 
-        return False, "No browser found. Install Google Chrome or Chromium."
-    except Exception as e:
-        return False, f"Failed to open URL: {e}"
+        return False, "The operating system did not provide a default browser."
+    except Exception as exc:
+        logger.debug("Default-browser open failed (%s)", type(exc).__name__)
+        return False, "The operating system could not open the requested URL."

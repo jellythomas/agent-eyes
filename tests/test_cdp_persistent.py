@@ -11,6 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent_eyes.cdp import (
+    _MAX_PIERCED_DOM_NODES,
+    _PIERCED_CONTROL_SELECTOR,
+    _PIERCED_SELECTOR_DEPTH,
+)
 from agent_eyes.cdp_persistent import CDPConnection, CDPSession, ChromeTab
 
 
@@ -200,11 +205,196 @@ class TestCDPSessionDomainCaching:
             await session.enable_domain("DOM")
             await session.enable_domain("DOM")  # second call — must NOT resend
             assert session.send.call_count == 1
-            session.send.assert_called_once_with("DOM.enable")
+            session.send.assert_called_once_with("DOM.enable", idempotent=True)
 
         loop.run_until_complete(run())
         loop.close()
 
+
+class TestCDPSessionDomSearch:
+    def test_query_is_protocol_data_and_results_keep_backend_identity(self):
+        async def run():
+            session = CDPSession("s-search", MagicMock())
+            query = 'button[data-name="] ; globalThis.pwned = true; //"]'
+
+            async def send(method, params=None, *, idempotent=False):
+                if method == "DOM.performSearch":
+                    assert params == {
+                        "query": query,
+                        "includeUserAgentShadowDOM": True,
+                    }
+                    assert idempotent is True
+                    return {"searchId": "search-1", "resultCount": 2}
+                if method == "DOM.getSearchResults":
+                    assert params == {
+                        "searchId": "search-1",
+                        "fromIndex": 0,
+                        "toIndex": 2,
+                    }
+                    assert idempotent is True
+                    return {"nodeIds": [11, 12]}
+                if method == "DOM.describeNode":
+                    assert idempotent is True
+                    node_id = params["nodeId"]
+                    return {
+                        "node": {
+                            "nodeId": node_id,
+                            "backendNodeId": node_id + 100,
+                            "nodeType": 1,
+                            "nodeName": "BUTTON",
+                            "attributes": ["aria-label", f"Button {node_id}"],
+                        }
+                    }
+                if method == "DOM.discardSearchResults":
+                    assert params == {"searchId": "search-1"}
+                    assert idempotent is False
+                    return {}
+                raise AssertionError(method)
+
+            session.enable_domain = AsyncMock()
+            session.send = AsyncMock(side_effect=send)
+
+            nodes = await session.search_dom(query)
+
+            session.enable_domain.assert_awaited_once_with("DOM")
+            assert [node["backendNodeId"] for node in nodes] == [111, 112]
+
+        asyncio.run(run())
+
+
+class TestCDPSessionPiercedDocument:
+    def test_named_control_search_is_capped_before_node_conversion(self):
+        async def run():
+            session = CDPSession("s-pierce", MagicMock())
+            session.search_dom = AsyncMock(
+                return_value=[
+                    {"nodeId": 2, "backendNodeId": 20},
+                    {"nodeId": 3, "backendNodeId": 30},
+                ]
+            )
+
+            nodes = await session.get_pierced_dom()
+
+            session.search_dom.assert_awaited_once_with(
+                _PIERCED_CONTROL_SELECTOR,
+                max_results=_MAX_PIERCED_DOM_NODES,
+            )
+            assert [node["backendNodeId"] for node in nodes] == [20, 30]
+
+        asyncio.run(run())
+
+    def test_mutation_helpers_dispatch_once_without_idempotent_replay(self):
+        async def run():
+            session = CDPSession("s-mutate", MagicMock())
+            session.send = AsyncMock(return_value={})
+
+            await session.press_key("Enter", ["Shift"])
+            await session.scroll(10, 20, 0, 300)
+            await session.handle_dialog(True, "answer")
+            await session.set_file_input(77, ["/tmp/example.txt"])
+
+            methods = [call.args[0] for call in session.send.await_args_list]
+            assert methods == [
+                "Input.dispatchKeyEvent",
+                "Input.dispatchKeyEvent",
+                "Input.dispatchMouseEvent",
+                "Page.handleJavaScriptDialog",
+                "DOM.setFileInputFiles",
+            ]
+            assert all(
+                call.kwargs.get("idempotent", False) is False
+                for call in session.send.await_args_list
+            )
+
+        asyncio.run(run())
+
+    def test_pierce_selector_scopes_describe_to_exact_search_matches(self):
+        async def run():
+            session = CDPSession("s-selector", MagicMock())
+            session.search_dom = AsyncMock(
+                return_value=[{"nodeId": 10, "backendNodeId": 20}]
+            )
+            session.send = AsyncMock(
+                return_value={
+                    "node": {
+                        "nodeId": 10,
+                        "backendNodeId": 20,
+                        "shadowRoots": [
+                            {
+                                "nodeId": 11,
+                                "backendNodeId": 21,
+                                "nodeType": 1,
+                                "nodeName": "BUTTON",
+                                "attributes": ["aria-label", "Inside"],
+                            }
+                        ],
+                    }
+                }
+            )
+
+            nodes = await session.pierce_selector("custom-shell")
+
+            session.search_dom.assert_awaited_once_with(
+                "custom-shell",
+                max_results=20,
+            )
+            session.send.assert_awaited_once_with(
+                "DOM.describeNode",
+                {
+                    "backendNodeId": 20,
+                    "depth": _PIERCED_SELECTOR_DEPTH,
+                    "pierce": True,
+                },
+                idempotent=True,
+            )
+            assert [node["backendNodeId"] for node in nodes] == [20, 21]
+
+        asyncio.run(run())
+
+    def test_result_count_is_capped_and_search_is_always_discarded(self):
+        async def run():
+            session = CDPSession("s-search", MagicMock())
+
+            async def send(method, params=None, *, idempotent=False):
+                if method == "DOM.performSearch":
+                    return {"searchId": "search-2", "resultCount": 10_000}
+                if method == "DOM.getSearchResults":
+                    assert params["toIndex"] == 3
+                    return {"nodeIds": [1, 2, 3]}
+                if method == "DOM.describeNode":
+                    raise RuntimeError("describe failed")
+                if method == "DOM.discardSearchResults":
+                    return {}
+                raise AssertionError(method)
+
+            session.enable_domain = AsyncMock()
+            session.send = AsyncMock(side_effect=send)
+
+            with pytest.raises(RuntimeError, match="describe failed"):
+                await session.search_dom("button", max_results=3)
+
+            assert any(
+                call.args[0] == "DOM.discardSearchResults"
+                for call in session.send.await_args_list
+            )
+
+        asyncio.run(run())
+
+    @pytest.mark.parametrize("query", ["", "   ", None])
+    def test_empty_queries_fail_before_protocol_dispatch(self, query):
+        async def run():
+            session = CDPSession("s-search", MagicMock())
+            session.send = AsyncMock()
+
+            with pytest.raises(ValueError, match="non-empty"):
+                await session.search_dom(query)
+
+            session.send.assert_not_awaited()
+
+        asyncio.run(run())
+
+
+class TestCDPSessionDomainCachingAdditional:
     def test_different_domains_each_enabled_once(self):
         loop = asyncio.new_event_loop()
 
@@ -361,6 +551,27 @@ class TestCDPConnectionOnDetached:
         assert conn._tabs[0].id == "t2"
         assert "s2" in conn._sessions
 
+    def test_late_detach_for_replaced_session_keeps_current_target_binding(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "session-old")
+        self._attach(conn, "t1", "session-new")
+
+        conn._on_detached({"sessionId": "session-old", "targetId": "t1"})
+
+        current = conn.get_session_for_target("t1")
+        assert current is not None
+        assert current.session_id == "session-new"
+        assert len(conn.list_tabs()) == 1
+
+    def test_detach_can_resolve_target_from_session_identity(self):
+        conn = CDPConnection()
+        self._attach(conn, "t1", "s1")
+
+        conn._on_detached({"sessionId": "s1"})
+
+        assert conn.get_session_for_target("t1") is None
+        assert conn.list_tabs() == []
+
 
 class TestCDPConnectionGetSessionForTab:
     def _attach(self, conn: CDPConnection, target_id: str, session_id: str) -> None:
@@ -395,6 +606,75 @@ class TestCDPConnectionGetSessionForTab:
         s1 = conn.get_session_for_tab(1)
         assert s0.session_id == "s1"
         assert s1.session_id == "s2"
+
+
+class TestCDPConnectionGetSessionForTarget:
+    @staticmethod
+    def _attach(
+        conn: CDPConnection,
+        target_id: str,
+        session_id: str,
+        *,
+        url: str = "https://example.com",
+        title: str = "Tab",
+    ) -> None:
+        conn._on_attached({
+            "sessionId": session_id,
+            "targetInfo": {
+                "targetId": target_id,
+                "type": "page",
+                "url": url,
+                "title": title,
+                "webSocketDebuggerUrl": "",
+            },
+        })
+
+    def test_target_id_lookup_does_not_confuse_duplicate_urls(self):
+        conn = CDPConnection()
+        self._attach(conn, "target-a", "session-a", url="https://example.com/same")
+        self._attach(conn, "target-b", "session-b", url="https://example.com/same")
+
+        session_a = conn.get_session_for_target("target-a")
+        session_b = conn.get_session_for_target("target-b")
+
+        assert session_a is not None
+        assert session_b is not None
+        assert session_a.session_id == "session-a"
+        assert session_b.session_id == "session-b"
+        assert session_a.target_id == "target-a"
+        assert session_b.target_id == "target-b"
+
+    def test_reattaching_same_target_rebinds_without_duplicate_tab(self):
+        conn = CDPConnection()
+        self._attach(conn, "target-a", "session-old", title="Before")
+        old_session = conn.get_session_for_target("target-a")
+
+        self._attach(conn, "target-a", "session-new", title="After")
+
+        rebound = conn.get_session_for_target("target-a")
+        assert rebound is not None
+        assert rebound is not old_session
+        assert rebound.session_id == "session-new"
+        assert len(conn.list_tabs()) == 1
+        assert conn.list_tabs()[0].title == "After"
+        assert conn.list_tabs()[0].session_id == "session-new"
+        assert "session-old" not in conn._sessions
+
+    def test_duplicate_attach_event_preserves_existing_session_object(self):
+        conn = CDPConnection()
+        self._attach(conn, "target-a", "session-a", title="Before")
+        original = conn.get_session_for_target("target-a")
+
+        self._attach(conn, "target-a", "session-a", title="After")
+
+        assert conn.get_session_for_target("target-a") is original
+        assert len(conn.list_tabs()) == 1
+        assert conn.list_tabs()[0].title == "After"
+
+    def test_unknown_target_returns_none(self):
+        conn = CDPConnection()
+
+        assert conn.get_session_for_target("missing") is None
 
 
 class TestCDPConnectionMessageIdMonotonicity:
@@ -452,6 +732,37 @@ class TestCDPConnectionConnectWithMock:
         loop.run_until_complete(run())
         loop.close()
 
+    def test_connect_enables_target_discovery_for_metadata_updates(self):
+        async def run():
+            conn = CDPConnection()
+            ws = self._make_fake_ws()
+            calls: list[tuple[str, dict | None]] = []
+
+            async def fake_connect(url, **kwargs):
+                return ws
+
+            async def fake_send_browser(method, params=None):
+                calls.append((method, params))
+                return {}
+
+            conn._send_browser = fake_send_browser
+            with patch("websockets.connect", new=fake_connect):
+                await conn.connect("ws://127.0.0.1:9222/json/version")
+            await conn.disconnect()
+            return calls
+
+        calls = asyncio.run(run())
+
+        assert ("Target.setDiscoverTargets", {"discover": True}) in calls
+        assert (
+            "Target.setAutoAttach",
+            {
+                "autoAttach": True,
+                "waitForDebuggerOnStart": False,
+                "flatten": True,
+            },
+        ) in calls
+
     def test_disconnect_sets_not_connected(self):
         loop = asyncio.new_event_loop()
 
@@ -503,6 +814,107 @@ class TestCDPConnectionConnectWithMock:
         loop.close()
         assert call_count == 1
 
+    def test_concurrent_ensure_connected_is_single_flight(self):
+        async def run():
+            conn = CDPConnection()
+            discover_calls = 0
+            ws_calls = 0
+            connect_calls = 0
+
+            def discover_port():
+                nonlocal discover_calls
+                discover_calls += 1
+                return 9222
+
+            async def get_ws_url(port):
+                nonlocal ws_calls
+                ws_calls += 1
+                await asyncio.sleep(0)
+                return "ws://127.0.0.1:9222/devtools/browser/one"
+
+            async def connect_locked(url):
+                nonlocal connect_calls
+                connect_calls += 1
+                await asyncio.sleep(0)
+                conn._connected = True
+
+            conn._discover_port = discover_port
+            conn._get_browser_ws_url = get_ws_url
+            conn._connect_locked = connect_locked
+
+            await asyncio.gather(*(conn.ensure_connected() for _ in range(32)))
+
+            assert discover_calls == 1
+            assert ws_calls == 1
+            assert connect_calls == 1
+
+        asyncio.run(run())
+
+
+class TestCDPConnectionLifecycleStress:
+    @staticmethod
+    def _attach(conn: CDPConnection, target_id: str, session_id: str) -> None:
+        conn._on_attached(
+            {
+                "sessionId": session_id,
+                "targetInfo": {
+                    "targetId": target_id,
+                    "type": "page",
+                    "url": f"https://example.test/{target_id}",
+                    "title": target_id,
+                },
+            }
+        )
+
+    def test_ten_thousand_unique_attach_detach_cycles_leave_no_state(self):
+        conn = CDPConnection()
+        conn._generation = 1
+
+        for index in range(10_000):
+            target_id = f"target-{index}"
+            session_id = f"session-{index}"
+            self._attach(conn, target_id, session_id)
+            conn._on_detached(
+                {"targetId": target_id, "sessionId": session_id}
+            )
+
+        assert conn._sessions == {}
+        assert conn._tabs == []
+        assert conn._tab_by_target == {}
+        assert conn._target_waiters == {}
+
+    def test_ten_thousand_rebinds_keep_one_current_target_then_detach_cleanly(self):
+        conn = CDPConnection()
+        conn._generation = 1
+
+        for index in range(10_000):
+            self._attach(conn, "same-target", f"session-{index}")
+
+        assert len(conn._sessions) == 1
+        assert len(conn._tabs) == 1
+        assert list(conn._tab_by_target) == ["same-target"]
+
+        conn._on_detached(
+            {"targetId": "same-target", "sessionId": "session-9999"}
+        )
+
+        assert conn._sessions == {}
+        assert conn._tabs == []
+        assert conn._tab_by_target == {}
+
+    def test_failed_browser_send_reclaims_pending_future(self):
+        async def run():
+            conn = CDPConnection()
+            conn._ws = MagicMock()
+            conn._ws.send = AsyncMock(side_effect=ConnectionError("closed"))
+
+            with pytest.raises(ConnectionError, match="closed"):
+                await conn._send_browser("Target.setAutoAttach")
+
+            assert conn._browser_pending == {}
+
+        asyncio.run(run())
+
 
 class TestCDPConnectionReadLoop:
     """Test that the read loop dispatches messages correctly."""
@@ -536,6 +948,49 @@ class TestCDPConnectionReadLoop:
 
         loop.run_until_complete(run())
         loop.close()
+
+    def test_target_info_changed_refreshes_existing_tab_metadata(self):
+        async def run():
+            conn = CDPConnection()
+            conn._on_attached(
+                {
+                    "sessionId": "sess-1",
+                    "targetInfo": {
+                        "targetId": "t1",
+                        "type": "page",
+                        "url": "https://before.test",
+                        "title": "Before",
+                    },
+                }
+            )
+            ws = FakeWebSocket()
+            conn._ws = ws
+            conn._connected = True
+            task = asyncio.create_task(conn._read_loop())
+            ws.push(
+                make_event(
+                    "Target.targetInfoChanged",
+                    {
+                        "targetInfo": {
+                            "targetId": "t1",
+                            "type": "page",
+                            "url": "https://after.test",
+                            "title": "After",
+                        }
+                    },
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await task
+            return conn.list_tabs()[0]
+
+        tab = asyncio.run(run())
+
+        assert tab.id == "t1"
+        assert tab.url == "https://after.test"
+        assert tab.title == "After"
+        assert tab.session_id == "sess-1"
 
     def test_detached_event_removes_session(self):
         loop = asyncio.new_event_loop()

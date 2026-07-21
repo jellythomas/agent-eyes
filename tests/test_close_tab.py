@@ -1,239 +1,213 @@
-"""Tests for _handle_close_tab safety fixes — title matching, force refresh, transparency.
-
-These tests exercise the logic extracted from server._handle_close_tab and
-server._handle_navigate. Since server.py has deep platform-specific imports
-(macOS AXUIElement, pywinauto, etc.) that cannot run in CI without the full
-OS stack, we test the pure logic in isolation and verify integration via
-behavioural contract tests that monkey-patch the module globals.
-"""
+from __future__ import annotations
 
 import asyncio
-import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+from agent_eyes.adapters.base import UIElement
+from agent_eyes.browser_inventory import BrowserTarget
+from agent_eyes.coordinator import AutomationCoordinator
 
 
-# ---------------------------------------------------------------------------
-# Pure logic extracted from the new _handle_close_tab implementation.
-# These functions mirror exactly what will be in server.py so that the
-# contract between test and implementation is tight.
-# ---------------------------------------------------------------------------
+def test_foreground_close_rejects_positional_index_before_inventory(monkeypatch):
+    from agent_eyes import server
 
-def _find_tab_by_title(cached_tabs, title_query):
-    """Return (idx, tab, error_str).
+    inventory = MagicMock(side_effect=AssertionError("inventory must not be queried"))
+    monkeypatch.setattr(server, "collect_browser_targets", inventory)
 
-    Replicates the title-matching branch of the new _handle_close_tab.
-    Returns (idx, tab, "") on unambiguous match.
-    Returns (None, None, error_str) on no match or ambiguous match.
-    """
-    query_lower = title_query.lower()
-    matches = [
-        (i, t) for i, t in enumerate(cached_tabs)
-        if query_lower in t.title.lower()
+    result = asyncio.run(server._handle_close_tab({"tab_index": 0}))
+
+    assert "does not accept positional tab_index" in result
+    inventory.assert_not_called()
+
+
+def test_foreground_close_requires_stable_target_or_unique_title(monkeypatch):
+    from agent_eyes import server
+
+    monkeypatch.setattr(server, "native_adapter", object())
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [])
+
+    result = asyncio.run(server._handle_close_tab({}))
+
+    assert result == "ERROR: Provide target_id or a unique title from a fresh list_tabs result."
+
+
+def test_foreground_close_rejects_ambiguous_title_without_activation(monkeypatch):
+    from agent_eyes import server
+
+    targets = [
+        BrowserTarget(browser="Firefox", pid=10, title="YouTube - Home"),
+        BrowserTarget(browser="Safari", pid=20, title="YouTube Music"),
     ]
-    if not matches:
-        tab_list = "\n".join(
-            f"  [{i}] {t.title} — {t.url}" for i, t in enumerate(cached_tabs)
-        )
-        return None, None, f"ERROR: No tab matching '{title_query}'. Open tabs:\n{tab_list}"
-    if len(matches) > 1:
-        match_list = "\n".join(
-            f"  [{i}] {t.title} — {t.url}" for i, t in matches
-        )
-        return None, None, (
-            f"ERROR: Multiple tabs match '{title_query}'. "
-            f"Specify tab_index to close the correct one:\n{match_list}"
-        )
-    idx, tab = matches[0]
-    return idx, tab, ""
+    activate = AsyncMock(side_effect=AssertionError("ambiguous target must not activate"))
+    monkeypatch.setattr(server, "native_adapter", object())
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: targets)
+    monkeypatch.setattr(server, "_activate_browser_target_and_wait", activate)
+
+    result = asyncio.run(server._handle_close_tab({"title": "youtube"}))
+
+    assert "2 foreground tabs matched" in result
+    assert "use target_id" in result
+    activate.assert_not_awaited()
 
 
-def _make_tab(title, url, tab_id="1"):
-    tab = MagicMock()
-    tab.title = title
-    tab.url = url
-    tab.id = tab_id
-    return tab
+def test_foreground_close_invalidates_native_state_after_confirmed_shortcut(monkeypatch):
+    from agent_eyes import server
+
+    target = BrowserTarget(
+        browser="Firefox",
+        pid=42,
+        title="Exact target",
+        element=UIElement(id=1, role="tab", platform_ref=object()),
+        window_element=UIElement(id=2, role="window", platform_ref=object()),
+    )
+    backend = MagicMock()
+    backend.is_available.return_value = True
+    backend.hotkey.return_value = True
+    invalidate = MagicMock()
+    adapter = MagicMock()
+    adapter.is_element_valid.return_value = True
+    adapter.is_window_focused.return_value = True
+    adapter.is_element_selected.return_value = True
+    monkeypatch.setattr(server, "native_adapter", adapter)
+    monkeypatch.setattr(server, "_input_backend", backend)
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
+    monkeypatch.setattr(
+        server,
+        "_activate_browser_target_and_wait",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(server, "_invalidate_native_mutation_state", invalidate)
+
+    result = asyncio.run(server._handle_close_tab({"target_id": target.identifier}))
+
+    assert result == "Closed foreground Firefox tab."
+    invalidate.assert_called_once_with(pid=42)
 
 
-# ---------------------------------------------------------------------------
-# Tests for title-matching logic
-# ---------------------------------------------------------------------------
+def test_foreground_close_rejects_window_only_target_without_shortcut(monkeypatch):
+    from agent_eyes import server
 
-class TestFindTabByTitle(unittest.TestCase):
-    """Unit tests for the title-matching algorithm."""
+    window = UIElement(id=2, role="window", platform_ref=object())
+    target = BrowserTarget(
+        browser="Firefox",
+        pid=42,
+        title="Window only",
+        source="native-window",
+        element=window,
+        window_element=window,
+    )
+    backend = MagicMock()
+    monkeypatch.setattr(server, "native_adapter", MagicMock())
+    monkeypatch.setattr(server, "_input_backend", backend)
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
 
-    def test_single_exact_match_returns_correct_index(self):
-        tabs = [_make_tab("GitHub", "https://github.com"), _make_tab("YouTube", "https://youtube.com")]
-        idx, tab, err = _find_tab_by_title(tabs, "YouTube")
-        self.assertEqual(idx, 1)
-        self.assertEqual(tab.title, "YouTube")
-        self.assertEqual(err, "")
+    result = asyncio.run(server._handle_close_tab({"target_id": target.identifier}))
 
-    def test_case_insensitive_match(self):
-        tabs = [_make_tab("YouTube - Home", "https://youtube.com")]
-        idx, tab, err = _find_tab_by_title(tabs, "youtube")
-        self.assertEqual(idx, 0)
-        self.assertEqual(err, "")
-
-    def test_partial_substring_match(self):
-        tabs = [_make_tab("YouTube - Home", "https://youtube.com")]
-        idx, tab, err = _find_tab_by_title(tabs, "Tube")
-        self.assertEqual(idx, 0)
-        self.assertEqual(err, "")
-
-    def test_no_match_returns_error_with_tab_list(self):
-        tabs = [_make_tab("GitHub", "https://github.com")]
-        idx, tab, err = _find_tab_by_title(tabs, "YouTube")
-        self.assertIsNone(idx)
-        self.assertIsNone(tab)
-        self.assertIn("ERROR", err)
-        self.assertIn("YouTube", err)
-        self.assertIn("GitHub", err)  # open tabs listed in error
-
-    def test_multiple_matches_returns_error_with_all_matches(self):
-        tabs = [
-            _make_tab("YouTube - Home", "https://youtube.com"),
-            _make_tab("YouTube Music", "https://music.youtube.com"),
-            _make_tab("GitHub", "https://github.com"),
-        ]
-        idx, tab, err = _find_tab_by_title(tabs, "YouTube")
-        self.assertIsNone(idx)
-        self.assertIn("ERROR", err)
-        self.assertIn("Multiple", err)
-        self.assertIn("[0]", err)
-        self.assertIn("[1]", err)
-
-    def test_empty_tab_list_returns_error(self):
-        idx, tab, err = _find_tab_by_title([], "YouTube")
-        self.assertIsNone(idx)
-        self.assertIn("ERROR", err)
-
-    def test_match_at_index_0(self):
-        tabs = [_make_tab("YouTube", "https://youtube.com"), _make_tab("GitHub", "https://github.com")]
-        idx, tab, err = _find_tab_by_title(tabs, "YouTube")
-        self.assertEqual(idx, 0)
-        self.assertEqual(err, "")
-
-    def test_error_includes_tab_list_on_no_match(self):
-        tabs = [
-            _make_tab("Tab A", "https://a.com"),
-            _make_tab("Tab B", "https://b.com"),
-        ]
-        _, _, err = _find_tab_by_title(tabs, "Nonexistent")
-        self.assertIn("[0]", err)
-        self.assertIn("[1]", err)
-        self.assertIn("Tab A", err)
-        self.assertIn("Tab B", err)
+    assert "UNSUPPORTED_CAPABILITY" in result
+    backend.hotkey.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Behavioural contract tests for close_tab handler
-# ---------------------------------------------------------------------------
+def test_foreground_close_rechecks_exact_window_and_tab_before_shortcut(monkeypatch):
+    from agent_eyes import server
 
-class TestCloseTabHandlerContract(unittest.IsolatedAsyncioTestCase):
-    """Verify the expected behaviour of _handle_close_tab via the pure logic."""
+    target = BrowserTarget(
+        browser="Firefox",
+        pid=42,
+        title="Exact target",
+        element=UIElement(id=1, role="tab", platform_ref=object()),
+        window_element=UIElement(id=2, role="window", platform_ref=object()),
+    )
+    adapter = MagicMock()
+    adapter.is_element_valid.return_value = True
+    adapter.is_window_focused.return_value = False
+    adapter.is_element_selected.return_value = True
+    backend = MagicMock()
+    backend.is_available.return_value = True
+    monkeypatch.setattr(server, "native_adapter", adapter)
+    monkeypatch.setattr(server, "_input_backend", backend)
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
+    monkeypatch.setattr(
+        server,
+        "_activate_browser_target_and_wait",
+        AsyncMock(return_value=True),
+    )
 
-    async def _simulate_close_tab(self, cached_tabs, args, cdp_success=True):
-        """Simulate _handle_close_tab logic inline — mirrors server.py implementation."""
-        title_query = args.get("title")
-        idx = args.get("tab_index")
+    result = asyncio.run(server._handle_close_tab({"target_id": target.identifier}))
 
-        if title_query:
-            found_idx, tab, err = _find_tab_by_title(cached_tabs, title_query)
-            if err:
-                return err, cached_tabs
-            idx, tab = found_idx, tab
-        else:
-            if idx is None:
-                idx = 0
-            if not isinstance(idx, int) or idx < 0 or idx >= len(cached_tabs):
-                return f"ERROR: Tab index {idx} out of range. {len(cached_tabs)} tab(s) available.", cached_tabs
-            tab = cached_tabs[idx]
-
-        tab_title = getattr(tab, "title", "unknown")
-        tab_url = getattr(tab, "url", "unknown")
-
-        if cdp_success:
-            cached_tabs = list(cached_tabs)
-            cached_tabs.pop(idx)
-            return f"Closed tab [{idx}]: {tab_title}\n  URL: {tab_url}", cached_tabs
-        return f"ERROR: Could not close tab [{idx}]: {tab_title} — {tab_url}", cached_tabs
-
-    async def test_success_response_includes_index_title_url(self):
-        tabs = [_make_tab("YouTube - Home", "https://youtube.com/feed/subscriptions")]
-        result, _ = await self._simulate_close_tab(tabs, {"title": "YouTube"})
-        self.assertIn("Closed tab [0]", result)
-        self.assertIn("YouTube - Home", result)
-        self.assertIn("youtube.com", result)
-
-    async def test_tab_removed_from_cache_on_success(self):
-        tabs = [_make_tab("GitHub", "https://github.com"), _make_tab("YouTube", "https://youtube.com")]
-        _, remaining = await self._simulate_close_tab(tabs, {"title": "YouTube"})
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0].title, "GitHub")
-
-    async def test_cdp_failure_includes_tab_details(self):
-        tabs = [_make_tab("YouTube", "https://youtube.com")]
-        result, remaining = await self._simulate_close_tab(tabs, {"title": "YouTube"}, cdp_success=False)
-        self.assertIn("ERROR", result)
-        self.assertIn("YouTube", result)
-        self.assertIn("youtube.com", result)
-        self.assertEqual(len(remaining), 1)  # cache not mutated on failure
-
-    async def test_index_based_close_default_0(self):
-        tabs = [_make_tab("GitHub", "https://github.com")]
-        result, _ = await self._simulate_close_tab(tabs, {})
-        self.assertIn("Closed tab [0]", result)
-
-    async def test_index_out_of_range_returns_error(self):
-        tabs = [_make_tab("GitHub", "https://github.com")]
-        result, remaining = await self._simulate_close_tab(tabs, {"tab_index": 5})
-        self.assertIn("ERROR", result)
-        self.assertEqual(len(remaining), 1)  # cache unchanged
-
-    async def test_no_match_does_not_mutate_cache(self):
-        tabs = [_make_tab("GitHub", "https://github.com")]
-        result, remaining = await self._simulate_close_tab(tabs, {"title": "Nonexistent"})
-        self.assertIn("ERROR", result)
-        self.assertEqual(len(remaining), 1)
-
-    async def test_multiple_matches_does_not_mutate_cache(self):
-        tabs = [
-            _make_tab("YouTube - Home", "https://youtube.com"),
-            _make_tab("YouTube Music", "https://music.youtube.com"),
-        ]
-        result, remaining = await self._simulate_close_tab(tabs, {"title": "YouTube"})
-        self.assertIn("ERROR", result)
-        self.assertIn("Multiple", result)
-        self.assertEqual(len(remaining), 2)
+    assert "FOCUS_MISMATCH" in result
+    backend.hotkey.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Force-refresh contract — documented expectation for server.py
-# ---------------------------------------------------------------------------
+def test_shadow_close_requires_exact_target_before_provider_probe(monkeypatch):
+    from agent_eyes import server
 
-class TestForceRefreshContract(unittest.TestCase):
-    """Document the force=True contract for destructive operations.
+    provider = AsyncMock(side_effect=AssertionError("provider must not be queried"))
+    monkeypatch.setattr(server, "_get_cdp_session", provider)
 
-    These tests verify the interface contract: _handle_close_tab and
-    _handle_navigate must pass force=True to _ensure_tabs. The actual
-    enforcement is in the integration (server.py), but these tests capture
-    the requirement so it cannot silently regress.
-    """
+    result = asyncio.run(server._handle_close_tab({"shadow": True}))
 
-    def test_close_tab_must_pass_force_true_to_ensure_tabs(self):
-        """_handle_close_tab contract: always refresh tab list before closing."""
-        # This documents that the function must call _ensure_tabs(force=True).
-        # Verified by reading server.py line: err = await _ensure_tabs(force=True)
-        # See: src/agent_eyes/server.py _handle_close_tab
-        self.assertTrue(True, "Contract: _handle_close_tab calls _ensure_tabs(force=True)")
-
-    def test_navigate_must_pass_force_true_to_ensure_tabs(self):
-        """_handle_navigate contract: always refresh tab list before navigating."""
-        # Verified by reading server.py line: err = await _ensure_tabs(force=True)
-        # See: src/agent_eyes/server.py _handle_navigate
-        self.assertTrue(True, "Contract: _handle_navigate calls _ensure_tabs(force=True)")
+    assert "requires target_id" in result
+    provider.assert_not_awaited()
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_shadow_close_success_invalidates_target_and_removes_cached_tab(monkeypatch):
+    from agent_eyes import server
+
+    target_id = "target-b"
+    session = MagicMock()
+    tab_a = MagicMock(id="target-a")
+    tab_b = MagicMock(id=target_id)
+    invalidate = MagicMock()
+    apple_cache = MagicMock()
+    pool = MagicMock()
+    pool.close_target = AsyncMock(return_value=True)
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(
+        server,
+        "_get_cdp_session",
+        AsyncMock(return_value=(session, tab_b, "")),
+    )
+    monkeypatch.setattr(server, "cdp_pool", pool)
+    monkeypatch.setattr(server, "_cached_tabs", [tab_a, tab_b])
+    monkeypatch.setattr(server, "_invalidate_shadow_observation", invalidate)
+    monkeypatch.setattr(server, "_invalidate_applescript_tab_cache", apple_cache)
+
+    result = asyncio.run(
+        server._handle_close_tab({"shadow": True, "target_id": target_id})
+    )
+
+    assert result == "Closed the requested shadow target."
+    pool.close_target.assert_awaited_once_with(target_id)
+    invalidate.assert_called_once_with("cdp-persistent", target_id)
+    assert server._cached_tabs == [tab_a]
+    apple_cache.assert_called_once_with()
+
+
+def test_shadow_close_unconfirmed_outcome_invalidates_and_clears_cache(monkeypatch):
+    from agent_eyes import server
+
+    target_id = "target-b"
+    tab = MagicMock(id=target_id)
+    invalidate = MagicMock()
+    monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
+    monkeypatch.setattr(
+        server,
+        "_get_cdp_session",
+        AsyncMock(return_value=(None, tab, "")),
+    )
+    monkeypatch.setattr(server.cdp_client, "close_tab", AsyncMock(return_value=False))
+    monkeypatch.setattr(server, "_cached_tabs", [tab])
+    monkeypatch.setattr(server, "_invalidate_shadow_observation", invalidate)
+
+    result = asyncio.run(
+        server._handle_close_tab({"shadow": True, "target_id": target_id})
+    )
+
+    assert "OUTCOME_UNKNOWN" in result
+    invalidate.assert_called_once_with("cdp-legacy", target_id)
+    assert server._cached_tabs == []

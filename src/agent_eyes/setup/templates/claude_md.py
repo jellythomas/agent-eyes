@@ -5,21 +5,14 @@ CLAUDE_MD_SECTION = """
 
 **ALWAYS use `mcp__agent-eyes__*` tools for ALL browser and UI automation. NEVER use `mcp__playwright__*` or other browser automation MCP tools.**
 
-agent-eyes uses accessibility trees (no screenshots), works with browser AND native desktop apps, and supports shadow mode for background automation.
+Agent Eyes uses accessibility trees for browsers and native desktop apps. Foreground native automation is the default: scan and reuse relevant open tabs across browsers before opening a new tab. Use shadow/background mode only when explicitly requested; never require Chrome remote debugging for normal work. Use event-backed `wait` instead of fixed sleeps.
 
 Quick reference:
-- **See current state:** `eyes_context`
-- **Read web page:** `eyes_get_web_tree`
-- **Read native app:** `eyes_get_tree`
-- **Click:** `eyes_click`
-- **Type:** `eyes_type`
-- **Navigate:** `eyes_navigate`
-- **Fill form:** `eyes_fill_form`
-- **Press keys:** `eyes_press_key`
-- **Run JS:** `eyes_evaluate`
-- **Background control:** `eyes_shadow`
-- **Find elements:** `eyes_find`
-- **Manage windows:** `eyes_window`
-- **Manage apps:** `eyes_app`
-- **List tabs:** `eyes_list_chrome_tabs`
+- **Compact state:** `mcp__agent-eyes__context`
+- **All-browser tab inventory/reuse:** `mcp__agent-eyes__list_tabs`
+- **Read native UI:** `mcp__agent-eyes__tree`, `mcp__agent-eyes__find`, `mcp__agent-eyes__subtree`
+- **Act:** `mcp__agent-eyes__click`, `mcp__agent-eyes__type`, `mcp__agent-eyes__press_key`
+- **Navigate/open/close:** `mcp__agent-eyes__navigate`, `mcp__agent-eyes__new_tab`, `mcp__agent-eyes__close_tab`
+- **Completion:** `mcp__agent-eyes__wait`
+- **Explicit background/DOM:** `mcp__agent-eyes__shadow`, `mcp__agent-eyes__web_tree`, `mcp__agent-eyes__js` with explicit shadow consent
 """.strip()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import ctypes
 from .base import BaseAdapter, UIElement, AppInfo
 
 
@@ -56,7 +57,7 @@ _UIA_SCROLL_PATTERN_ID = 10004
 _UIA_EXPAND_COLLAPSE_PATTERN_ID = 10005
 
 # UIA property IDs
-_UIA_PROCESS_ID_PROPERTY_ID = 30008
+_UIA_PROCESS_ID_PROPERTY_ID = 30002
 _UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 _UIA_NAME_PROPERTY_ID = 30005
 _UIA_IS_ENABLED_PROPERTY_ID = 30010
@@ -82,6 +83,7 @@ class WindowsAdapter(BaseAdapter):
         self._root = None
         self._id_counter = 0
         self._in_web_area = False
+        self._include_web_content = True
         try:
             import comtypes
             import comtypes.client
@@ -183,23 +185,38 @@ class WindowsAdapter(BaseAdapter):
             role = _UIA_CONTROL_TYPE_NAMES.get(ctrl_type, "unknown")
             name = el.CurrentName or ""
 
+            # UI Automation requires clients to check CurrentIsPassword before
+            # querying ValuePattern. Protected controls may reject the value
+            # query, and a non-conforming provider must never leak it to us.
+            is_secure = True
+            try:
+                is_secure = bool(el.CurrentIsPassword)
+            except Exception:
+                pass
+
             # Detect entry into web content (document role)
             if role == "document":
                 in_web_area = True
                 self._in_web_area = True
-                max_depth = max(max_depth, depth + 20)
+                if getattr(self, "_include_web_content", True):
+                    max_depth = max(max_depth, depth + 20)
+                else:
+                    max_depth = depth
 
             # Get value via ValuePattern if available
             value = ""
-            try:
-                value_pattern = el.GetCurrentPattern(_UIA_VALUE_PATTERN_ID)
-                if value_pattern:
-                    value = value_pattern.CurrentValue or ""
-            except Exception:
-                pass
+            if not is_secure:
+                try:
+                    value_pattern = el.GetCurrentPattern(_UIA_VALUE_PATTERN_ID)
+                    if value_pattern:
+                        value = value_pattern.CurrentValue or ""
+                except Exception:
+                    pass
 
             # States
             states: list[str] = []
+            if is_secure:
+                states.append("secure")
             try:
                 if el.CurrentIsEnabled:
                     states.append("enabled")
@@ -279,6 +296,7 @@ class WindowsAdapter(BaseAdapter):
                  is_browser: bool = False) -> UIElement | None:
         if self._uia is None or self._root is None:
             return None
+        self._include_web_content = True
         self.reset_ids()
         try:
             condition = self._uia.CreatePropertyCondition(
@@ -290,6 +308,54 @@ class WindowsAdapter(BaseAdapter):
             return self._element_to_ui(el, 0, max_depth)
         except Exception:
             return None
+
+    def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        """Return every top-level browser window, pruning document content."""
+        if self._uia is None or self._root is None:
+            return []
+        self.reset_ids()
+        self._include_web_content = False
+        try:
+            condition = self._uia.CreatePropertyCondition(
+                _UIA_PROCESS_ID_PROPERTY_ID, pid,
+            )
+            windows = self._root.FindAll(_TREE_SCOPE_CHILDREN, condition)
+            trees = []
+            for window_index in range(windows.Length):
+                self._in_web_area = False
+                window = windows.GetElement(window_index)
+                tree = self._element_to_ui(window, 0, max_depth)
+                if tree is not None:
+                    tree.window_index = window_index
+                    trees.append(tree)
+            return trees
+        except Exception:
+            return []
+        finally:
+            self._include_web_content = True
+
+    def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:
+        if element.platform_ref is None:
+            return None
+        self._include_web_content = True
+        self.reset_ids()
+        return self._element_to_ui(element.platform_ref, 0, max_depth)
+
+    def is_element_selected(self, element: UIElement) -> bool:
+        if element.platform_ref is None:
+            return False
+        try:
+            pattern = element.platform_ref.GetCurrentPattern(
+                _UIA_SELECTION_ITEM_PATTERN_ID
+            )
+            if pattern is not None and bool(pattern.CurrentIsSelected):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(element.platform_ref.CurrentHasKeyboardFocus)
+        except Exception:
+            return False
 
     def find_elements(
         self, pid: int, role: str = "", name: str = "", value: str = ""
@@ -349,6 +415,42 @@ class WindowsAdapter(BaseAdapter):
         try:
             element.platform_ref.SetFocus()
             return True
+        except Exception:
+            return False
+
+    def is_same_element(self, first: UIElement, second: UIElement) -> bool:
+        if (
+            self._uia is None
+            or first.platform_ref is None
+            or second.platform_ref is None
+        ):
+            return False
+        try:
+            return bool(
+                self._uia.CompareElements(first.platform_ref, second.platform_ref)
+            )
+        except Exception:
+            return False
+
+    def is_element_valid(self, element: UIElement) -> bool:
+        if element.platform_ref is None:
+            return False
+        try:
+            int(element.platform_ref.CurrentProcessId)
+            return True
+        except Exception:
+            return False
+
+    def focus_window(self, window: UIElement) -> bool:
+        return self.focus_element(window)
+
+    def is_window_focused(self, window: UIElement) -> bool:
+        if window.platform_ref is None or sys.platform != "win32":
+            return False
+        try:
+            expected = int(window.platform_ref.CurrentNativeWindowHandle)
+            actual = int(ctypes.windll.user32.GetForegroundWindow())
+            return expected != 0 and expected == actual
         except Exception:
             return False
 

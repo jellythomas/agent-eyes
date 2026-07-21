@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "label": "pre-hardening-working-tree",
+  "recorded_date": "2026-07-17",
+  "git_head": "8cc5a8e",
+  "working_tree": "dirty",
+  "environment": {
+    "os": "macOS",
+    "architecture": "arm64",
+    "python": "3.12.11",
+    "uv": "0.8.19",
+    "mcp": "1.26.0"
+  },
+  "protocol": {
+    "warmups": 3,
+    "samples": 30,
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "notes": "Direct interpreter measurements unless the measurement name explicitly names the CLI or MCP process. Browser counts were not captured in the original audit and are intentionally not fabricated."
+  },
+  "latency_ms": {
+    "server_import": {
+      "median": 535.7,
+      "p95": 592.7
+    },
+    "server_import_without_import_time_providers_poc": {
+      "median": 369.1,
+      "p95": 421.3
+    },
+    "mcp_initialize_and_tools_list": {
+      "median": 476.1,
+      "p95": 584.3
+    },
+    "cli_help": {
+      "median": 45.62,
+      "p95": 48.03
+    },
+    "list_apps_warm": {
+      "median": 9.18,
+      "p95": 9.65
+    },
+    "context_warm": {
+      "median": 7.19,
+      "p95": 8.91
+    },
+    "browser_inventory_fresh_process": {
+      "median": 165.28,
+      "p95": 180.64
+    },
+    "list_tabs_warm": {
+      "median": 11.68,
+      "p95": 14.46
+    },
+    "native_event_immediate_completion": {
+      "median": 3.13,
+      "p95": 4.75
+    },
+    "format_50_browser_targets": {
+      "p95": 0.332
+    },
+    "format_1000_browser_targets": {
+      "median": 6.17,
+      "p95": 6.839
+    }
+  },
+  "verified_failures": {
+    "native_wait_requested_ms": 10,
+    "native_wait_actual_ms": 258.6,
+    "native_action_slow_registration_actual_ms": 212.7,
+    "native_action_slow_cleanup_actual_ms": 214.2,
+    "type_heartbeat_lag_ms": 197.2,
+    "type_1000_character_scheduled_sleep_ms": 20000,
+    "parallel_list_tabs_requests": 32,
+    "parallel_list_tabs_provider_calls": 32,
+    "parallel_cdp_ensure_connected_calls": 32,
+    "parallel_cdp_connect_attempts": 32,
+    "same_target_reattach_cycles": 10000,
+    "leaked_cdp_records_after_one_detach": 9999,
+    "uncapped_javascript_result_bytes": 1000008
+  },
+  "context_bytes": {
+    "tool_count": 28,
+    "tools_list_compact_json": 18881,
+    "tool_and_schema_descriptions": 12776
+  },
+  "tests": {
+    "collected": 429,
+    "passed": 429,
+    "elapsed_seconds": 6.58,
+    "reconnect_real_wait_seconds": 5.0
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "cdp_lifecycle": {"cycles": 10000, "leaked_records": 0},
+  "elapsed_seconds": 0.283,
+  "schema_version": 1,
+  "seed": 20260718,
+  "singleflight": {
+    "cancelled_waiters": 4225,
+    "leaked_flights": 0,
+    "provider_calls": 1000,
+    "schedules": 1000,
+    "wrong_results": 0
+  },
+  "target_isolation": {
+    "rejected_cross_target_resolutions": 1000,
+    "schedules": 1000,
+    "wrong_target_resolutions": 0
+  }
+}

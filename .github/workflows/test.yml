@@ -1,0 +1,80 @@
+name: Test agent-eyes
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Static and dependency gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install quality tools
+        run: python -m pip install --upgrade pip uv ruff bandit pip-audit
+      - name: Lint source and benchmarks
+        run: ruff check src benchmarks
+      - name: Reject medium and high static-security findings
+        run: bandit -r src -q -ll
+      - name: Audit the locked dependency set
+        shell: bash
+        run: |
+          audit_requirements="$(mktemp)"
+          uv export --frozen --all-groups --no-emit-project --no-hashes --format requirements-txt --output-file "$audit_requirements"
+          pip-audit --no-deps --disable-pip --requirement "$audit_requirements"
+
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install package and test dependencies
+        run: python -m pip install --upgrade pip build pytest && python -m pip install -e .
+      - name: Compile source
+        run: python -m compileall -q src
+      - name: Run tests
+        run: python -m pytest -q
+
+  package:
+    name: Build and inspect distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build distributions
+        run: python -m pip install --upgrade pip build twine && python -m build
+      - name: Check package metadata
+        run: python -m twine check dist/*

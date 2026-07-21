@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+
+import pytest
+
+from agent_eyes.operation import OperationBudget, OperationError, OperationErrorCode
+from agent_eyes.provider_worker import ProviderCallState, ProviderWorker
+
+
+def test_sync_provider_work_runs_off_the_event_loop():
+    async def run() -> None:
+        worker = ProviderWorker("test-provider")
+        caller_thread = threading.get_ident()
+
+        result = await worker.run(
+            threading.get_ident,
+            budget=OperationBudget.start(1.0),
+            operation="thread identity",
+        )
+        await worker.aclose()
+
+        assert result != caller_thread
+
+    asyncio.run(run())
+
+
+def test_four_provider_lanes_start_lazily_and_remain_single_threaded():
+    async def run() -> None:
+        marker = f"four-lane-{time.monotonic_ns()}"
+        workers = [ProviderWorker(f"{marker}-{index}") for index in range(4)]
+
+        def owned_threads() -> list[threading.Thread]:
+            prefix = f"agent-eyes-{marker}-"
+            return [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith(prefix)
+            ]
+
+        # ThreadPoolExecutor is constructed with each lane, but its sole worker
+        # thread must remain lazy until that provider is first used.
+        assert owned_threads() == []
+        try:
+            initial_thread_ids = await asyncio.gather(
+                *(
+                    worker.run(
+                        threading.get_ident,
+                        budget=OperationBudget.start(1.0),
+                        operation=f"initialize lane {index}",
+                    )
+                    for index, worker in enumerate(workers)
+                )
+            )
+
+            assert len(set(initial_thread_ids)) == 4
+            assert len(owned_threads()) == 4
+
+            repeated_thread_ids = await asyncio.gather(
+                *(
+                    workers[index].run(
+                        threading.get_ident,
+                        budget=OperationBudget.start(1.0),
+                        operation=f"reuse lane {index} call {call_index}",
+                    )
+                    for index in range(4)
+                    for call_index in range(8)
+                )
+            )
+            for index, initial_thread_id in enumerate(initial_thread_ids):
+                lane_results = repeated_thread_ids[index * 8 : (index + 1) * 8]
+                assert lane_results == [initial_thread_id] * 8
+            assert len(owned_threads()) == 4
+        finally:
+            await asyncio.gather(*(worker.aclose() for worker in workers))
+
+        assert owned_threads() == []
+
+    asyncio.run(run())
+
+
+def test_timeout_returns_promptly_and_quarantines_late_worker():
+    async def run() -> None:
+        worker = ProviderWorker("test-provider")
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_ran = threading.Event()
+        active = 0
+        max_active = 0
+        active_guard = threading.Lock()
+
+        def first() -> str:
+            nonlocal active, max_active
+            with active_guard:
+                active += 1
+                max_active = max(max_active, active)
+            first_started.set()
+            release_first.wait(timeout=1.0)
+            with active_guard:
+                active -= 1
+            return "first"
+
+        def second() -> str:
+            nonlocal active, max_active
+            with active_guard:
+                active += 1
+                max_active = max(max_active, active)
+            second_ran.set()
+            with active_guard:
+                active -= 1
+            return "second"
+
+        started = time.monotonic()
+        with pytest.raises(OperationError) as first_error:
+            await worker.run(
+                first,
+                budget=OperationBudget.start(0.01),
+                operation="slow native query",
+            )
+        elapsed = time.monotonic() - started
+        assert first_error.value.code is OperationErrorCode.DEADLINE_EXCEEDED
+        assert elapsed < 0.05
+        assert first_started.is_set()
+        assert worker.busy is True
+
+        with pytest.raises(OperationError) as second_error:
+            await worker.run(
+                second,
+                budget=OperationBudget.start(0.01),
+                operation="conflicting native action",
+            )
+        assert second_error.value.code is OperationErrorCode.DEADLINE_EXCEEDED
+        assert second_ran.is_set() is False
+
+        release_first.set()
+        await worker.wait_until_idle()
+
+        assert await worker.run(
+            second,
+            budget=OperationBudget.start(1.0),
+            operation="recovered native action",
+        ) == "second"
+        assert max_active == 1
+        await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_call_state_distinguishes_late_started_timeout_from_queue_timeout():
+    async def run() -> None:
+        worker = ProviderWorker("dispatch-state-test")
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def blocking() -> None:
+            first_started.set()
+            release_first.wait(timeout=1.0)
+
+        started_state = ProviderCallState()
+        with pytest.raises(OperationError):
+            await worker.run(
+                blocking,
+                budget=OperationBudget.start(0.01),
+                operation="late mutation",
+                state=started_state,
+            )
+
+        assert first_started.is_set()
+        assert started_state.submitted is True
+        assert started_state.started is True
+        assert started_state.may_have_run is True
+
+        queued_state = ProviderCallState()
+        with pytest.raises(OperationError):
+            await worker.run(
+                lambda: None,
+                budget=OperationBudget.start(0.01),
+                operation="queued mutation",
+                state=queued_state,
+            )
+
+        assert queued_state.submitted is False
+        assert queued_state.started is False
+        assert queued_state.may_have_run is False
+
+        release_first.set()
+        await worker.wait_until_idle()
+        await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_deadline_expiring_after_queue_acquisition_prevents_submission():
+    async def run() -> None:
+        worker = ProviderWorker("dispatch-checkpoint-test")
+        current = 0.0
+
+        def clock() -> float:
+            return current
+
+        def expire() -> None:
+            nonlocal current
+            current = 2.0
+
+        acquire_lane = worker._acquire_lane
+
+        async def acquire_then_expire(*, budget, allow_closed=False):
+            await acquire_lane(budget=budget, allow_closed=allow_closed)
+            expire()
+
+        worker._acquire_lane = acquire_then_expire
+        state = ProviderCallState()
+        applied = False
+
+        def mutation() -> None:
+            nonlocal applied
+            applied = True
+
+        try:
+            with pytest.raises(OperationError) as exc_info:
+                await worker.run(
+                    mutation,
+                    budget=OperationBudget.start(1.0, clock=clock),
+                    operation="mutation after queue",
+                    state=state,
+                )
+
+            assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
+            assert state.submitted is False
+            assert state.started is False
+            assert applied is False
+            assert worker.busy is False
+        finally:
+            await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_timed_out_lane_recovers_after_originating_event_loop_closes():
+    worker = ProviderWorker("cross-loop-recovery-test")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking() -> None:
+        started.set()
+        release.wait(timeout=1.0)
+
+    async def time_out_first_call() -> None:
+        with pytest.raises(OperationError):
+            await worker.run(
+                blocking,
+                budget=OperationBudget.start(0.01),
+                operation="cross-loop blocking call",
+            )
+
+    asyncio.run(time_out_first_call())
+    assert started.is_set()
+    assert worker.busy is True
+
+    release.set()
+    asyncio.run(worker.wait_until_idle())
+
+    async def reuse() -> str:
+        return await worker.run(
+            lambda: "recovered",
+            budget=OperationBudget.start(1.0),
+            operation="cross-loop recovered call",
+        )
+
+    assert asyncio.run(reuse()) == "recovered"
+    asyncio.run(worker.aclose())
+
+
+def test_late_provider_exception_is_consumed_without_loop_secret_leak():
+    secret = "late-provider-sentinel-secret"
+
+    async def run() -> None:
+        worker = ProviderWorker("late-exception-test")
+        release = threading.Event()
+        captured: list[dict] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: captured.append(context))
+
+        def fail_late() -> None:
+            release.wait(timeout=1.0)
+            raise RuntimeError(secret)
+
+        with pytest.raises(OperationError):
+            await worker.run(
+                fail_late,
+                budget=OperationBudget.start(0.01),
+                operation="late failing provider",
+            )
+        release.set()
+        await worker.wait_until_idle()
+        await asyncio.sleep(0)
+        await worker.aclose()
+
+        assert secret not in repr(captured)
+        assert captured == []
+
+    asyncio.run(run())
+
+
+def test_cancelled_close_can_be_retried_from_a_new_event_loop():
+    marker = f"cancel-close-{time.monotonic_ns()}"
+    worker = ProviderWorker(marker)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking() -> None:
+        started.set()
+        release.wait(timeout=1.0)
+
+    async def cancel_first_close() -> None:
+        with pytest.raises(OperationError):
+            await worker.run(
+                blocking,
+                budget=OperationBudget.start(0.01),
+                operation="close quarantine",
+            )
+        close_task = asyncio.create_task(worker.aclose())
+        await asyncio.sleep(0)
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    asyncio.run(cancel_first_close())
+    assert started.is_set()
+    release.set()
+    asyncio.run(worker.aclose())
+
+    assert not any(
+        thread.name.startswith(f"agent-eyes-{marker}")
+        for thread in threading.enumerate()
+    )
+
+
+def test_cancelled_caller_does_not_release_lane_while_sync_work_is_running():
+    async def run() -> None:
+        worker = ProviderWorker("test-provider")
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            release.wait(timeout=1.0)
+
+        task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(10.0),
+                operation="cancelled native query",
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert worker.busy is True
+        release.set()
+        await worker.wait_until_idle()
+        assert worker.busy is False
+        await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_sync_exception_releases_lane_for_next_operation():
+    async def run() -> None:
+        worker = ProviderWorker("test-provider")
+
+        def fail() -> None:
+            raise ValueError("provider failed")
+
+        with pytest.raises(ValueError, match="provider failed"):
+            await worker.run(
+                fail,
+                budget=OperationBudget.start(1.0),
+                operation="failing provider",
+            )
+
+        assert await worker.run(
+            lambda: "recovered",
+            budget=OperationBudget.start(1.0),
+            operation="recovered provider",
+        ) == "recovered"
+        await worker.aclose()
+
+    asyncio.run(run())
+
+
+def test_close_waits_for_active_work_and_rejects_new_work():
+    async def run() -> None:
+        worker = ProviderWorker("test-provider")
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            release.wait(timeout=1.0)
+
+        task = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(1.0),
+                operation="active provider",
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        close_task = asyncio.create_task(worker.aclose())
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+
+        release.set()
+        await task
+        await close_task
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await worker.run(
+                lambda: None,
+                budget=OperationBudget.start(1.0),
+                operation="closed provider",
+            )
+
+    asyncio.run(run())
+
+
+def test_permanently_hung_provider_cannot_block_shutdown_or_process_exit():
+    async def run() -> None:
+        marker = f"hung-shutdown-{time.monotonic_ns()}"
+        worker = ProviderWorker(marker, shutdown_timeout=0.01)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking() -> None:
+            started.set()
+            release.wait()
+
+        provider_call = asyncio.create_task(
+            worker.run(
+                blocking,
+                budget=OperationBudget.start(0.01),
+                operation="permanently hung provider",
+            )
+        )
+        with pytest.raises(OperationError):
+            await provider_call
+        assert started.is_set()
+
+        before = time.monotonic()
+        await worker.aclose()
+        elapsed = time.monotonic() - before
+
+        owned_threads = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == f"agent-eyes-{marker}"
+        ]
+        assert elapsed < 0.1
+        assert len(owned_threads) == 1
+        assert owned_threads[0].daemon is True
+
+        release.set()
+        owned_threads[0].join(timeout=1.0)
+        assert owned_threads[0].is_alive() is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "shutdown_timeout",
+    [-1.0, float("inf"), float("nan"), True, "0.1"],
+)
+def test_invalid_worker_shutdown_timeout_is_rejected(shutdown_timeout):
+    with pytest.raises(ValueError):
+        ProviderWorker("invalid-timeout", shutdown_timeout=shutdown_timeout)

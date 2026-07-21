@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-import sys
+import os
 import re
+import sys
 from pathlib import Path
 
 from .competitors import COMPETITORS, CATEGORIES
@@ -18,8 +19,8 @@ def _home() -> Path:
 def _ai_tool_definitions() -> list[dict]:
     """Return definitions for all known AI tools with their config paths.
 
-    Each definition includes platform-specific paths and the JSON structure
-    used to store MCP server configs.
+    Each definition includes platform-specific paths and the structure used
+    to store MCP server configs.
     """
     home = _home()
 
@@ -30,16 +31,17 @@ def _ai_tool_definitions() -> list[dict]:
         windsurf_base = home / ".codeium" / "windsurf"
         zed_config = home / ".config" / "zed"
     elif sys.platform == "win32":
-        appdata = home / "AppData" / "Roaming"
+        appdata = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
         code_user = appdata / "Code" / "User"
         claude_desktop = appdata / "Claude"
         windsurf_base = home / ".codeium" / "windsurf"
         zed_config = appdata / "Zed"
     else:  # Linux
-        code_user = home / ".config" / "Code" / "User"
-        claude_desktop = home / ".config" / "Claude"
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+        code_user = config_home / "Code" / "User"
+        claude_desktop = config_home / "Claude"
         windsurf_base = home / ".codeium" / "windsurf"
-        zed_config = home / ".config" / "zed"
+        zed_config = config_home / "zed"
 
     return [
         {
@@ -81,6 +83,29 @@ def _ai_tool_definitions() -> list[dict]:
                 },
             },
             "supports_skills": False,
+            "supports_agents": False,
+        },
+        {
+            "id": "codex",
+            "name": "Codex",
+            "detection_paths": [home / ".codex"],
+            "config_locations": {
+                "global_mcp": {
+                    "path": home / ".codex" / "config.toml",
+                    "key": "mcp_servers",
+                    "format": "toml",
+                },
+                "project_mcp": {
+                    "path": Path(".codex") / "config.toml",
+                    "key": "mcp_servers",
+                    "format": "toml",
+                },
+                "skills": {
+                    "path": home / ".codex" / "skills",
+                    "type": "directory",
+                },
+            },
+            "supports_skills": True,
             "supports_agents": False,
         },
         {
