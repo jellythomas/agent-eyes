@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -41,6 +42,10 @@ class ReadinessStatus(str, Enum):
 
 class ReadinessStateError(RuntimeError):
     """Raised when a persisted readiness manifest cannot be trusted."""
+
+
+class _ReadinessLockTimeout(ReadinessStateError):
+    """Raised only when a readiness lock remains contended until its deadline."""
 
 
 @dataclass(frozen=True)
@@ -474,10 +479,6 @@ def _acquire_windows_file_lock(
     poll_interval: float = 0.05,
 ) -> None:
     """Acquire the one-byte Windows lock with a caller-visible deadline."""
-    stream.seek(0)
-    if stream.read(1) == b"":
-        stream.write(b"\0")
-        stream.flush()
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
         stream.seek(0)
@@ -489,9 +490,13 @@ def _acquire_windows_file_lock(
             )
             return
         except OSError as exc:
+            if exc.errno != errno.EACCES:
+                raise ReadinessStateError(
+                    "Readiness state lock could not be acquired"
+                ) from exc
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ReadinessStateError(
+                raise _ReadinessLockTimeout(
                     "Timed out waiting for the readiness state lock"
                 ) from exc
             time.sleep(min(max(0.0, poll_interval), remaining))

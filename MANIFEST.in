@@ -1,0 +1,2 @@
+include scripts/normalize_sdist.py
+include scripts/smoke_installed_artifact.py

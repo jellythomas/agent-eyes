@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
+import errno
 from pathlib import Path
 
 import pytest
@@ -323,7 +324,7 @@ def test_windows_readiness_lock_has_bounded_nonblocking_acquisition():
 
         def locking(self, _fd, mode, _nbytes):
             self.modes.append(mode)
-            raise OSError("busy")
+            raise PermissionError(errno.EACCES, "busy")
 
     msvcrt = Msvcrt()
 
@@ -335,6 +336,34 @@ def test_windows_readiness_lock_has_bounded_nonblocking_acquisition():
         )
 
     assert msvcrt.modes == [msvcrt.LK_NBLCK]
+
+
+def test_windows_readiness_lock_fails_fast_for_permanent_errors():
+    from agent_eyes.setup import readiness
+
+    class Stream:
+        def seek(self, _offset):
+            return None
+
+        def fileno(self):
+            return 17
+
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.calls = 0
+
+        def locking(self, _fd, _mode, _nbytes):
+            self.calls += 1
+            raise OSError(errno.EBADF, "invalid descriptor")
+
+    msvcrt = Msvcrt()
+
+    with pytest.raises(ReadinessStateError, match="could not be acquired"):
+        readiness._acquire_windows_file_lock(Stream(), msvcrt)
+
+    assert msvcrt.calls == 1
 
 
 def test_readiness_lock_stream_keeps_raw_file_position_aligned(tmp_path):

@@ -28,10 +28,10 @@ jobs:
           cache: pip
       - name: Install quality tools
         run: python -m pip install --upgrade pip uv ruff bandit pip-audit
-      - name: Lint source and benchmarks
-        run: ruff check src benchmarks
+      - name: Lint source, benchmarks, and scripts
+        run: ruff check src benchmarks scripts
       - name: Reject medium and high static-security findings
-        run: bandit -r src -q -ll
+        run: bandit -r src scripts -q -ll
       - name: Audit the locked dependency set
         shell: bash
         run: |
@@ -70,7 +70,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - name: Install package and test dependencies
-        run: python -m pip install --upgrade pip build pytest && python -m pip install -e .
+        run: python -m pip install --upgrade pip pytest && python -m pip install -e .
       - name: Compile source
         run: python -m compileall -q src
       - name: Run tests
@@ -82,7 +82,7 @@ jobs:
   package:
     name: Build and inspect distributions
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,21 +91,102 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Build distributions
-        run: |
-          python -m pip install --upgrade pip build twine
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
-      - name: Build distributions from a stable epoch
-        run: python -m build
-      - name: Check package metadata
-        run: python -m twine check dist/*
-      - name: Smoke-test the built wheel in isolation
+      - name: Install pinned build tools
+        run: >-
+          python -m pip install --upgrade pip
+          setuptools==83.0.0
+          build==1.5.0
+          pytest==9.0.2
+          twine==6.2.0
+      - name: Set reproducible build inputs
         shell: bash
         run: |
-          python -m venv /tmp/agent-eyes-artifact
-          /tmp/agent-eyes-artifact/bin/python -m pip install dist/*.whl
-          /tmp/agent-eyes-artifact/bin/agent-eyes --version
-          /tmp/agent-eyes-artifact/bin/agent-eyes --help >/dev/null
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION=$(PYTHONPATH=src python -c 'import agent_eyes; print(agent_eyes.__version__)')" >> "$GITHUB_ENV"
+      - name: Build and compare independent distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          build_root="$(mktemp -d)"
+          trap 'rm -rf "$build_root"' EXIT
+          mkdir -p \
+            "$build_root/source-a" \
+            "$build_root/source-b" \
+            "$build_root/dist-a" \
+            "$build_root/dist-b" \
+            "$build_root/from-sdist" \
+            "$build_root/dist-from-sdist"
+
+          git archive --format=tar HEAD | tar -xf - -C "$build_root/source-a"
+          git archive --format=tar HEAD | tar -xf - -C "$build_root/source-b"
+          python -m build --no-isolation --outdir "$build_root/dist-a" "$build_root/source-a"
+          python -m build --no-isolation --outdir "$build_root/dist-b" "$build_root/source-b"
+
+          wheels_a=("$build_root/dist-a"/*.whl)
+          wheels_b=("$build_root/dist-b"/*.whl)
+          sdists_a=("$build_root/dist-a"/*.tar.gz)
+          sdists_b=("$build_root/dist-b"/*.tar.gz)
+          test "${#wheels_a[@]}" -eq 1
+          test "${#wheels_b[@]}" -eq 1
+          test "${#sdists_a[@]}" -eq 1
+          test "${#sdists_b[@]}" -eq 1
+
+          python scripts/normalize_sdist.py "${sdists_a[0]}"
+          python scripts/normalize_sdist.py "${sdists_b[0]}"
+          test "$(basename "${wheels_a[0]}")" = "$(basename "${wheels_b[0]}")"
+          test "$(basename "${sdists_a[0]}")" = "$(basename "${sdists_b[0]}")"
+          cmp "${wheels_a[0]}" "${wheels_b[0]}"
+          cmp "${sdists_a[0]}" "${sdists_b[0]}"
+
+          tar -xzf "${sdists_a[0]}" -C "$build_root/from-sdist"
+          sdist_sources=("$build_root/from-sdist"/*)
+          test "${#sdist_sources[@]}" -eq 1
+          test -d "${sdist_sources[0]}"
+          test -f "${sdist_sources[0]}/scripts/normalize_sdist.py"
+          python -m pytest -q "${sdist_sources[0]}/tests/test_normalize_sdist.py"
+          python -m build \
+            --no-isolation \
+            --wheel \
+            --outdir "$build_root/dist-from-sdist" \
+            "${sdist_sources[0]}"
+          rebuilt_wheels=("$build_root/dist-from-sdist"/*.whl)
+          test "${#rebuilt_wheels[@]}" -eq 1
+          test "$(basename "${wheels_a[0]}")" = "$(basename "${rebuilt_wheels[0]}")"
+          cmp "${wheels_a[0]}" "${rebuilt_wheels[0]}"
+
+          test ! -e dist
+          mkdir dist
+          cp "${wheels_a[0]}" "${sdists_a[0]}" dist/
+          python - <<'PY'
+          from hashlib import file_digest
+          from pathlib import Path
+
+          for artifact in sorted(Path("dist").iterdir()):
+              with artifact.open("rb") as stream:
+                  digest = file_digest(stream, "sha256").hexdigest()
+              print(f"{digest}  {artifact}")
+          PY
+      - name: Check package metadata
+        run: python -m twine check dist/*
+      - name: Smoke-test the exact built wheel in isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          wheels=(dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m venv "$smoke_root/venv"
+          "$smoke_root/venv/bin/python" -m pip install --upgrade pip
+          "$smoke_root/venv/bin/python" -m pip install "${wheels[0]}"
+          env -u PYTHONHOME -u PYTHONPATH PYTHONNOUSERSITE=1 \
+            "$smoke_root/venv/bin/python" scripts/smoke_installed_artifact.py \
+            --executable "$smoke_root/venv/bin/agent-eyes" \
+            --expected-version "$PACKAGE_VERSION"
 
   stress:
     name: Stress / ${{ matrix.os }}

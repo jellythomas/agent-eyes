@@ -1,4 +1,4 @@
-"""Seeded concurrency, target-isolation, snapshot-memory, and CDP stress checks."""
+"""Seeded concurrency, setup-lock, snapshot-memory, and CDP stress checks."""
 
 from __future__ import annotations
 
@@ -6,16 +6,26 @@ import argparse
 import asyncio
 import gc
 import json
+import multiprocessing
 import os
+from pathlib import Path
+import queue
 import random
 import subprocess
 import sys
+import tempfile
 import time
 
 from agent_eyes.cdp_persistent import CDPConnection
 from agent_eyes.coordinator import AutomationCoordinator
 from agent_eyes.observations import ElementRecord, ObservationStore
 from agent_eyes.operation import OperationError, OperationErrorCode, OperationMode
+from agent_eyes.setup.state import setup_process_lock
+
+
+_SETUP_LOCK_WORKERS = 4
+_SETUP_LOCK_ROUNDS = 25
+_SETUP_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 def _positive_integer(value: str) -> int:
@@ -216,6 +226,119 @@ def _snapshot_rss_cycles(cycles: int) -> dict[str, int | float | str]:
     }
 
 
+def _setup_lock_worker(
+    lock_path: str,
+    counter_path: str,
+    barrier,
+    result_queue,
+) -> None:
+    """Contend for the setup lock from a spawned interpreter."""
+    completed = 0
+    try:
+        selected_lock = Path(lock_path)
+        selected_counter = Path(counter_path)
+        for _ in range(_SETUP_LOCK_ROUNDS):
+            barrier.wait(timeout=_SETUP_LOCK_TIMEOUT_SECONDS)
+            with setup_process_lock(selected_lock):
+                counter = int(selected_counter.read_text(encoding="ascii"))
+                selected_counter.write_text(str(counter + 1), encoding="ascii")
+            completed += 1
+        result_queue.put((os.getpid(), completed, None))
+    except Exception as exc:  # pragma: no cover - reported by the parent process
+        result_queue.put((os.getpid(), completed, f"{type(exc).__name__}: {exc}"))
+
+
+def _setup_process_lock_schedules() -> dict[str, int]:
+    """Prove cross-process setup-lock exclusion under synchronized contention."""
+    context = multiprocessing.get_context("spawn")
+    acquisitions = _SETUP_LOCK_WORKERS * _SETUP_LOCK_ROUNDS
+    with tempfile.TemporaryDirectory(prefix="agent-eyes-lock-stress-") as temp_dir:
+        root = Path(temp_dir)
+        lock_path = root / ".setup.lock"
+        counter_path = root / "counter"
+        counter_path.write_text("0", encoding="ascii")
+        barrier = context.Barrier(_SETUP_LOCK_WORKERS)
+        result_queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_setup_lock_worker,
+                args=(str(lock_path), str(counter_path), barrier, result_queue),
+            )
+            for _ in range(_SETUP_LOCK_WORKERS)
+        ]
+        started_processes = []
+        deadline = time.monotonic() + _SETUP_LOCK_TIMEOUT_SECONDS
+        results: list[tuple[int, int, str | None]] = []
+        try:
+            for process in processes:
+                process.start()
+                started_processes.append(process)
+
+            for _ in processes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "setup-lock workers exceeded the stress deadline"
+                    )
+                try:
+                    results.append(result_queue.get(timeout=remaining))
+                except queue.Empty as exc:
+                    raise RuntimeError(
+                        "setup-lock workers exceeded the stress deadline"
+                    ) from exc
+
+            for process in processes:
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+            if any(process.is_alive() for process in processes):
+                raise RuntimeError(
+                    "setup-lock workers did not exit before the deadline"
+                )
+            exit_codes = [process.exitcode for process in processes]
+            if any(exit_code != 0 for exit_code in exit_codes):
+                raise RuntimeError(
+                    f"setup-lock workers exited unsuccessfully: {exit_codes}"
+                )
+
+            child_errors = [error for _, _, error in results if error is not None]
+            if child_errors:
+                raise RuntimeError(f"setup-lock workers failed: {child_errors}")
+            completed_acquisitions = sum(completed for _, completed, _ in results)
+            final_counter = int(counter_path.read_text(encoding="ascii"))
+            if completed_acquisitions != acquisitions or final_counter != acquisitions:
+                raise RuntimeError(
+                    "setup-lock mutual exclusion failed: "
+                    f"completed={completed_acquisitions}, counter={final_counter}, "
+                    f"expected={acquisitions}"
+                )
+        finally:
+            barrier.abort()
+            for process in started_processes:
+                if process.is_alive():
+                    process.terminate()
+            terminate_deadline = time.monotonic() + 5.0
+            for process in started_processes:
+                process.join(timeout=max(0.0, terminate_deadline - time.monotonic()))
+            for process in started_processes:
+                if process.is_alive():
+                    process.kill()
+            kill_deadline = time.monotonic() + 5.0
+            for process in started_processes:
+                process.join(timeout=max(0.0, kill_deadline - time.monotonic()))
+                if not process.is_alive():
+                    process.close()
+            result_queue.close()
+            result_queue.join_thread()
+
+    return {
+        "workers": _SETUP_LOCK_WORKERS,
+        "rounds_per_worker": _SETUP_LOCK_ROUNDS,
+        "acquisitions": acquisitions,
+        "completed_acquisitions": completed_acquisitions,
+        "final_counter": final_counter,
+        "child_errors": 0,
+    }
+
+
 async def _singleflight_schedules(schedules: int, seed: int) -> dict[str, int]:
     generator = random.Random(seed)
     provider_calls = 0
@@ -252,11 +375,13 @@ async def _singleflight_schedules(schedules: int, seed: int) -> dict[str, int]:
         release.set()
         results = await asyncio.gather(*tasks, return_exceptions=True)
         survivors = [
-            value
-            for index, value in enumerate(results)
-            if index not in cancelled
+            value for index, value in enumerate(results) if index not in cancelled
         ]
-        if calls != 1 or not survivors or not all(value is survivors[0] for value in survivors):
+        if (
+            calls != 1
+            or not survivors
+            or not all(value is survivors[0] for value in survivors)
+        ):
             raise RuntimeError(f"single-flight invariant failed at schedule {schedule}")
         if coordinator._flights:
             await asyncio.sleep(0)
@@ -324,7 +449,9 @@ def _target_isolation_schedules(schedules: int) -> dict[str, int]:
                 raise
             rejected_cross_target_resolutions += 1
         else:
-            raise RuntimeError(f"cross-target resolution succeeded at schedule {schedule}")
+            raise RuntimeError(
+                f"cross-target resolution succeeded at schedule {schedule}"
+            )
     store.close()
     return {
         "schedules": schedules,
@@ -360,9 +487,7 @@ def _cdp_attach_detach_cycles(cycles: int) -> dict[str, int]:
         target_id = f"target-{cycle}"
         session_id = f"session-{cycle}"
         _attach_cdp_target(connection, target_id, session_id)
-        connection._on_detached(
-            {"sessionId": session_id, "targetId": target_id}
-        )
+        connection._on_detached({"sessionId": session_id, "targetId": target_id})
     leaked_records = (
         len(connection._sessions)
         + len(connection._tabs)
@@ -441,15 +566,17 @@ async def _run(
     singleflight = await _singleflight_schedules(schedules, seed)
     target_isolation = _target_isolation_schedules(schedules)
     snapshot_memory = _snapshot_rss_cycles(snapshot_cycles)
+    setup_process_lock_stress = _setup_process_lock_schedules()
     cdp_lifecycle = _cdp_attach_detach_cycles(attach_cycles)
     cdp_reconnect = await _cdp_reconnect_cycles(reconnect_cycles)
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "seed": seed,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "singleflight": singleflight,
         "target_isolation": target_isolation,
         "snapshot_memory": snapshot_memory,
+        "setup_process_lock": setup_process_lock_stress,
         "cdp_lifecycle": cdp_lifecycle,
         "cdp_reconnect": cdp_reconnect,
     }

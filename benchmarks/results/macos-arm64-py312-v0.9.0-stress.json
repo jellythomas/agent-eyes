@@ -1,14 +1,25 @@
 {
-  "cdp_lifecycle": {"cycles": 10000, "leaked_records": 0},
+  "cdp_lifecycle": {
+    "cycles": 10000,
+    "leaked_records": 0
+  },
   "cdp_reconnect": {
     "cycles": 1000,
     "leaked_records": 0,
     "maximum_records": 3,
     "wrong_generation_bindings": 0
   },
-  "elapsed_seconds": 0.373,
-  "schema_version": 3,
+  "elapsed_seconds": 0.605,
+  "schema_version": 4,
   "seed": 20260718,
+  "setup_process_lock": {
+    "acquisitions": 100,
+    "child_errors": 0,
+    "completed_acquisitions": 100,
+    "final_counter": 100,
+    "rounds_per_worker": 25,
+    "workers": 4
+  },
   "singleflight": {
     "cancelled_waiters": 4225,
     "leaked_flights": 0,
@@ -17,9 +28,9 @@
     "wrong_results": 0
   },
   "snapshot_memory": {
-    "baseline_rss_bytes": 30556160,
+    "baseline_rss_bytes": 32194560,
     "cycles": 10000,
-    "final_rss_bytes": 30556160,
+    "final_rss_bytes": 32194560,
     "growth_bytes": 0,
     "growth_percent": 0.0,
     "leaked_snapshots": 0,
