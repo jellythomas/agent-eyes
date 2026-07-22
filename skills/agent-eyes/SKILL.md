@@ -26,8 +26,8 @@ an explicit capability, never as a fallback for ordinary browser work.
    `subtree` when narrower state is enough. Use `full=true` only when necessary.
 5. Preserve the `snapshot=` token from every observation. Pass both `snapshot`
    and `[id]` to element actions; never combine an ID with another snapshot.
-6. Call `wait` for the exact expected completion condition. Do not add fixed sleeps or
-   repeatedly fetch a full tree.
+6. Call `wait` with a specific expected role/name condition. Do not add fixed sleeps
+   or repeatedly fetch a full tree.
 7. Verify the changed condition only. Refresh the affected target after
    navigation, `STALE_SNAPSHOT`, `STALE_TARGET`, or `FOCUS_MISMATCH`.
 
@@ -49,10 +49,12 @@ an explicit capability, never as a fallback for ordinary browser work.
 
 Use `shadow=true` only when the user explicitly requests background, no-focus, or
 protocol/DOM execution. First call `list_tabs(shadow=true)`, then pass its exact
-`target_id` to `web_tree`, `js`, `wait`, navigation, or other shadow actions. Use
-the snapshot from `web_tree` for shadow element actions. If the optional provider
-is unavailable, report the capability gap; do not ask to restart Chrome for normal
-foreground work and do not silently replay through another provider.
+`target_id` only to tools compatible with that returned provider. Apple Events
+targets support `web_tree` reads plus `navigate`, `js`, and the macOS `shadow`
+compatibility tool; CDP-only actions reject them. Use the snapshot from `web_tree`
+for compatible shadow element actions. If the optional provider is unavailable,
+report the capability gap; do not ask to restart Chrome for normal foreground work
+and do not silently replay through another provider.
 
 ## Failure and safety policy
 
@@ -72,6 +74,8 @@ batched `fill_form`, and condition-specific `wait`. Avoid screenshots when the
 accessibility tree is sufficient and avoid returning unchanged state.
 
 If readiness is `setup_required` or `permission_required`, present the single
-remediation from `status`. First-time users normally run `uvx agent-eyes setup`;
-that command checks and installs the current platform runtime before configuring
-selected clients. Do not install packages from inside an MCP tool call.
+remediation from `status`. First-time users normally run
+`uvx agent-eyes@latest setup`; that command checks and persistently installs the
+current platform runtime, configures selected clients, and synchronizes the
+canonical skill for Claude Code/Codex plus Codex metadata. Do not install
+packages from inside an MCP tool call.

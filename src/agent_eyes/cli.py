@@ -29,12 +29,16 @@ class ExitCode(IntEnum):
     CANCELLED = 5
 
 
-def _add_profile(parser) -> None:
+def _add_profile(
+    parser,
+    *,
+    help_text: str = "Capability profile to verify (default: standard)",
+) -> None:
     parser.add_argument(
         "--profile",
         choices=("standard", "full"),
         default="standard",
-        help="Capability profile to verify (default: standard)",
+        help=help_text,
     )
 
 
@@ -43,13 +47,17 @@ def _add_output(parser) -> None:
 
 
 def _add_mutation_controls(parser) -> None:
-    parser.add_argument("--yes", action="store_true", help="Approve the displayed user-level plan")
+    parser.add_argument("--yes", action="store_true", help="Approve the computed user-level plan")
     parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Never prompt; requires --yes to apply user-level changes",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Display the plan without changing anything")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Display the plan without changing persistent Agent Eyes state",
+    )
 
 
 def _add_clients(parser) -> None:
@@ -57,12 +65,12 @@ def _add_clients(parser) -> None:
     selection.add_argument(
         "--client",
         action="append",
-        help="Configure one detected MCP client (repeatable)",
+        help="Configure one supported MCP client (repeatable)",
     )
     selection.add_argument(
         "--all-detected",
         action="store_true",
-        help="Configure every detected MCP client",
+        help="Explicitly select the default set of detected MCP clients",
     )
 
 
@@ -85,15 +93,28 @@ def build_parser():
     )
     serve.set_defaults(handler=_run_serve)
 
-    doctor = commands.add_parser("doctor", help="Run read-only live readiness checks")
+    doctor = commands.add_parser(
+        "doctor",
+        help="Run live readiness checks and refresh diagnostic state",
+    )
     _add_profile(doctor)
     _add_output(doctor)
     doctor.add_argument("--verbose", action="store_true", help="Show every capability check")
-    doctor.add_argument("--refresh", action="store_true", help="Ignore the cached diagnostic snapshot")
+    doctor.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Compatibility option; doctor always performs live checks",
+    )
     doctor.set_defaults(handler=_run_doctor)
 
     install = commands.add_parser("install", help="Install or repair runtime components")
-    _add_profile(install)
+    _add_profile(
+        install,
+        help_text=(
+            "Compatibility option; the selected profile does not change the "
+            "platform package installed (default: standard)"
+        ),
+    )
     _add_output(install)
     _add_mutation_controls(install)
     install.add_argument("--repair", action="store_true", help="Force a persistent reinstall")
@@ -268,6 +289,7 @@ def _probe_persistent_readiness(executable, profile: str):
     """Ask the installed launcher to verify its own provider environment."""
     import json
     import subprocess
+    import tempfile
 
     from agent_eyes.setup.readiness import ReadinessReport, probe_current_readiness
 
@@ -281,13 +303,17 @@ def _probe_persistent_readiness(executable, profile: str):
             profile=profile,
         )
 
-    completed = subprocess.run(
-        [str(executable), "doctor", "--json", "--profile", profile],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
+    environment = os.environ.copy()
+    with tempfile.TemporaryDirectory(prefix="agent-eyes-precheck-") as state_dir:
+        environment["AGENT_EYES_STATE_DIR"] = state_dir
+        completed = subprocess.run(
+            [str(executable), "doctor", "--json", "--profile", profile],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=environment,
+        )
     try:
         payload = json.loads(completed.stdout)
     except (json.JSONDecodeError, TypeError) as exc:
@@ -647,11 +673,23 @@ def _run_setup(args) -> int:
             )
         if install_plan is None and precheck.status is ReadinessStatus.SETUP_REQUIRED:
             executable, install_plan = _prepare_install(repair=True)
-        targets = _client_targets(args.client)
-        client_plan = _client_change_plan(targets)
-        prepared = _preflight_client_configs(client_plan, executable)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         return _emit_error(args, str(exc), ExitCode.SETUP_REQUIRED)
+
+    try:
+        targets = _client_targets(args.client)
+    except ValueError as exc:
+        return _emit_error(args, str(exc), ExitCode.USAGE)
+    except Exception as exc:
+        return _emit_error(
+            args,
+            f"Client discovery failed: {exc}",
+            ExitCode.ERROR,
+        )
+
+    try:
+        client_plan = _client_change_plan(targets)
+        prepared = _preflight_client_configs(client_plan, executable)
     except Exception as exc:
         return _emit_error(
             args,

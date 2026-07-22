@@ -17,6 +17,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
+def _expected_tool_count(platform_name: str) -> int:
+    return 28 if platform_name == "darwin" else 25
+
+
 def _isolated_environment(root: Path) -> dict[str, str]:
     """Return an environment that cannot redirect Python imports from the wheel."""
     environment = os.environ.copy()
@@ -76,7 +80,7 @@ async def _smoke_mcp(
                 status = await session.call_tool("status", {})
 
     tool_names = [tool.name for tool in tools.tools]
-    expected_tool_count = 28 if sys.platform == "darwin" else 26
+    expected_tool_count = _expected_tool_count(sys.platform)
     if initialized.serverInfo.name != "agent-eyes":
         raise RuntimeError(f"unexpected MCP server name: {initialized.serverInfo.name}")
     if initialized.serverInfo.version != expected_version:

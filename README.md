@@ -1,55 +1,199 @@
 # Agent Eyes
 
-Agent Eyes is a model-independent computer-use MCP server. It reads native accessibility trees and sends real keyboard/mouse input so an AI agent can inspect and operate desktop applications without depending on Claude, Codex, or a particular browser automation framework.
+Agent Eyes is a model-independent computer-use MCP server. It reads native
+accessibility trees and sends real keyboard and mouse input so an AI agent can
+inspect and operate desktop applications and browsers without being tied to
+Claude, Codex, Chrome, or a browser automation framework.
 
-The default policy is foreground and browser-agnostic: inspect the live desktop and all accessibility-visible browser windows/tabs, reuse and focus the best existing target, and open a new tab only when no suitable target exists. Shadow/background automation is an explicit mode, not the normal fallback.
+The default is **foreground, native, and browser-agnostic**: inspect all open
+tabs, reuse and focus the best existing target, and open a new foreground tab
+only when no suitable target exists. Background protocol automation is an
+explicit `shadow=true` mode, never an automatic fallback.
 
-## First-time setup
+## Install to ready
 
-Run one guided bootstrap command:
+### 1. Install and verify the prerequisites
 
-```bash
-uvx agent-eyes setup
-```
+Agent Eyes supports Python 3.10 through 3.14 on macOS, Windows, and Linux. The
+recommended bootstrap uses [`uv`](https://docs.astral.sh/uv/getting-started/installation/),
+which can provide a compatible Python automatically on macOS and Windows.
 
-If you attach the MCP before running setup, the stdio handshake still completes
-without probing permissions or installing anything. The first `status` or
-computer-use call performs a bounded live readiness check. When a required
-provider or permission is missing, action tools return one structured
-`setup_required` or `permission_required` error with the recovery command. Run
-that command in a terminal; the MCP server never installs packages from inside a
-tool call.
-
-`uvx` is used only to bootstrap setup. The wizard:
-
-1. Checks the current version, persistent launcher, operating system, native accessibility provider, input provider, and permissions.
-2. Shows the exact persistent-install command and every MCP config/skill artifact it plans to change.
-3. Asks once before applying user-level changes.
-4. Reuses a healthy current launcher without reinstalling; otherwise installs the current Agent Eyes version into an isolated `uv tool` or `pipx` environment.
-5. Atomically configures detected MCP clients with the stable launcher path and synchronizes the canonical Agent Eyes skill, with backups for existing changed artifacts.
-6. Verifies the installed providers and reports any permission step still requiring you.
-
-Setup never silently runs `sudo`, grants OS permissions, removes other MCP servers, or installs packages while the MCP stdio server is starting.
-
-Use `--repair` only to force a reinstall after an upgrade or damaged installation. Normal repeated setup is a fast live check plus idempotent configuration.
-
-Preview without changing anything:
+Install `uv` if `uv --version` is not already available:
 
 ```bash
-uvx agent-eyes setup --dry-run
+# macOS or Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-For automated user-level setup:
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Open a new terminal if the installer updated your `PATH`, then verify it:
 
 ```bash
-uvx agent-eyes setup --yes --non-interactive
+uv --version
 ```
 
-`--yes` does not approve sudo, operating-system permissions, or browser dialogs.
+Linux also needs `/usr/bin/python3` at version 3.10 or newer, `pipx`, and the
+distro-provided AT-SPI/PyGObject packages before setup. Agent Eyes deliberately
+uses that system Python with `pipx --system-site-packages` so the isolated
+persistent runtime can access those system bindings.
 
-## MCP configuration
+```bash
+/usr/bin/python3 --version
+```
 
-Setup writes an absolute persistent launcher. A resulting configuration looks like:
+```bash
+# Debian or Ubuntu
+sudo apt install at-spi2-core python3-gi gir1.2-atspi-2.0 pipx
+pipx ensurepath
+```
+
+```bash
+# Fedora
+sudo dnf install at-spi2-core python3-gobject at-spi2-atk pipx
+pipx ensurepath
+```
+
+For another distribution, install the equivalent AT-SPI2, PyGObject, and
+`pipx` packages. Agent Eyes never installs privileged system packages itself.
+
+### 2. Preview setup
+
+Run the newest published setup wizard in an ephemeral `uvx` environment and
+inspect every planned change:
+
+```bash
+uvx agent-eyes@latest setup --dry-run
+```
+
+`@latest` tells `uvx` to refresh the bootstrap package even if an older version
+is already installed or cached. Agent Eyes does not install, configure clients,
+or update persistent diagnostic state during the preview; `uvx` may still refresh
+its own ephemeral package cache.
+
+### 3. Apply setup
+
+```bash
+uvx agent-eyes@latest setup
+```
+
+Setup displays one combined user-level plan and asks once before applying it.
+For an unattended environment where you have already reviewed the dry run:
+
+```bash
+uvx agent-eyes@latest setup --yes --non-interactive
+```
+
+`--yes` approves only the displayed user-level plan. It does not approve
+`sudo`, operating-system permissions, or browser dialogs.
+
+### 4. Verify the installed version and readiness
+
+Setup installs a persistent launcher, so normal use no longer goes through
+`uvx`:
+
+```bash
+agent-eyes --version
+agent-eyes doctor --verbose
+```
+
+The target result is `Agent Eyes <version>: ready`. If doctor reports
+`degraded`, `setup_required`, or `permission_required`, follow its printed
+remediation(s) and rerun the command. Use `agent-eyes doctor --json` for
+machine-readable output.
+
+### 5. Restart changed MCP clients
+
+Restart or reload every client that setup says it changed. The restart makes
+the client reconnect through the persistent launcher and reload the installed
+Agent Eyes skill. A terminal-only version or doctor check does not reload an
+already-running MCP client.
+
+### 6. Make the first MCP calls
+
+Ask the restarted MCP client to call `status` once, then inventory browser tabs
+with `list_tabs` before taking browser action:
+
+```text
+status {}
+list_tabs {"query": "youtube rollerblade"}
+```
+
+`status` should report `ready`. `list_tabs` should return ranked foreground
+targets without asking for a Chrome remote-debugging restart. MCP tools are
+called by the AI client, not entered directly in a shell.
+
+## What setup changes
+
+`uvx agent-eyes@latest setup` performs the complete first-run bootstrap:
+
+1. Runs the latest wizard ephemerally and checks the operating system, current
+   launcher, native accessibility provider, input provider, and permissions.
+2. Reuses a healthy current launcher or installs the exact current Agent Eyes
+   platform package persistently: prefers `uv tool` and falls back to `pipx` on
+   macOS/Windows, and uses `pipx` with system site packages on Linux.
+3. Detects supported MCP clients and preflights their native JSON, JSONC, or TOML
+   configuration before writing anything.
+4. Writes an absolute persistent executable with `"args": ["serve"]` while
+   preserving unrelated configuration.
+5. Installs the canonical `agent-eyes/SKILL.md` for Claude Code and Codex, plus
+   `agents/openai.yaml` metadata for Codex.
+6. Applies MCP configs and skill artifacts as one rollback-capable transaction,
+   backing up existing changed files under `~/.agent-eyes/backups/`.
+7. Probes the persistent runtime again and reports the final readiness state.
+
+Repeated setup leaves already-current installation, MCP, and skill artifacts
+unchanged. It refreshes diagnostic timestamps and, when the selected profile is
+core-ready, initialization timestamps. If an exact-version launcher exists but
+its precheck reports `setup_required`, setup automatically prepares a forced
+repair plan. Use `--repair` explicitly only to force a same-version reinstall of
+a damaged environment.
+
+Setup deliberately has clear boundaries:
+
+- It does not install `uv`, Linux `pipx`, or distro system packages.
+- It does not run `sudo`.
+- It cannot grant macOS Accessibility or other operating-system permissions.
+- It cannot approve operating-system or browser dialogs.
+- It does not remove Playwright or other competing MCP servers.
+- It does not install packages while an MCP stdio server is starting or handling
+  a tool call.
+
+Agent Eyes does not depend on Playwright MCP. Playwright-related names are only
+recognized while auditing existing client configuration, skill directories, and
+agent references; they are not an Agent Eyes runtime or browser requirement.
+
+## Supported MCP clients
+
+Without a selection flag, setup configures every detected supported client.
+Repeat `--client ID` to choose specific clients, or use `--all-detected` as an
+explicit spelling of the default.
+
+| Client | `--client` ID | Global MCP config | Additional setup artifact |
+|---|---|---|---|
+| Claude Code | `claude-code` | JSON (`mcpServers`) | `agent-eyes/SKILL.md` |
+| Claude Desktop | `claude-desktop` | JSON (`mcpServers`) | None |
+| Codex | `codex` | TOML (`mcp_servers`) | `SKILL.md` and `agents/openai.yaml` |
+| Cursor | `cursor` | JSON (`mcpServers`) | None |
+| VS Code (Copilot) | `vscode` | JSON (`servers`) | None |
+| Cline | `cline` | JSON (`mcpServers`) | None |
+| Roo Code | `roo-code` | JSON (`mcpServers`) | None |
+| Windsurf | `windsurf` | JSON (`mcpServers`) | None |
+| Zed | `zed` | JSON (`context_servers`) | None |
+| Continue | `continue` | JSON (`mcpServers`) | None |
+
+For example, configure only Codex and Claude Code:
+
+```bash
+uvx agent-eyes@latest setup \
+  --client codex \
+  --client claude-code
+```
+
+Setup writes the equivalent of this entry using the actual absolute path:
 
 ```json
 {
@@ -62,125 +206,200 @@ Setup writes an absolute persistent launcher. A resulting configuration looks li
 }
 ```
 
-Codex receives the equivalent entry in `~/.codex/config.toml`; JSON and JSONC clients keep their native format and unrelated entries. Claude Code and Codex also receive the canonical `agent-eyes/SKILL.md`, and Codex receives its supported `agents/openai.yaml` metadata. MCP configs and skill files are preflighted and applied as one rollback-capable transaction. Windows uses the equivalent absolute `agent-eyes.exe` path. Restart a changed MCP client after setup so it reconnects through the persistent launcher and reloads the skill.
+Codex receives the equivalent TOML entry. Windows uses the absolute
+`agent-eyes.exe` path. JSON/JSONC/TOML comments and unrelated entries are
+preserved where the format supports them; malformed input is rejected, safe
+symlink targets are followed, and existing changed artifacts receive recoverable backups.
+Existing entries that invoke `agent-eyes` with no arguments remain compatible
+because no arguments are an alias for `agent-eyes serve`.
 
-Existing configurations that invoke `agent-eyes` with no arguments remain compatible; no arguments are an alias for `agent-eyes serve`.
+## Browser modes
 
-## Commands
+### Foreground mode: the default
+
+Normal foreground work uses the operating-system accessibility provider. It can
+inspect and operate accessible Safari, Firefox, Chromium-family, and other
+browsers without a Chrome remote-debugging restart:
+
+1. Call `list_tabs` once with concise task, site, title, or URL terms.
+2. Inspect all open tabs across accessibility-visible browser windows.
+3. Reuse and focus the best relevant existing target.
+4. Open a new foreground tab only when no suitable target exists.
+5. Keep the returned provider-qualified `target_id` for exact follow-up actions.
+
+Native target IDs include a content fingerprint, for example
+`native:78738:w1:t3:h4a1c9e2d7b10`. Prefer them over mutable tab positions.
+Refresh inventory after navigation, closing, replacement, or reordering.
+
+Some browsers expose limited URLs or DOM details for inactive tabs through
+accessibility APIs. That limitation does not cause an automatic switch to a
+browser-specific remote mode. The planned optional browser-neutral bridge is
+described in the [v2 architecture](https://github.com/jellythomas/agent-eyes/blob/main/docs/plans/2026-07-17-agent-eyes-v2-native-first-design.md).
+
+### Shadow mode: explicit background automation
+
+Use `shadow=true` only when the user explicitly requests background, no-focus,
+protocol, or DOM-level browser automation:
 
 ```text
-agent-eyes setup [--yes] [--non-interactive] [--client CLIENT | --all-detected] [--dry-run] [--repair] [--json]
-agent-eyes doctor [--json] [--verbose] [--profile PROFILE] [--refresh]
-agent-eyes install [--yes] [--dry-run] [--repair] [--json] [--profile PROFILE]
-agent-eyes init [--yes] [--non-interactive] [--client CLIENT] [--all-detected] [--dry-run] [--json]
-agent-eyes serve
+list_tabs {"query": "dashboard", "shadow": true}
+web_tree {"target_id": "<returned-shadow-target>", "shadow": true}
 ```
 
-- `agent-eyes setup` runs the complete guided install, client initialization, and verification flow.
-- `agent-eyes doctor` performs live checks and refreshes `~/.agent-eyes/readiness.json`; it does not install packages or change MCP client configs.
-- `agent-eyes install` performs only the persistent, current-platform installation phase.
-- `agent-eyes init` preflights every selected MCP config and supported skill artifact before writing, supports JSON/JSONC/TOML, preserves unrelated tools and comments, follows safe symlink targets, and applies the group atomically with backups.
-- `agent-eyes serve` starts the stdio MCP server. It performs no package-manager or network work.
+Pass the exact shadow `target_id` and the snapshot returned by `web_tree` to
+later actions. `web_tree`, `js`, `dialog`, `upload`, and `pierce` are
+protocol-only and reject foreground calls. If the optional provider is not
+connected, Agent Eyes reports the capability gap instead of asking to restart
+Chrome or silently rerouting normal work.
 
-You can rerun `agent-eyes setup --repair` safely after an upgrade or failed setup. The configuration operations are idempotent.
+## Efficient, event-driven operation
 
-## Readiness states
+Foreground waits subscribe to macOS AXObserver, Windows UI Automation, or Linux
+AT-SPI notifications before evaluating their condition. Navigation and explicit
+shadow waits use protocol lifecycle/accessibility events. Actions continue as
+soon as the expected state becomes observable; bounded adaptive checks are used
+only when an event provider cannot be registered. Agent Eyes does not use a
+fixed sleep as its page-load strategy. Short key-down/up and drag delays remain
+input semantics rather than load polling.
 
-Agent Eyes derives readiness from live providers rather than trusting an “installed” Boolean:
+For low latency and model-token use:
 
-| State | Meaning | Action |
-|---|---|---|
-| `ready` | Required foreground observation and input capabilities work | None |
-| `degraded` | Core foreground use works, but an optional or persistent component is missing | Run `agent-eyes setup` when convenient |
-| `setup_required` | A required native/input provider is missing or failed | Run `agent-eyes setup` |
-| `permission_required` | Providers are installed but an OS permission/service needs user action | Follow `agent-eyes doctor --verbose`, then rerun it |
+- Call `context` once for orientation and `list_tabs` once for browser ranking.
+- Prefer compact accessibility trees over screenshots.
+- Preserve observation `snapshot` tokens and use IDs only with their originating
+  snapshot.
+- Narrow follow-up reads with `find` or `subtree` rather than requesting the full
+  tree repeatedly.
+- Use condition-specific `wait` calls and verify only the changed state.
 
-When required capabilities are unavailable, the MCP still completes its handshake and exposes a compact `status` tool with the recovery command. It does not repeatedly prepend setup questions to normal tool results.
+## Common CLI syntax
 
-The cached manifest is `~/.agent-eyes/readiness.json`. Live checks remain authoritative; version, platform, architecture, Python, profile, or executable changes invalidate the cached identity.
+| Command | Purpose |
+|---|---|
+| `agent-eyes --version` | Print the installed version |
+| `agent-eyes setup [options]` | Install/repair, initialize clients, and verify readiness |
+| `agent-eyes doctor [--verbose] [--json]` | Run live readiness checks and refresh diagnostic state |
+| `agent-eyes install [options]` | Install or repair only the persistent runtime |
+| `agent-eyes init [options]` | Configure only MCP clients and supported skills |
+| `agent-eyes serve [--log-level LEVEL]` | Run the stdio MCP server |
 
-## Platform guidance
+Common setup/init options include repeatable `--client ID`, `--all-detected`,
+`--dry-run`, `--yes`, `--non-interactive`, and `--json`. Setup/install also
+accept `--repair`. Use `--help` on any command for its local syntax.
 
-| Platform | Foreground provider | Input provider | User-controlled setup |
-|---|---|---|---|
-| macOS | AXUIElement via PyObjC | Quartz CGEvent | Grant Accessibility to the app responsible for launching Agent Eyes (for example Codex, Claude, Terminal, or iTerm) |
-| Windows | Microsoft UI Automation via `comtypes` | Win32 SendInput | Standard desktop UI usually needs no prompt; elevated/protected UI has additional Windows restrictions |
-| Linux/X11 | AT-SPI2 via PyGObject | XTest via `python-xlib` | Install distro AT-SPI/PyGObject packages and ensure the accessibility service/display session is available |
-| Linux/Wayland | AT-SPI2 for structure | Depends on compositor/session | Universal physical input is not implemented yet; doctor reports the capability gap instead of crashing |
-
-Linux distributions provide GI/AT-SPI bindings as system packages. Install them before rerunning setup:
-
-```bash
-# Debian/Ubuntu (pipx is also required for the persistent Linux tool)
-sudo apt install at-spi2-core python3-gi gir1.2-atspi-2.0
-python3 -m pip install --user pipx && python3 -m pipx ensurepath
-
-# Fedora (pipx is also required for the persistent Linux tool)
-sudo dnf install at-spi2-core python3-gobject at-spi2-atk pipx
-```
-
-Agent Eyes does not modify system Python or use `--break-system-packages`.
-
-## Browser behavior
-
-Normal foreground browser work does not require a Chrome remote-debugging restart.
-
-The operating-system accessibility provider can inspect and operate Safari, Firefox, Chromium-family browsers, and other accessible browsers as ordinary applications. The target policy is:
-
-1. Refresh every live accessibility-visible browser/window/tab target.
-2. Score all open tabs against the requested site, title, URL, and task.
-3. Focus and reuse the best relevant existing tab.
-4. Open a new foreground tab only if there is no suitable match.
-5. Use a background/shadow provider only when the caller explicitly requests it.
-
-`list_tabs`, `navigate`, `new_tab`, and `close_tab` use the native foreground policy by default. Returned targets have provider-qualified IDs such as `native:78738:w1:t3:h4a1c9e2d7b10`; the content fingerprint makes destructive IDs stale when a tab is replaced or reordered, so prefer those IDs over a mutable list position. `web_tree`, `js`, `dialog`, `upload`, and `pierce` are protocol-only tools and reject the call unless `shadow=true` was explicitly supplied. Agent Eyes never asks for a Chrome remote-debugging restart during normal foreground work.
-
-Current limitation: native accessibility exposes the tab labels and controls that each browser makes available to assistive technology, but some browsers do not expose every inactive tab's exact URL or page DOM. The planned shared WebExtension bridge adds exact tab/URL/navigation metadata while keeping one browser-neutral protocol. Chromium and Firefox can share most extension code but require different native-host manifests; Safari uses the same WebExtension core inside its Apple packaging/native-app bridge. These packaging adapters do not leak into the MCP tool contract. See the [v2 architecture](docs/plans/2026-07-17-agent-eyes-v2-native-first-design.md).
-
-The bridge is therefore not the universal browser-control dependency. Native
-accessibility remains the always-on foreground plane. A future optional bridge
-can share its WebExtension logic and Agent Eyes protocol, while retaining small
-browser packaging/permission adapters: Chromium and Firefox native-messaging
-manifests differ, and Safari Web Extensions ship as Apple app extensions.
-[WebDriver BiDi](https://www.w3.org/TR/webdriver-bidi/) provides a promising
-evented cross-browser protocol, but it creates a WebDriver session and remains a
-Working Draft; Agent Eyes treats it as a future explicit shadow provider rather
-than a way to seize every already-open authenticated browser session. The Linux
-broker direction similarly targets the
-[XDG RemoteDesktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
-and [libei](https://libinput.pages.freedesktop.org/libei/) without changing the
-MCP contract.
-
-## Completion and performance model
-
-Foreground waits subscribe to macOS AXObserver, Windows UI Automation, or Linux AT-SPI notifications before evaluating the condition. Navigation and explicit shadow waits use protocol lifecycle/accessibility events. Actions return as soon as the expected state is observable; bounded adaptive checks are used only when an OS notification provider cannot be registered. Delays that separate physical key-down/up or drag events remain input semantics, not page-load polling.
-
-To keep model context small, orientation is compact by default, trees have bounded output budgets, element text is normalized/truncated, and browser target IDs remain stable between ranking changes. Ask for a targeted `find`, `subtree`, or `wait` result instead of repeatedly requesting a full tree.
+See the [complete CLI reference](https://github.com/jellythomas/agent-eyes/blob/main/docs/api/agent-eyes-cli.md) for every option,
+default, profile, JSON field, exit code, environment override, and example.
 
 ## MCP tools
 
-Agent Eyes currently exposes 28 tools on macOS and 26 on Windows/Linux when the
-foreground core is ready. `app` and `window` are omitted outside macOS until
-their exact-target mutation contracts are implemented on those platforms:
+The server exposes 28 tools on macOS and 25 on Windows/Linux after omitting the
+macOS-only `app`, `window`, and Apple Events compatibility `shadow` tools:
 
 - Orientation: `status`, `context`, `list_apps`, `focused`
 - Structured UI: `tree`, `subtree`, `find`, `pierce`
 - Input: `click`, `type`, `press_key`, `hover`, `scroll`, `drag`, `fill_form`, `upload`
-- Applications/windows: `app`, `window`
+- Applications/windows on macOS: `app`, `window`
 - Browser/web: `list_tabs`, `web_tree`, `navigate`, `js`, `new_tab`, `close_tab`, `dialog`, `wait`
-- Explicit background mode: `shadow`
-- Compatibility: `install_check` (same live result as `status`)
+- Explicit background compatibility on macOS: `shadow`
+- Readiness compatibility: `install_check` (same live result as `status`)
 
-Element IDs from a tree can be passed to action tools. Structured accessibility output is preferred over screenshots to reduce latency and token use.
+Preserve each immutable observation snapshot and pass it whenever the action
+accepts one. Shadow element actions require the matching snapshot; legacy
+foreground `click` and `type` calls can still resolve an unqualified current ID,
+but snapshot-qualified calls are safer. See the
+[complete MCP tool reference](https://github.com/jellythomas/agent-eyes/blob/main/docs/api/mcp-tools.md) for transport, routing,
+parameters, bounds, results, errors, platform availability, safety rules, and
+copyable JSON arguments for every tool.
+
+## Readiness states
+
+Agent Eyes derives readiness from live providers rather than an installed flag:
+
+| State | Meaning | Next action |
+|---|---|---|
+| `ready` | Every capability required by the selected profile is available | None |
+| `degraded` | Core foreground use works; an optional/persistent component is missing | Run latest setup when convenient |
+| `setup_required` | A component required by the selected profile is missing/failed | Run `uvx agent-eyes@latest setup` |
+| `permission_required` | Providers exist but an OS permission/service blocks them | Follow doctor, restart the responsible app, and rerun doctor |
+
+The cached diagnostic manifest is `~/.agent-eyes/readiness.json`. Live probes are
+authoritative. Its version, platform, architecture, Python, profile, and
+executable fingerprint lets consumers detect whether saved state matches their
+current environment.
+
+If the MCP is attached before setup, stdio initialization still completes
+without installing or probing permissions. The first `status` or computer-use
+call performs a bounded readiness check and returns one structured remediation
+when needed; it does not repeatedly prepend setup questions to later results.
+
+## Platform providers
+
+| Platform | Foreground observation | Input | User-controlled requirement |
+|---|---|---|---|
+| macOS | AXUIElement through PyObjC | Quartz CGEvent | Grant Accessibility to the app that launches Agent Eyes, such as Codex, Claude, Terminal, or iTerm |
+| Windows | Microsoft UI Automation through `comtypes` | Win32 SendInput | Normal desktop UI usually has no prompt; elevated/protected UI remains restricted |
+| Linux/X11 | AT-SPI2 through PyGObject | XTest through `python-xlib` | Install distro packages and ensure the accessibility service/display session is available |
+| Linux/Wayland | AT-SPI2 for structure | Compositor/session dependent | Universal physical input is not implemented; doctor reports the gap |
+
+## Troubleshooting
+
+Start with live diagnostics:
+
+```bash
+agent-eyes doctor --verbose
+agent-eyes doctor --json
+```
+
+Common recovery paths:
+
+- **Missing provider or dependency:** `uvx agent-eyes@latest setup`.
+- **Damaged same-version runtime:** `agent-eyes setup --repair`.
+- **Permission denied:** grant permission to the app that launches Agent Eyes,
+  restart that app, and rerun doctor.
+- **Malformed client config:** repair the reported JSON, JSONC, or TOML file, then
+  rerun `agent-eyes init --dry-run`.
+- **Old `uvx` MCP entry:** rerun `agent-eyes init`; client configs should use the
+  persistent absolute launcher.
+- **Interrupted setup:** rerun the same setup command. Installation and config
+  writes are lock-protected and idempotent.
+- **Client still shows old tools:** restart/reload the changed client.
+
+Backups of existing changed configs and skills are under
+`~/.agent-eyes/backups/`.
+
+## Upgrade, repair, and removal
+
+Upgrade to the latest release and reapply the complete verified setup:
+
+```bash
+uvx agent-eyes@latest setup
+agent-eyes --version
+agent-eyes doctor --verbose
+```
+
+Use `--repair` only to force a same-version reinstall when the persistent
+environment is damaged.
+
+To remove only the persistent executable, use the manager reported by setup:
+
+```bash
+uv tool uninstall agent-eyes
+# or
+pipx uninstall agent-eyes
+```
+
+Then remove the `agent-eyes` entry from MCP client configs and, if present, the
+installed `agent-eyes` skill directories. Automatic cross-client uninstall and
+rollback orchestration is not implemented.
 
 ## Reproducible benchmarks
 
 The checked-in pre-hardening baseline and benchmark programs use deterministic
 fixtures so results are attributable to Agent Eyes rather than a website or
-network. The reference run below used macOS arm64, Python 3.12, 30 measured
-samples after 3 warmups, and p95=`sorted[ceil(0.95*n)-1]`.
+network. The reference v0.9.0 run used macOS arm64, Python 3.12, 30 measured
+samples after three warmups, and p95=`sorted[ceil(0.95*n)-1]`.
 
-| Gate | Before | 0.9.0 | Change |
+| Gate | Before | v0.9.0 | Change |
 |---|---:|---:|---:|
 | Server import p95 | Not comparable* | 286.58 ms | Passes <=450 ms gate |
 | MCP initialize + tools/list p95 | Not comparable* | 319.39 ms | Passes <=500 ms gate |
@@ -190,16 +409,14 @@ samples after 3 warmups, and p95=`sorted[ceil(0.95*n)-1]`.
 | Provider calls for 32 identical observations | 32 | 1 | 96.9% fewer |
 | CDP enrichment, 60 elements / 1 ms RTT | 182 round trips | 61 round trips | 66.5% fewer; 2.92x measured speedup |
 
-*Startup schema 2 measures the named operation boundaries: server import time
-inside a fresh interpreter, and MCP process launch through the tools/list
-response. The schema 1 baseline also included interpreter lifecycle and MCP
-transport cleanup, so its startup values are retained as history but are not a
-like-for-like comparison.
+*The current startup schema measures server import in a fresh interpreter and
+MCP launch through `tools/list`. The earlier baseline included interpreter
+lifecycle and transport cleanup, so those startup values are not like-for-like.
 
-The journey benchmark asserts that an existing YouTube target is activated with
-zero new tabs and zero implicit shadow probes, and that an absent target opens
-exactly one foreground tab. It does not include real provider, browser-rendering,
-or network latency. Reproduce every reported class of measurement with:
+The journey benchmark verifies that an existing YouTube target is activated with
+zero new tabs and zero implicit shadow probes, while an absent target opens one
+foreground tab. It deliberately excludes live browser, rendering, and network
+latency. Reproduce the benchmark classes with:
 
 ```bash
 uv run python benchmarks/benchmark_startup.py
@@ -209,67 +426,25 @@ uv run python benchmarks/benchmark_journeys.py
 uv run python benchmarks/stress_concurrency.py
 ```
 
-The stress run also warms the allocator, then measures current process RSS
-before and after 10,000 deterministic `ObservationStore` create/invalidate
-cycles. Each cycle owns and releases one 4 KiB provider payload, the store may
-retain at most one live snapshot, and RSS growth must not exceed the greater of
-10 MiB or 5% of its baseline. Linux reads `/proc/self/statm`, Windows reads the
-process working set, and other supported Unix hosts use `ps` RSS.
-It also starts four fresh interpreter processes for 25 barrier-synchronized
-setup-lock rounds each. All 100 acquisitions must complete, and a shared counter
-must reach exactly 100 without corruption.
-
-Machine-readable results and the baseline protocol are under
-`benchmarks/results/` and `benchmarks/baselines/`.
-
-## Troubleshooting
-
-Start with:
-
-```bash
-agent-eyes doctor --verbose
-agent-eyes doctor --json
-```
-
-Common recovery steps:
-
-- Missing provider: rerun `agent-eyes setup --repair`.
-- Permission denied: grant the permission to the responsible launcher, restart that app, and rerun doctor.
-- Config error: Agent Eyes refuses to overwrite malformed JSON, JSONC, or TOML. Repair the reported file and rerun `agent-eyes init`.
-- Old `uvx` MCP entry: rerun init so the client uses the persistent absolute launcher.
-- Interrupted setup: rerun the same setup command; verified steps and idempotent config entries are safe to repeat.
-
-Backups of existing changed MCP configs and skill artifacts are stored under `~/.agent-eyes/backups/`.
-
-## Upgrade and removal
-
-Upgrade the persistent tool, then reverify:
-
-```bash
-uv tool upgrade agent-eyes
-agent-eyes setup --repair
-```
-
-For pipx installations, use `pipx upgrade agent-eyes`. To remove the executable, use `uv tool uninstall agent-eyes` or `pipx uninstall agent-eyes`, then remove the `agent-eyes` entry from MCP client configs. Automatic rollback/uninstall orchestration is not implemented yet.
+The stress suite also validates bounded observation-store memory and 100
+barrier-synchronized cross-process setup-lock acquisitions. Machine-readable
+results and the baseline protocol are under `benchmarks/results/` and
+`benchmarks/baselines/`.
 
 ## Development
 
 ```bash
 uv sync --all-groups
 uv run python -m pytest -q
-uv run python -m pytest --cov=agent_eyes.coordinator --cov=agent_eyes.input_validation --cov=agent_eyes.observations --cov=agent_eyes.operation --cov=agent_eyes.tool_contract --cov-report=term-missing tests/test_coordinator_concurrency.py tests/test_input_validation.py tests/test_observation_store.py tests/test_operation_budget.py tests/test_tool_contract.py
 uvx ruff check src benchmarks scripts
 uvx bandit -r src scripts -q -ll
 uv run agent-eyes doctor --verbose
 ```
 
-Python 3.10 through 3.14 is tested. The project uses MCP over stdio, so runtime logging must go to stderr; stdout is reserved for JSON-RPC frames.
-
-The package and publish jobs build twice from independent clean Git archives,
-normalize each sdist with `SOURCE_DATE_EPOCH`, require byte-identical wheels and
-sdists, rebuild the wheel from the normalized sdist, and smoke-test the exact
-wheel selected for upload. A release is blocked if any comparison or installed
-CLI/MCP/setup smoke check differs.
+The project uses MCP over stdio, so runtime logs must go to stderr; stdout is
+reserved for JSON-RPC frames. Release jobs build from two independent clean Git
+archives, require reproducible wheel/sdist output, rebuild the wheel from the
+normalized sdist, and smoke-test the exact artifact selected for upload.
 
 ## License
 

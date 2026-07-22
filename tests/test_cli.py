@@ -36,6 +36,82 @@ def test_parser_exposes_guided_setup_commands():
     assert parser.parse_args(["setup", "--yes"]).yes is True
 
 
+def test_compatibility_flags_have_truthful_help_and_remain_accepted(capsys):
+    from agent_eyes.cli import build_parser
+
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as doctor_exit:
+        parser.parse_args(["doctor", "--help"])
+    assert doctor_exit.value.code == 0
+    doctor_help = " ".join(capsys.readouterr().out.split())
+    assert "doctor always performs live checks" in doctor_help
+    assert parser.parse_args(["doctor", "--refresh"]).refresh is True
+
+    with pytest.raises(SystemExit) as install_exit:
+        parser.parse_args(["install", "--help"])
+    assert install_exit.value.code == 0
+    install_help = " ".join(capsys.readouterr().out.split())
+    assert "does not change the platform package installed" in install_help
+    assert parser.parse_args(["install", "--profile", "full"]).profile == "full"
+
+    for command in ("init", "setup"):
+        with pytest.raises(SystemExit) as client_exit:
+            parser.parse_args([command, "--help"])
+        assert client_exit.value.code == 0
+        client_help = " ".join(capsys.readouterr().out.split())
+        assert "Explicitly select the default set of detected MCP clients" in client_help
+        assert parser.parse_args([command, "--all-detected"]).all_detected is True
+
+
+@pytest.mark.parametrize("command", ("init", "setup"))
+def test_unknown_client_is_usage_error(
+    command,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from agent_eyes import cli
+    from agent_eyes.setup import readiness
+
+    launcher = tmp_path / "agent-eyes"
+    launcher.write_text("launcher")
+    report = SimpleNamespace(status=readiness.ReadinessStatus.READY)
+    monkeypatch.setattr(cli, "_persistent_executable", lambda: launcher)
+    monkeypatch.setattr(cli, "_launcher_matches_current", lambda path: True)
+    monkeypatch.setattr(cli, "_prepare_install", lambda repair: (launcher, None))
+    monkeypatch.setattr(cli, "_probe_persistent_readiness", lambda *_args: report)
+
+    result = cli.main(
+        [command, "--client", "unknown", "--dry-run", "--json"]
+    )
+
+    assert result == int(cli.ExitCode.USAGE)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "error": "Unknown MCP client(s): unknown",
+        "status": "error",
+    }
+
+
+def test_setup_environment_value_error_is_setup_required(monkeypatch, capsys):
+    from agent_eyes import cli
+
+    monkeypatch.setattr(
+        cli,
+        "_prepare_install",
+        lambda repair: (_ for _ in ()).throw(ValueError("Unsupported platform: plan9")),
+    )
+
+    result = cli.main(["setup", "--dry-run", "--json"])
+
+    assert result == int(cli.ExitCode.SETUP_REQUIRED)
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "Unsupported platform: plan9",
+        "status": "error",
+    }
+
+
 def test_no_arguments_remain_serve_alias(monkeypatch):
     from agent_eyes import cli
 
@@ -266,6 +342,47 @@ def test_persistent_readiness_parse_error_does_not_echo_launcher_output(
 
     assert secret not in str(exc_info.value)
     assert "stdout_chars=" in str(exc_info.value)
+
+
+def test_persistent_readiness_probe_isolates_launcher_diagnostic_state(
+    tmp_path,
+    monkeypatch,
+):
+    from agent_eyes import cli
+
+    launcher = tmp_path / "agent-eyes"
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o700)
+    persistent_state = tmp_path / "persistent-state"
+    monkeypatch.setenv("AGENT_EYES_STATE_DIR", str(persistent_state))
+    observed: dict[str, Path] = {}
+
+    def run(*args, **kwargs):
+        isolated_state = Path(kwargs["env"]["AGENT_EYES_STATE_DIR"])
+        observed["state"] = isolated_state
+        assert isolated_state != persistent_state
+        assert isolated_state.is_dir()
+        return subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout=json.dumps(
+                {
+                    "status": "ready",
+                    "capabilities": [],
+                    "fingerprint": {},
+                    "checked_at": "2026-07-22T00:00:00+00:00",
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    report = cli._probe_persistent_readiness(launcher, "standard")
+
+    assert report.status.value == "ready"
+    assert not persistent_state.exists()
+    assert not observed["state"].exists()
 
 
 def test_client_configs_are_all_preflighted_before_any_write(tmp_path, monkeypatch):

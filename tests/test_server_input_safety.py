@@ -180,3 +180,51 @@ def test_dual_mode_shadow_calls_require_target_before_readiness_or_dispatch(monk
 
     readiness.assert_not_awaited()
     dispatch.assert_not_awaited()
+
+
+def test_mixed_or_unguarded_pointer_modes_fail_before_readiness_or_dispatch(
+    monkeypatch,
+):
+    from agent_eyes import server
+
+    readiness = AsyncMock(side_effect=AssertionError("readiness must not run"))
+    dispatch = AsyncMock(side_effect=AssertionError("dispatch must not run"))
+    monkeypatch.setattr(server, "_ensure_runtime_readiness", readiness)
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+
+    cases = (
+        ("click", {"x": 10, "y": 20}),
+        (
+            "click",
+            {
+                "id": 4,
+                "snapshot": "s-live",
+                "x": 10,
+                "y": 20,
+                "pid": 7,
+                "shadow": True,
+            },
+        ),
+        (
+            "wait",
+            {
+                "shadow": True,
+                "target_id": "tab-7",
+                "pid": 7,
+                "name": "Ready",
+            },
+        ),
+        (
+            "hover",
+            {"id": 4, "snapshot": "n-live", "x": 10, "y": 20},
+        ),
+    )
+
+    for name, arguments in cases:
+        result = asyncio.run(server.call_tool(name, arguments))
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert "Invalid input" in _result_text(result)
+
+    readiness.assert_not_awaited()
+    dispatch.assert_not_awaited()

@@ -1,53 +1,66 @@
 ---
 name: install
 description: >
-  Guided Agent Eyes runtime installation and repair. Use for first-time setup,
-  missing native/input dependencies, permission diagnosis, or upgrades. Delegates
-  to the model-independent agent-eyes CLI and never installs packages inside the
-  MCP server process.
+  Guide Agent Eyes first-time setup, runtime-only installation, dependency and
+  permission diagnosis, repair, or upgrade. Use the model-independent CLI and
+  never install packages from inside an MCP server process or tool call.
 ---
 
-# Agent Eyes install
+# Install Agent Eyes
 
-The CLI is the source of truth. Do not reproduce package-manager logic in the model.
+Use the CLI as the source of truth. Do not reproduce package-manager operations
+inside the model or mutate the environment that currently hosts an MCP process.
 
-On a fresh machine, use `uvx` only for the bootstrap commands below; after setup,
-the MCP and all normal checks must use the persistent `agent-eyes` launcher.
+## Complete first-time setup
 
-1. Run the read-only diagnosis (use the fallback if the persistent launcher is not installed yet):
-
-   ```bash
-   agent-eyes doctor --verbose
-   ```
-
-   If that executable is not available, run `uvx agent-eyes doctor --verbose`.
-
-2. Preview the exact user-level installation plan:
-
-   ```bash
-   agent-eyes install --dry-run
-   ```
-
-3. Run the guided installer:
-
-   ```bash
-   agent-eyes install
-   ```
-
-   A healthy current persistent launcher is a no-op. Use `agent-eyes install --repair` only to force a reinstall.
-
-4. Follow any OS permission or Linux system-package instruction printed by the CLI, then rerun doctor.
-
-For a complete first run—including persistent install, MCP client initialization, and verification—prefer:
+Prefer the complete workflow when the user wants Agent Eyes ready in an MCP
+client:
 
 ```bash
-uvx agent-eyes setup
+uv --version
+uvx agent-eyes@latest setup --dry-run
+uvx agent-eyes@latest setup
+agent-eyes --version
+agent-eyes doctor --verbose
 ```
 
-Rules:
+The `uvx` environment only runs the latest bootstrap wizard. Setup installs the
+matching platform package persistently, configures selected MCP clients, installs
+the canonical skill for Claude Code/Codex plus Codex metadata, and verifies the
+persistent providers. Restart every client reported as changed.
 
-- Never run `pip install` against the active MCP/uvx environment.
-- Never silently use sudo or approve OS/browser dialogs.
-- Never write an installed Boolean; readiness comes from live checks and `~/.agent-eyes/readiness.json` is only a cache.
-- Chrome remote debugging is optional shadow capability and is never a normal installation requirement.
-- Report the exact CLI status and remediation; do not claim readiness from command exit alone.
+On Linux, require `/usr/bin/python3` 3.10 or newer, `pipx`, and distro
+AT-SPI/PyGObject packages before setup. The persistent runtime uses
+`pipx --system-site-packages --python /usr/bin/python3` so it can import the
+distro bindings. Report missing prerequisites exactly as the CLI reports them;
+do not run `sudo` automatically.
+
+## Runtime-only install or repair
+
+Use this only when the user explicitly wants the persistent executable without
+MCP client configuration:
+
+```bash
+uvx agent-eyes@latest install --dry-run
+uvx agent-eyes@latest install
+agent-eyes doctor --verbose
+```
+
+On an already installed current launcher, the equivalent commands begin with
+`agent-eyes install`. A healthy current launcher is a no-op. Use
+`agent-eyes install --repair` for a forced same-version runtime reinstall. Use
+the complete `uvx agent-eyes@latest setup` flow for upgrades so client entries
+and skills are synchronized too.
+
+`agent-eyes install` does not configure MCP clients or install skills. Use
+`agent-eyes init` afterward, or use complete setup instead.
+
+## Safety and reporting
+
+- Never run `pip install` inside an active MCP/uvx environment.
+- Never silently run `sudo`, grant OS permissions, or approve browser dialogs.
+- Never treat an installed Boolean as readiness; use the live doctor result.
+- Treat `~/.agent-eyes/readiness.json` as a cache, not proof.
+- Do not require Chrome remote debugging or Playwright MCP for foreground use.
+- Report the installed version, executable path, readiness state, remediation,
+  and clients that still need a restart.

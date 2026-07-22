@@ -135,7 +135,7 @@ def test_blocked_runtime_action_reports_actual_readiness_status(monkeypatch):
 
     assert isinstance(result, CallToolResult)
     assert result.isError is True
-    assert result.content[0].text.startswith("permission_required:")
+    assert result.content[0].text.startswith("ERROR: permission_required:")
 
 
 def test_native_read_only_action_is_not_blocked_by_missing_input(monkeypatch):
@@ -162,7 +162,7 @@ def test_input_action_is_blocked_when_only_input_capability_is_missing(monkeypat
 
     assert isinstance(result, CallToolResult)
     assert result.isError is True
-    assert result.content[0].text.startswith("setup_required:")
+    assert result.content[0].text.startswith("ERROR: setup_required:")
     assert "input" in result.content[0].text
     dispatch.assert_not_awaited()
 

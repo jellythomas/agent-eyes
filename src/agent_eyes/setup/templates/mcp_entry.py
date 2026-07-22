@@ -68,6 +68,7 @@ _ALL_AGENT_EYES_TOOLS = [
 _MACOS_ONLY_AGENT_EYES_TOOLS = frozenset(
     {
         "mcp__agent-eyes__app",
+        "mcp__agent-eyes__shadow",
         "mcp__agent-eyes__window",
     }
 )

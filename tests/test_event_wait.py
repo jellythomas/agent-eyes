@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
+
+from mcp.types import CallToolResult
 
 from agent_eyes.adapters.base import UIElement
 from agent_eyes.cdp import CDPClient, ChromeTab
@@ -241,6 +244,7 @@ def test_default_wait_does_not_probe_or_connect_shadow_provider(monkeypatch):
 
         result = await server._handle_wait_for({"role": "button", "timeout": 0.01})
 
+        assert result.startswith("ERROR:")
         assert "pid" in result.lower()
         server._ensure_tabs.assert_not_awaited()
         server.cdp_pool.ensure_connected.assert_not_awaited()
@@ -309,8 +313,60 @@ def test_foreground_native_wait_timeout_never_probes_shadow(monkeypatch):
             {"pid": 56, "name": "Missing", "timeout": 0.02}
         )
 
-        assert result.startswith("Timeout after 0.02s")
+        assert result.startswith("ERROR: Timeout after 0.02s")
         server.cdp_pool.ensure_connected.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_foreground_wait_missing_pid_is_an_mcp_tool_error(monkeypatch):
+    async def run():
+        from agent_eyes import server
+
+        monkeypatch.setattr(
+            server,
+            "_ensure_runtime_readiness",
+            AsyncMock(return_value=SimpleNamespace(core_ready=True)),
+        )
+
+        result = await server.call_tool("wait", {"role": "button"})
+
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert result.content[0].text.startswith("ERROR:")
+        assert "pid" in result.content[0].text.lower()
+
+    asyncio.run(run())
+
+
+def test_foreground_wait_timeout_is_an_mcp_tool_error(monkeypatch):
+    async def run():
+        from agent_eyes import server
+
+        waiter = AsyncMock(
+            return_value=NativeWaitResult(
+                element=None,
+                elapsed=0.01,
+                event_driven=True,
+                checks=1,
+            )
+        )
+        monkeypatch.setattr(server, "native_adapter", MagicMock())
+        monkeypatch.setattr(server, "wait_for_native_element", waiter)
+        monkeypatch.setattr(
+            server,
+            "_ensure_runtime_readiness",
+            AsyncMock(return_value=SimpleNamespace(core_ready=True)),
+        )
+
+        result = await server.call_tool(
+            "wait",
+            {"pid": 56, "name": "Missing", "timeout": 0.01},
+        )
+
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert result.content[0].text.startswith("ERROR: Timeout after 0.01s")
 
     asyncio.run(run())
 
@@ -367,6 +423,42 @@ def test_explicit_shadow_wait_uses_connected_event_session(monkeypatch):
         assert result.startswith("snapshot=")
         assert "Continue" in result
         session.wait_for_ax_node.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_shadow_wait_timeout_is_an_mcp_tool_error(monkeypatch):
+    async def run():
+        from agent_eyes import server
+
+        session = MagicMock()
+        session.generation = 4
+        session.wait_for_ax_node = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            server,
+            "_get_cdp_session",
+            AsyncMock(return_value=(session, MagicMock(id="target-7"), "")),
+        )
+        monkeypatch.setattr(
+            server,
+            "_persistent_document_revision",
+            AsyncMock(return_value=12),
+        )
+        monkeypatch.setattr(server, "coordinator", server.AutomationCoordinator())
+
+        result = await server.call_tool(
+            "wait",
+            {
+                "role": "button",
+                "shadow": True,
+                "target_id": "target-7",
+                "timeout": 0.01,
+            },
+        )
+
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert result.content[0].text.startswith("ERROR: Timeout")
 
     asyncio.run(run())
 
