@@ -1,0 +1,39 @@
+{
+  "environment": {
+    "agent_eyes": "0.9.0",
+    "architecture": "arm64",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.11"
+  },
+  "protocol": {
+    "fixture": "deterministic native-first public call_tool path; no network latency",
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "samples": 30,
+    "warmups": 3
+  },
+  "scenarios": {
+    "existing_tab_reuse": {
+      "evidence": {
+        "activation_calls": [1],
+        "foreground_open_calls": [0],
+        "implicit_shadow_probes": [0],
+        "inventory_calls": [2],
+        "mcp_calls": [2]
+      },
+      "latency": {"max_ms": 0.367, "median_ms": 0.178, "p95_ms": 0.358},
+      "output_size": {"max_bytes": 485.0, "median_bytes": 485.0, "p95_bytes": 485.0}
+    },
+    "new_tab_when_absent": {
+      "evidence": {
+        "activation_calls": [0],
+        "foreground_open_calls": [1],
+        "implicit_shadow_probes": [0],
+        "inventory_calls": [2],
+        "mcp_calls": [2]
+      },
+      "latency": {"max_ms": 0.527, "median_ms": 0.204, "p95_ms": 0.427},
+      "output_size": {"max_bytes": 206.0, "median_bytes": 206.0, "p95_bytes": 206.0}
+    }
+  },
+  "schema_version": 1
+}

@@ -1,9 +1,9 @@
-"""Cross-platform human-like input simulation for agent-eyes.
+"""Cross-platform input simulation for agent-eyes.
 
 Simulates REAL keyboard and mouse events at the OS level, triggering
-all event listeners (onInput, onChange, keyDown, keyUp) just like
-physical hardware input. This is critical for apps that use event
-listeners to validate input (e.g., Jamf, web apps in Chrome).
+application input handling. Text uses each platform's bounded native bulk path
+by default; callers can explicitly request slower per-character timing with
+``human_like=True``.
 
 Platform support:
   - macOS:   CGEvent API via PyObjC (HID-level, indistinguishable from hardware)
@@ -22,7 +22,6 @@ Usage:
 from __future__ import annotations
 
 import abc
-import os
 import sys
 import time
 import logging
@@ -31,6 +30,38 @@ import random
 from typing import Optional
 
 logger = logging.getLogger("agent-eyes")
+
+_MACOS_UNICODE_EVENT_UNIT_LIMIT = 20
+
+
+def _utf16_code_units(text: str) -> tuple[int, ...]:
+    """Return the UTF-16 code units required by native keyboard APIs."""
+    encoded = text.encode("utf-16-le", errors="surrogatepass")
+    return tuple(
+        encoded[index] | (encoded[index + 1] << 8)
+        for index in range(0, len(encoded), 2)
+    )
+
+
+def _chunks_by_utf16_units(text: str, limit: int) -> tuple[str, ...]:
+    """Split text without breaking a supplementary Unicode character."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+    for character in text:
+        character_units = len(_utf16_code_units(character))
+        if current and current_units + character_units > limit:
+            chunks.append("".join(current))
+            current = []
+            current_units = 0
+        current.append(character)
+        current_units += character_units
+    if current:
+        chunks.append("".join(current))
+    return tuple(chunks)
 
 
 class InputBackend(abc.ABC):
@@ -42,8 +73,13 @@ class InputBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
-        """Type text character by character, firing real key events."""
+    def type_text(
+        self,
+        text: str,
+        delay: float = 0.02,
+        human_like: bool = False,
+    ) -> bool:
+        """Type text, using fast native batching unless human-like mode is explicit."""
         ...
 
     @abc.abstractmethod
@@ -100,14 +136,12 @@ class InputBackend(abc.ABC):
         """Clear a text field like a human: select all, then delete."""
         if not self.select_all():
             return False
-        time.sleep(0.05)
         return self.press_key("delete")
 
     def clear_and_type(self, text: str, delay: float = 0.02) -> bool:
-        """Clear a field and type new text — the full human-like sequence."""
+        """Clear a field and type new text with the default fast text path."""
         if not self.clear_field():
             return False
-        time.sleep(0.05)
         return self.type_text(text, delay=delay)
 
     def click_and_type(
@@ -116,7 +150,6 @@ class InputBackend(abc.ABC):
         """Click an element, optionally clear it, and type text."""
         if not self.click(x, y):
             return False
-        time.sleep(0.08)
         if clear:
             return self.clear_and_type(text, delay=delay)
         return self.type_text(text, delay=delay)
@@ -161,38 +194,50 @@ class MacOSInputBackend(InputBackend):
         if sys.platform != "darwin":
             return False
         try:
-            import Quartz  # noqa: F401
-            return True
+            import Quartz
+
+            preflight = getattr(Quartz, "CGPreflightPostEventAccess", None)
+            return bool(preflight()) if callable(preflight) else True
         except ImportError:
             return False
+        except Exception:
+            return False
 
-    def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
+    def type_text(
+        self,
+        text: str,
+        delay: float = 0.02,
+        human_like: bool = False,
+    ) -> bool:
         self._load()
         Q = self._quartz
-        source = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
         try:
-            for char in text:
-                # Key down with unicode character
-                event = Q.CGEventCreateKeyboardEvent(source, 0, True)
-                Q.CGEventKeyboardSetUnicodeString(event, 1, char)
-                Q.CGEventPost(Q.kCGSessionEventTap, event)
+            if not text:
+                return True
+            source = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
+            chunks = (
+                tuple(text)
+                if human_like
+                else _chunks_by_utf16_units(
+                    text,
+                    _MACOS_UNICODE_EVENT_UNIT_LIMIT,
+                )
+            )
+            for chunk in chunks:
+                unit_count = len(_utf16_code_units(chunk))
+                for key_down in (True, False):
+                    event = Q.CGEventCreateKeyboardEvent(source, 0, key_down)
+                    Q.CGEventKeyboardSetUnicodeString(event, unit_count, chunk)
+                    Q.CGEventPost(Q.kCGSessionEventTap, event)
 
-                # Key up
-                event = Q.CGEventCreateKeyboardEvent(source, 0, False)
-                Q.CGEventKeyboardSetUnicodeString(event, 1, char)
-                Q.CGEventPost(Q.kCGSessionEventTap, event)
-
-                # Human-like variable delay
                 if human_like:
                     d = delay * random.uniform(0.7, 1.3)
-                    if char in " .,;:!?\n":
+                    if chunk in " .,;:!?\n":
                         d *= random.uniform(1.3, 2.0)
-                    time.sleep(d)
-                else:
-                    time.sleep(delay)
+                    time.sleep(max(0, d))
             return True
-        except Exception as e:
-            logger.error("macOS type_text failed: %s", e)
+        except Exception:
+            logger.error("macOS type_text failed")
             return False
 
     def press_key(self, key: str) -> bool:
@@ -200,7 +245,7 @@ class MacOSInputBackend(InputBackend):
         Q = self._quartz
         key_code = self._KEY_CODES.get(key.lower())
         if key_code is None:
-            logger.error("Unknown key: %s", key)
+            logger.error("Unknown key (key_length=%d)", len(key))
             return False
         try:
             # Use kCGSessionEventTap (not kCGHIDEventTap) to target the
@@ -216,10 +261,15 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGSessionEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS press_key failed: %s", e)
+            logger.error(
+                "macOS press_key failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def hotkey(self, *keys: str) -> bool:
+        if len(keys) < 2:
+            return False
         self._load()
         Q = self._quartz
         modifier_flags = {
@@ -235,8 +285,9 @@ class MacOSInputBackend(InputBackend):
             flags = 0
             for m in mods:
                 flag = modifier_flags.get(m.lower())
-                if flag:
-                    flags |= flag
+                if flag is None:
+                    return False
+                flags |= flag
 
             key_code = self._KEY_CODES.get(final_key.lower())
             if key_code is None:
@@ -259,7 +310,10 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGSessionEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS hotkey failed: %s", e)
+            logger.error(
+                "macOS hotkey failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def click(self, x: int, y: int, button: str = "left") -> bool:
@@ -285,7 +339,10 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGHIDEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS click failed: %s", e)
+            logger.error(
+                "macOS click failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def double_click(self, x: int, y: int) -> bool:
@@ -310,7 +367,10 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGHIDEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS double_click failed: %s", e)
+            logger.error(
+                "macOS double_click failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
@@ -326,7 +386,10 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGHIDEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS scroll failed: %s", e)
+            logger.error(
+                "macOS scroll failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def move_mouse(self, x: int, y: int) -> bool:
@@ -337,7 +400,10 @@ class MacOSInputBackend(InputBackend):
             Q.CGEventPost(Q.kCGHIDEventTap, event)
             return True
         except Exception as e:
-            logger.error("macOS move_mouse failed: %s", e)
+            logger.error(
+                "macOS move_mouse failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def paste_text(self, text: str) -> bool:
@@ -375,7 +441,10 @@ class MacOSInputBackend(InputBackend):
 
             return True
         except Exception as e:
-            logger.error("macOS paste_text failed: %s", e)
+            logger.error(
+                "macOS paste_text failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def is_frontmost(self, pid: int) -> bool:
@@ -397,20 +466,20 @@ class MacOSInputBackend(InputBackend):
             from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
             app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
             if app:
-                app.activateWithOptionSet_(NSApplicationActivateIgnoringOtherApps)
-                time.sleep(0.15)
-                return True
+                return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
             # Fallback to System Events if NSRunningApplication fails
-            subprocess.run(
+            completed = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to set frontmost of '
                  f'(first process whose unix id is {pid}) to true'],
                 capture_output=True, timeout=3,
             )
-            time.sleep(0.15)
-            return True
+            return completed.returncode == 0
         except Exception as e:
-            logger.error("macOS activate_window failed: %s", e)
+            logger.error(
+                "macOS activate_window failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
 
@@ -424,41 +493,63 @@ class LinuxInputBackend(InputBackend):
         self._X = None
         self._XK = None
         self._xtest = None
+        self._event = None
         try:
             from Xlib import X, XK, display
             from Xlib.ext import xtest
+            from Xlib.protocol import event
             self._display = display.Display()
             self._X = X
             self._XK = XK
             self._xtest = xtest
-        except ImportError:
-            pass
+            self._event = event
+        except Exception as exc:
+            logger.debug(
+                "Linux X11 input backend unavailable (exception_type=%s)",
+                type(exc).__name__,
+            )
 
     def is_available(self) -> bool:
         return self._display is not None
 
-    def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
+    def type_text(
+        self,
+        text: str,
+        delay: float = 0.02,
+        human_like: bool = False,
+    ) -> bool:
         try:
+            keycodes: list[int] = []
             for char in text:
                 keysym = self._XK.string_to_keysym(char)
                 if not keysym:
-                    # Use Unicode keysym for chars not in standard X keysym table
+                    # Use Unicode keysym for chars not in standard X keysym table.
                     keysym = ord(char) | 0x01000000
                 keycode = self._display.keysym_to_keycode(keysym)
-                if keycode:
-                    self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
-                    self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
-                    self._display.sync()
+                if not keycode:
+                    # Preflight the complete value so an unsupported character
+                    # cannot leave a partially typed prefix behind.
+                    return False
+                keycodes.append(keycode)
+
+            dispatched = False
+            for char, keycode in zip(text, keycodes):
+                self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
+                self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
+                dispatched = True
                 if human_like:
+                    if dispatched:
+                        self._display.sync()
+                        dispatched = False
                     d = delay + random.uniform(-0.005, 0.015)
                     if char in " .,;:!?\n":
                         d *= random.uniform(1.3, 2.0)
                     time.sleep(max(0, d))
-                else:
-                    time.sleep(delay)
+            if dispatched:
+                self._display.sync()
             return True
-        except Exception as e:
-            logger.error("Linux type_text failed: %s", e)
+        except Exception:
+            logger.error("Linux type_text failed")
             return False
 
     # XK name mapping for special keys
@@ -486,18 +577,27 @@ class LinuxInputBackend(InputBackend):
             xk_name = self._KEY_MAP.get(key.lower(), key)
             keysym = self._XK.string_to_keysym(xk_name)
             if not keysym:
-                logger.error("Linux press_key: unknown key %s", key)
+                logger.error(
+                    "Linux press_key: unknown key (key_length=%d)",
+                    len(key),
+                )
                 return False
             keycode = self._display.keysym_to_keycode(keysym)
             if not keycode:
-                logger.error("Linux press_key: no keycode for %s", key)
+                logger.error(
+                    "Linux press_key: no keycode (key_length=%d)",
+                    len(key),
+                )
                 return False
             self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
             self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux press_key failed: %s", e)
+            logger.error(
+                "Linux press_key failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def hotkey(self, *keys: str) -> bool:
@@ -507,11 +607,17 @@ class LinuxInputBackend(InputBackend):
                 xk_name = self._KEY_MAP.get(key.lower(), key)
                 keysym = self._XK.string_to_keysym(xk_name)
                 if not keysym:
-                    logger.error("Linux hotkey: unknown key %s", key)
+                    logger.error(
+                        "Linux hotkey: unknown key (key_length=%d)",
+                        len(key),
+                    )
                     return False
                 kc = self._display.keysym_to_keycode(keysym)
                 if not kc:
-                    logger.error("Linux hotkey: no keycode for %s", key)
+                    logger.error(
+                        "Linux hotkey: no keycode (key_length=%d)",
+                        len(key),
+                    )
                     return False
                 keycodes.append(kc)
             for kc in keycodes:
@@ -521,7 +627,10 @@ class LinuxInputBackend(InputBackend):
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux hotkey failed: %s", e)
+            logger.error(
+                "Linux hotkey failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def click(self, x: int, y: int, button: str = "left") -> bool:
@@ -536,7 +645,10 @@ class LinuxInputBackend(InputBackend):
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux click failed: %s", e)
+            logger.error(
+                "Linux click failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def double_click(self, x: int, y: int) -> bool:
@@ -551,7 +663,10 @@ class LinuxInputBackend(InputBackend):
                 time.sleep(0.05)
             return True
         except Exception as e:
-            logger.error("Linux double_click failed: %s", e)
+            logger.error(
+                "Linux double_click failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def move_mouse(self, x: int, y: int) -> bool:
@@ -561,7 +676,10 @@ class LinuxInputBackend(InputBackend):
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux move_mouse failed: %s", e)
+            logger.error(
+                "Linux move_mouse failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
@@ -587,7 +705,10 @@ class LinuxInputBackend(InputBackend):
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux scroll failed: %s", e)
+            logger.error(
+                "Linux scroll failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> bool:
@@ -608,7 +729,10 @@ class LinuxInputBackend(InputBackend):
             self._display.sync()
             return True
         except Exception as e:
-            logger.error("Linux drag failed: %s", e)
+            logger.error(
+                "Linux drag failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def paste_text(self, text: str) -> bool:
@@ -616,9 +740,77 @@ class LinuxInputBackend(InputBackend):
         return self.hotkey("ctrl", "v")
 
     def activate_window(self, pid: int) -> bool:
-        # python-xlib does not provide a reliable cross-WM window activation API.
-        # Return False and let the caller use alternative means.
-        return False
+        """Request foreground activation through the EWMH window-manager API."""
+        try:
+            if self.is_frontmost(pid):
+                return True
+            target = self._window_for_pid(pid)
+            if target is None or self._event is None:
+                return False
+
+            root = self._display.screen().root
+            active_atom = self._display.intern_atom("_NET_ACTIVE_WINDOW")
+            current = self._property_values(root, "_NET_ACTIVE_WINDOW")
+            current_window = int(current[0]) if current else 0
+            message = self._event.ClientMessage(
+                window=target,
+                client_type=active_atom,
+                data=(32, [1, self._X.CurrentTime, current_window, 0, 0]),
+            )
+            root.send_event(
+                message,
+                event_mask=(
+                    self._X.SubstructureRedirectMask
+                    | self._X.SubstructureNotifyMask
+                ),
+                propagate=False,
+            )
+            self._display.flush()
+            return True
+        except Exception as e:
+            logger.error(
+                "Linux activate_window failed (exception_type=%s)",
+                type(e).__name__,
+            )
+            return False
+
+    def _property_values(self, window, property_name: str) -> list[int]:
+        """Read one EWMH property as integer values."""
+        atom = self._display.intern_atom(property_name, only_if_exists=True)
+        if not atom:
+            return []
+        value = window.get_full_property(atom, self._X.AnyPropertyType)
+        if value is None:
+            return []
+        return [int(item) for item in value.value]
+
+    def _window_pid(self, window) -> int | None:
+        values = self._property_values(window, "_NET_WM_PID")
+        return values[0] if values else None
+
+    def _window_for_pid(self, pid: int):
+        root = self._display.screen().root
+        for property_name in ("_NET_CLIENT_LIST_STACKING", "_NET_CLIENT_LIST"):
+            for window_id in reversed(self._property_values(root, property_name)):
+                try:
+                    window = self._display.create_resource_object("window", window_id)
+                    if self._window_pid(window) == pid:
+                        return window
+                except Exception:
+                    continue
+        return None
+
+    def is_frontmost(self, pid: int) -> bool:
+        """Return whether the EWMH active window belongs to ``pid``."""
+        try:
+            root = self._display.screen().root
+            active = self._property_values(root, "_NET_ACTIVE_WINDOW")
+            if not active:
+                return False
+            window = self._display.create_resource_object("window", active[0])
+            return self._window_pid(window) == pid
+        except Exception:
+            return False
 
 
 # ── Windows: SendInput via ctypes ──────────────────────────────────
@@ -687,6 +879,12 @@ class WindowsInputBackend(InputBackend):
         self._INPUT = INPUT
         self._KEYBDINPUT = KEYBDINPUT
         self._MOUSEINPUT = MOUSEINPUT
+        self._user32.SendInput.argtypes = (
+            wintypes.UINT,
+            ctypes.POINTER(INPUT),
+            ctypes.c_int,
+        )
+        self._user32.SendInput.restype = wintypes.UINT
 
     def is_available(self) -> bool:
         if sys.platform != "win32":
@@ -697,87 +895,91 @@ class WindowsInputBackend(InputBackend):
         except ImportError:
             return False
 
-    def _send_input(self, inp):
+    def _send_input(self, inp) -> bool:
         import ctypes
-        self._user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+        sent = self._user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+        return int(sent) == 1
 
-    def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
-        self._load()
+    def _send_inputs(self, inputs: list[object]) -> bool:
+        """Send one uninterrupted native input array and verify full dispatch."""
+        import ctypes
+
+        if not inputs:
+            return True
+        array = (self._INPUT * len(inputs))(*inputs)
+        sent = self._user32.SendInput(
+            len(inputs),
+            array,
+            ctypes.sizeof(self._INPUT),
+        )
+        return int(sent) == len(inputs)
+
+    def _unicode_input_events(self, text: str) -> list[object]:
         KEYEVENTF_UNICODE = 0x0004
         KEYEVENTF_KEYUP = 0x0002
-        try:
-            for char in text:
-                scan = ord(char)
-                # Key down
-                inp = self._INPUT(
-                    type=1,
-                    _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
-                        wVk=0, wScan=scan, dwFlags=KEYEVENTF_UNICODE,
-                    )),
+        events: list[object] = []
+        for scan in _utf16_code_units(text):
+            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+                events.append(
+                    self._INPUT(
+                        type=1,
+                        _input=self._INPUT._INPUT(
+                            ki=self._KEYBDINPUT(
+                                wVk=0,
+                                wScan=scan,
+                                dwFlags=flags,
+                            )
+                        ),
+                    )
                 )
-                self._send_input(inp)
-                # Key up
-                inp = self._INPUT(
-                    type=1,
-                    _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
-                        wVk=0, wScan=scan,
-                        dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    )),
-                )
-                self._send_input(inp)
+        return events
 
-                if human_like:
-                    d = delay * random.uniform(0.7, 1.3)
-                    if char in " .,;:!?\n":
-                        d *= random.uniform(1.3, 2.0)
-                    time.sleep(d)
-                else:
-                    time.sleep(delay)
+    def type_text(
+        self,
+        text: str,
+        delay: float = 0.02,
+        human_like: bool = False,
+    ) -> bool:
+        self._load()
+        try:
+            if not human_like:
+                return self._send_inputs(self._unicode_input_events(text))
+
+            for character in text:
+                if not self._send_inputs(self._unicode_input_events(character)):
+                    return False
+                d = delay * random.uniform(0.7, 1.3)
+                if character in " .,;:!?\n":
+                    d *= random.uniform(1.3, 2.0)
+                time.sleep(max(0, d))
             return True
-        except Exception as e:
-            logger.error("Windows type_text failed: %s", e)
+        except Exception:
+            logger.error("Windows type_text failed")
             return False
 
-    def _tap_vk(self, vk: int):
+    def _key_input(self, vk: int, *, key_up: bool = False):
         KEYEVENTF_KEYUP = 0x0002
         KEYEVENTF_EXTENDEDKEY = 0x0001
         flags = KEYEVENTF_EXTENDEDKEY if vk in self._EXTENDED else 0
-
-        inp = self._INPUT(
+        if key_up:
+            flags |= KEYEVENTF_KEYUP
+        return self._INPUT(
             type=1,
             _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
                 wVk=vk, dwFlags=flags,
             )),
         )
-        self._send_input(inp)
-        time.sleep(0.01)
-        inp = self._INPUT(
-            type=1,
-            _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
-                wVk=vk, dwFlags=flags | KEYEVENTF_KEYUP,
-            )),
-        )
-        self._send_input(inp)
 
-    def _press_vk(self, vk: int):
-        flags = 0x0001 if vk in self._EXTENDED else 0
-        inp = self._INPUT(
-            type=1,
-            _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
-                wVk=vk, dwFlags=flags,
-            )),
+    def _tap_vk(self, vk: int) -> bool:
+        return self._send_inputs(
+            [self._key_input(vk), self._key_input(vk, key_up=True)]
         )
-        self._send_input(inp)
 
-    def _release_vk(self, vk: int):
-        flags = (0x0001 if vk in self._EXTENDED else 0) | 0x0002
-        inp = self._INPUT(
-            type=1,
-            _input=self._INPUT._INPUT(ki=self._KEYBDINPUT(
-                wVk=vk, dwFlags=flags,
-            )),
-        )
-        self._send_input(inp)
+    def _press_vk(self, vk: int) -> bool:
+        return self._send_input(self._key_input(vk))
+
+    def _release_vk(self, vk: int) -> bool:
+        return self._send_input(self._key_input(vk, key_up=True))
 
     def press_key(self, key: str) -> bool:
         self._load()
@@ -785,10 +987,12 @@ class WindowsInputBackend(InputBackend):
         if vk is None:
             return False
         try:
-            self._tap_vk(vk)
-            return True
+            return self._tap_vk(vk)
         except Exception as e:
-            logger.error("Windows press_key failed: %s", e)
+            logger.error(
+                "Windows press_key failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def hotkey(self, *keys: str) -> bool:
@@ -797,16 +1001,22 @@ class WindowsInputBackend(InputBackend):
         if any(v is None for v in vks):
             return False
         try:
-            # Press modifiers, tap final key, release modifiers
-            for vk in vks[:-1]:
-                self._press_vk(vk)
-                time.sleep(0.01)
-            self._tap_vk(vks[-1])
-            for vk in reversed(vks[:-1]):
-                self._release_vk(vk)
-            return True
+            events = [self._key_input(vk) for vk in vks[:-1]]
+            events.extend(
+                [
+                    self._key_input(vks[-1]),
+                    self._key_input(vks[-1], key_up=True),
+                ]
+            )
+            events.extend(
+                self._key_input(vk, key_up=True) for vk in reversed(vks[:-1])
+            )
+            return self._send_inputs(events)
         except Exception as e:
-            logger.error("Windows hotkey failed: %s", e)
+            logger.error(
+                "Windows hotkey failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def click(self, x: int, y: int, button: str = "left") -> bool:
@@ -827,100 +1037,103 @@ class WindowsInputBackend(InputBackend):
             down_flag = MOUSEEVENTF_RIGHTDOWN if button == "right" else MOUSEEVENTF_LEFTDOWN
             up_flag = MOUSEEVENTF_RIGHTUP if button == "right" else MOUSEEVENTF_LEFTUP
 
-            # Move
-            inp = self._INPUT(
-                type=0,
-                _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
-                    dx=nx, dy=ny,
-                    dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                )),
+            return self._send_inputs(
+                [
+                    self._mouse_input(
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                        dx=nx,
+                        dy=ny,
+                    ),
+                    self._mouse_input(down_flag),
+                    self._mouse_input(up_flag),
+                ]
             )
-            self._send_input(inp)
-            time.sleep(0.01)
-
-            # Down
-            inp = self._INPUT(
-                type=0,
-                _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
-                    dwFlags=down_flag,
-                )),
-            )
-            self._send_input(inp)
-            time.sleep(0.01)
-
-            # Up
-            inp = self._INPUT(
-                type=0,
-                _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
-                    dwFlags=up_flag,
-                )),
-            )
-            self._send_input(inp)
-            return True
         except Exception as e:
-            logger.error("Windows click failed: %s", e)
+            logger.error(
+                "Windows click failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
-    def _move_to(self, x: int, y: int):
+    def _mouse_input(
+        self,
+        flags: int,
+        *,
+        data: int = 0,
+        dx: int = 0,
+        dy: int = 0,
+    ):
+        return self._INPUT(
+            type=0,
+            _input=self._INPUT._INPUT(
+                mi=self._MOUSEINPUT(
+                    dx=dx,
+                    dy=dy,
+                    dwFlags=flags,
+                    mouseData=data,
+                )
+            ),
+        )
+
+    def _move_input(self, x: int, y: int):
         """Move mouse to absolute position using normalized coords."""
         screen_w = self._user32.GetSystemMetrics(0)
         screen_h = self._user32.GetSystemMetrics(1)
+        if screen_w <= 0 or screen_h <= 0:
+            raise RuntimeError("invalid Windows screen metrics")
         nx = int(x * 65535 / screen_w)
         ny = int(y * 65535 / screen_h)
-        inp = self._INPUT(
-            type=0,
-            _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
-                dx=nx, dy=ny,
-                dwFlags=0x0001 | 0x8000,  # MOVE | ABSOLUTE
-            )),
-        )
-        self._send_input(inp)
+        return self._mouse_input(0x0001 | 0x8000, dx=nx, dy=ny)
 
-    def _mouse_event(self, flags: int, data: int = 0):
+    def _move_to(self, x: int, y: int) -> bool:
+        return self._send_input(self._move_input(x, y))
+
+    def _mouse_event(self, flags: int, data: int = 0) -> bool:
         """Send a mouse event with given flags."""
-        inp = self._INPUT(
-            type=0,
-            _input=self._INPUT._INPUT(mi=self._MOUSEINPUT(
-                dwFlags=flags, mouseData=data,
-            )),
-        )
-        self._send_input(inp)
+        return self._send_input(self._mouse_input(flags, data=data))
 
     def scroll(self, x: int, y: int, delta_x: int = 0, delta_y: int = -3) -> bool:
         """Scroll using SendInput mouse wheel events."""
         self._load()
         try:
-            self._move_to(x, y)
             MOUSEEVENTF_WHEEL = 0x0800
             WHEEL_DELTA = 120
             # delta_y negative = scroll down, positive = scroll up
-            amount = abs(delta_y) if delta_y != 0 else 3
+            amount = min(abs(delta_y) if delta_y != 0 else 3, 20)
             wheel_delta = -WHEEL_DELTA if delta_y <= 0 else WHEEL_DELTA
-            for _ in range(amount):
-                self._mouse_event(MOUSEEVENTF_WHEEL, wheel_delta)
-            return True
+            events = [self._move_input(x, y)]
+            events.extend(
+                self._mouse_input(MOUSEEVENTF_WHEEL, data=wheel_delta)
+                for _ in range(amount)
+            )
+            return self._send_inputs(events)
         except Exception as e:
-            logger.error("Windows scroll failed: %s", e)
+            logger.error(
+                "Windows scroll failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def drag(self, from_x: int, from_y: int, to_x: int, to_y: int) -> bool:
         """Drag using SendInput mouse events."""
         self._load()
         try:
-            self._move_to(from_x, from_y)
-            time.sleep(0.01)
-            self._mouse_event(0x0002)  # MOUSEEVENTF_LEFTDOWN
-            time.sleep(0.01)
             steps = min(max(abs(to_x - from_x), abs(to_y - from_y), 1), 20)
+            events = [
+                self._move_input(from_x, from_y),
+                self._mouse_input(0x0002),
+            ]
             for i in range(1, steps + 1):
                 ix = from_x + (to_x - from_x) * i // steps
                 iy = from_y + (to_y - from_y) * i // steps
-                self._move_to(ix, iy)
-                time.sleep(0.01)
-            self._mouse_event(0x0004)  # MOUSEEVENTF_LEFTUP
-            return True
+                events.append(self._move_input(ix, iy))
+            events.append(self._mouse_input(0x0004))
+            return self._send_inputs(events)
         except Exception as e:
-            logger.error("Windows drag failed: %s", e)
+            logger.error(
+                "Windows drag failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     def activate_window(self, pid: int) -> bool:
@@ -950,12 +1163,35 @@ class WindowsInputBackend(InputBackend):
 
             EnumWindows(callback, 0)
             if target_hwnd:
-                SetForegroundWindow(target_hwnd)
-                time.sleep(0.3)
-                return True
+                return bool(SetForegroundWindow(target_hwnd))
             return False
         except Exception as e:
-            logger.error("Windows activate_window failed: %s", e)
+            logger.error(
+                "Windows activate_window failed (exception_type=%s)",
+                type(e).__name__,
+            )
+            return False
+
+    def is_frontmost(self, pid: int) -> bool:
+        """Return whether the Win32 foreground window belongs to ``pid``."""
+        self._load()
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            get_foreground_window = self._user32.GetForegroundWindow
+            get_foreground_window.restype = wintypes.HWND
+            hwnd = get_foreground_window()
+            if not hwnd:
+                return False
+            process_id = wintypes.DWORD()
+            self._user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            return process_id.value == pid
+        except Exception as e:
+            logger.error(
+                "Windows foreground check failed (exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
 
@@ -965,27 +1201,66 @@ class AppleScriptInputBackend(InputBackend):
     """Fallback macOS input using osascript System Events (slower but no PyObjC)."""
 
     def is_available(self) -> bool:
-        return sys.platform == "darwin"
-
-    def type_text(self, text: str, delay: float = 0.02, human_like: bool = True) -> bool:
+        if sys.platform != "darwin":
+            return False
         try:
-            # Use JXA for reliable Unicode handling
-            import json
-            script = f'''
-            var se = Application("System Events");
-            var text = {json.dumps(text)};
-            for (var i = 0; i < text.length; i++) {{
-                se.keystroke(text[i]);
-                delay({delay});
-            }}
-            '''
-            subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", script],
-                capture_output=True, timeout=max(30, len(text) * delay * 2),
+            completed = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to get UI elements enabled',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
-            return True
-        except Exception as e:
-            logger.error("AppleScript type_text failed: %s", e)
+            return (
+                completed.returncode == 0
+                and completed.stdout.strip().casefold() == "true"
+            )
+        except Exception:
+            return False
+
+    def type_text(
+        self,
+        text: str,
+        delay: float = 0.02,
+        human_like: bool = False,
+    ) -> bool:
+        try:
+            if not text:
+                return True
+            import json
+
+            if human_like:
+                script = f'''
+                var se = Application("System Events");
+                var text = {json.dumps(text)};
+                var chars = Array.from(text);
+                for (var i = 0; i < chars.length; i++) {{
+                    se.keystroke(chars[i]);
+                    delay({max(0, delay)});
+                }}
+                '''
+                timeout = max(30, len(text) * max(0, delay) * 2)
+            else:
+                script = f'''
+                var se = Application("System Events");
+                var text = {json.dumps(text)};
+                se.keystroke(text);
+                '''
+                timeout = 30
+
+            completed = subprocess.run(
+                ["osascript", "-l", "JavaScript"],
+                input=script,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return completed.returncode == 0
+        except Exception:
+            logger.error("AppleScript type_text failed")
             return False
 
     def press_key(self, key: str) -> bool:
@@ -999,34 +1274,40 @@ class AppleScriptInputBackend(InputBackend):
         if code is None:
             return False
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to key code {code}'],
                 capture_output=True, timeout=5,
             )
-            return True
+            return completed.returncode == 0
         except Exception:
             return False
 
     def hotkey(self, *keys: str) -> bool:
+        if len(keys) < 2:
+            return False
         modifiers = {
             "command": "command down", "shift": "shift down",
             "option": "option down", "alt": "option down",
             "control": "control down", "ctrl": "control down",
         }
-        mods = [modifiers.get(k.lower()) for k in keys[:-1] if k.lower() in modifiers]
+        mods = [modifiers.get(k.lower()) for k in keys[:-1]]
+        if any(mod is None for mod in mods):
+            return False
         final_key = keys[-1]
-        if not mods:
+        if len(final_key) != 1 or not mods:
             return False
         mod_str = ", ".join(mods)
         try:
-            subprocess.run(
+            import json
+
+            completed = subprocess.run(
                 ["osascript", "-e",
-                 f'tell application "System Events" to keystroke "{final_key}" '
+                 f'tell application "System Events" to keystroke {json.dumps(final_key)} '
                  f'using {{{mod_str}}}'],
                 capture_output=True, timeout=5,
             )
-            return True
+            return completed.returncode == 0
         except Exception:
             return False
 
@@ -1039,14 +1320,29 @@ class AppleScriptInputBackend(InputBackend):
 
     def activate_window(self, pid: int) -> bool:
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["osascript", "-e",
                  f'tell application "System Events" to set frontmost of '
                  f'(first process whose unix id is {pid}) to true'],
                 capture_output=True, timeout=5,
             )
-            time.sleep(0.3)
-            return True
+            return completed.returncode == 0
+        except Exception:
+            return False
+
+    def is_frontmost(self, pid: int) -> bool:
+        try:
+            completed = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    "tell application \"System Events\" to get unix id of first process whose frontmost is true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return completed.returncode == 0 and completed.stdout.strip() == str(pid)
         except Exception:
             return False
 
@@ -1070,9 +1366,10 @@ def get_input_backend() -> InputBackend:
             return backend
         # Fallback to AppleScript
         backend = AppleScriptInputBackend()
-        _backend_cache = backend
-        logger.info("Input backend: macOS AppleScript (fallback)")
-        return backend
+        if backend.is_available():
+            _backend_cache = backend
+            logger.info("Input backend: macOS AppleScript (fallback)")
+            return backend
 
     elif sys.platform == "win32":
         backend = WindowsInputBackend()
@@ -1085,7 +1382,7 @@ def get_input_backend() -> InputBackend:
         backend = LinuxInputBackend()
         if backend.is_available():
             _backend_cache = backend
-            logger.info("Input backend: Linux %s", backend._tool)
+            logger.info("Input backend: Linux X11/XTest")
             return backend
 
     # Ultimate fallback — return a no-op that always fails
@@ -1096,7 +1393,7 @@ def get_input_backend() -> InputBackend:
 class _NoOpBackend(InputBackend):
     def is_available(self) -> bool:
         return False
-    def type_text(self, text, delay=0.02, human_like=True) -> bool:
+    def type_text(self, text, delay=0.02, human_like=False) -> bool:
         return False
     def press_key(self, key) -> bool:
         return False

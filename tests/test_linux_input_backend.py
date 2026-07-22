@@ -60,6 +60,16 @@ class TestIsAvailable:
         backend._display = None
         assert backend.is_available() is False
 
+    def test_factory_returns_available_linux_backend(self, monkeypatch):
+        import agent_eyes.input_sim as input_sim
+
+        backend, *_ = _make_backend_with_mocks()
+        monkeypatch.setattr(input_sim.sys, "platform", "linux")
+        monkeypatch.setattr(input_sim, "LinuxInputBackend", lambda: backend)
+        monkeypatch.setattr(input_sim, "_backend_cache", None)
+
+        assert input_sim.get_input_backend() is backend
+
     def test_init_without_xlib_sets_display_none(self):
         """If python-xlib is not importable, _display stays None."""
         with patch.dict("sys.modules", {"Xlib": None, "Xlib.ext": None, "Xlib.ext.xtest": None}):
@@ -71,11 +81,53 @@ class TestIsAvailable:
                 backend._xtest = None
                 assert backend.is_available() is False
 
+    def test_init_with_unavailable_display_does_not_crash(self):
+        """Headless/Wayland sessions can have Xlib installed but no X display."""
+        fake_xlib = MagicMock()
+        fake_display = MagicMock()
+        fake_display.Display.side_effect = OSError("display unavailable")
+        fake_xlib.display = fake_display
+        fake_ext = MagicMock()
+
+        with patch.dict(
+            sys.modules,
+            {
+                "Xlib": fake_xlib,
+                "Xlib.ext": fake_ext,
+                "Xlib.ext.xtest": fake_ext.xtest,
+            },
+        ):
+            backend = LinuxInputBackend()
+
+        assert backend.is_available() is False
+
 
 # ── type_text ──────────────────────────────────────────────────────
 
 
 class TestTypeText:
+    def test_default_fast_path_has_no_sleep_and_syncs_once(self, monkeypatch):
+        backend, display, _X, _XK, xtest = _make_backend_with_mocks()
+
+        def unexpected_sleep(_delay):
+            raise AssertionError("default typing slept")
+
+        monkeypatch.setattr("agent_eyes.input_sim.time.sleep", unexpected_sleep)
+
+        assert backend.type_text("ac" * 500) is True
+        assert xtest.fake_input.call_count == 2000
+        display.sync.assert_called_once()
+
+    def test_human_like_mode_retains_per_character_sleep(self, monkeypatch):
+        backend, display, _X, _XK, _xtest = _make_backend_with_mocks()
+        sleep = MagicMock()
+        monkeypatch.setattr("agent_eyes.input_sim.time.sleep", sleep)
+        monkeypatch.setattr("agent_eyes.input_sim.random.uniform", lambda _a, _b: 0)
+
+        assert backend.type_text("ac", delay=0.01, human_like=True) is True
+        assert sleep.call_count == 2
+        assert display.sync.call_count == 2
+
     def test_happy_path_types_each_char(self):
         backend, display, X, XK, xtest = _make_backend_with_mocks()
         # 'a' → keysym 97 → keycode 97
@@ -94,14 +146,24 @@ class TestTypeText:
         assert 97 in pressed
         assert 99 in pressed
 
-    def test_skips_chars_with_no_keycode(self):
+    def test_rejects_chars_with_no_keycode(self):
         backend, display, X, XK, xtest = _make_backend_with_mocks()
         # Override: keysym returns something but keysym_to_keycode returns 0
         XK.string_to_keysym.side_effect = lambda name: 9999 if name == "a" else 0
         display.keysym_to_keycode.side_effect = lambda ks: 0  # no keycode
         result = backend.type_text("a", delay=0, human_like=False)
-        assert result is True  # no crash, just skipped
+        assert result is False
         xtest.fake_input.assert_not_called()
+
+    def test_unsupported_suffix_is_rejected_before_typing_prefix(self):
+        backend, display, X, XK, xtest = _make_backend_with_mocks()
+        XK.string_to_keysym.side_effect = lambda name: {"a": 97, "€": 9999}.get(name, 0)
+        display.keysym_to_keycode.side_effect = lambda keysym: 0 if keysym == 9999 else keysym
+
+        assert backend.type_text("a€", delay=0, human_like=False) is False
+
+        xtest.fake_input.assert_not_called()
+        display.sync.assert_not_called()
 
     def test_unicode_fallback_for_unmapped_char(self):
         backend, display, X, XK, xtest = _make_backend_with_mocks()

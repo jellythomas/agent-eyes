@@ -1,0 +1,40 @@
+{
+  "cdp_lifecycle": {"cycles": 10000, "leaked_records": 0},
+  "cdp_reconnect": {
+    "cycles": 1000,
+    "leaked_records": 0,
+    "maximum_records": 3,
+    "wrong_generation_bindings": 0
+  },
+  "elapsed_seconds": 0.373,
+  "schema_version": 3,
+  "seed": 20260718,
+  "singleflight": {
+    "cancelled_waiters": 4225,
+    "leaked_flights": 0,
+    "provider_calls": 1000,
+    "schedules": 1000,
+    "wrong_results": 0
+  },
+  "snapshot_memory": {
+    "baseline_rss_bytes": 30556160,
+    "cycles": 10000,
+    "final_rss_bytes": 30556160,
+    "growth_bytes": 0,
+    "growth_percent": 0.0,
+    "leaked_snapshots": 0,
+    "maximum_live_snapshots": 1,
+    "minimum_threshold_bytes": 10485760,
+    "payload_bytes_per_cycle": 4096,
+    "released_records": 10000,
+    "rss_source": "ps-rss",
+    "threshold_bytes": 10485760,
+    "threshold_percent": 5,
+    "warmup_cycles": 512
+  },
+  "target_isolation": {
+    "rejected_cross_target_resolutions": 1000,
+    "schedules": 1000,
+    "wrong_target_resolutions": 0
+  }
+}

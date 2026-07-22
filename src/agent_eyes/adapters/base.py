@@ -12,6 +12,26 @@ INTERACTIVE_ROLES = frozenset({
     "switch", "searchbox", "spinbutton", "textarea",
 })
 
+_SECURE_STATES = frozenset({"password", "protected", "secure"})
+_SECURE_ROLE_KEYS = frozenset({
+    "password",
+    "passwordfield",
+    "passwordtext",
+    "securetext",
+    "securetextfield",
+})
+
+
+def _compact_field(value: str, limit: int) -> str:
+    normalized = " ".join(value.split()).replace('"', '\\"')
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
+
+
+def _normalized_role_key(role: str) -> str:
+    return "".join(character for character in role.casefold() if character.isalnum())
+
 
 @dataclass
 class UIElement:
@@ -30,6 +50,13 @@ class UIElement:
     visual: str = ""                 # Visual description (e.g. "red bg, white text, 14px")
     pid: int = 0                     # PID of the owning application (for window activation)
     tab_index: int = -1              # Chrome tab index for CDP elements (-1 = native/unknown)
+    window_index: int = -1           # Native browser window index (-1 = unknown)
+
+    def _is_secure(self) -> bool:
+        return (
+            _normalized_role_key(self.role) in _SECURE_ROLE_KEYS
+            or any(str(state).casefold() in _SECURE_STATES for state in self.states)
+        )
 
     def _location_label(self, viewport_w: int = 1920, viewport_h: int = 1080) -> str:
         """Compute spatial location label from bounds."""
@@ -58,9 +85,9 @@ class UIElement:
         if self.role:
             parts.append(self.role)
         if self.name:
-            parts.append(f'"{self.name}"')
-        if self.value:
-            val_preview = self.value[:80] + ("..." if len(self.value) > 80 else "")
+            parts.append(f'"{_compact_field(self.name, 120)}"')
+        if self.value and not self._is_secure():
+            val_preview = _compact_field(self.value, 80)
             parts.append(f'value="{val_preview}"')
         if self.states:
             parts.append(" ".join(self.states))
@@ -87,9 +114,9 @@ class UIElement:
         """Render as single flat line: [id] role "name" value="val" state1"""
         parts = [f"[{self.id}]", self.role]
         if self.name:
-            parts.append(f'"{self.name}"')
-        if self.value:
-            parts.append(f'value="{self.value}"')
+            parts.append(f'"{_compact_field(self.name, 120)}"')
+        if self.value and not self._is_secure():
+            parts.append(f'value="{_compact_field(self.value, 160)}"')
         skip_states = {"enabled"}
         meaningful = [s for s in self.states if s not in skip_states]
         parts.extend(meaningful)
@@ -123,6 +150,10 @@ class PlatformAdapter(Protocol):
 
     def get_tree(self, pid: int, max_depth: int = 5) -> UIElement | None: ...
 
+    def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]: ...
+
+    def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None: ...
+
     def find_elements(
         self, pid: int, role: str = "", name: str = "", value: str = ""
     ) -> list[UIElement]: ...
@@ -130,6 +161,18 @@ class PlatformAdapter(Protocol):
     def perform_action(self, element: UIElement, action: str) -> bool: ...
 
     def focus_element(self, element: UIElement) -> bool: ...
+
+    def is_same_element(self, first: UIElement, second: UIElement) -> bool: ...
+
+    def is_element_valid(self, element: UIElement) -> bool: ...
+
+    def element_at_position(self, x: float, y: float) -> UIElement | None: ...
+
+    def focus_window(self, window: UIElement) -> bool: ...
+
+    def is_window_focused(self, window: UIElement) -> bool: ...
+
+    def is_element_selected(self, element: UIElement) -> bool: ...
 
     def set_value(self, element: UIElement, value: str) -> bool: ...
 
@@ -162,6 +205,16 @@ class BaseAdapter(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        """Get every browser window tree while pruning page-document content."""
+        ...
+
+    @abc.abstractmethod
+    def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:
+        """Refresh a subtree from a previously returned live platform reference."""
+        ...
+
+    @abc.abstractmethod
     def find_elements(
         self, pid: int, role: str = "", name: str = "", value: str = ""
     ) -> list[UIElement]:
@@ -176,6 +229,33 @@ class BaseAdapter(abc.ABC):
     def focus_element(self, element: UIElement) -> bool:
         """Focus an element for keyboard input. Override per platform."""
         return False
+
+    def is_same_element(self, first: UIElement, second: UIElement) -> bool:
+        """Return native identity equality; the conservative default is identity."""
+        return (
+            first.platform_ref is not None
+            and first.platform_ref is second.platform_ref
+        )
+
+    def is_element_valid(self, element: UIElement) -> bool:
+        """Return whether a live native reference is still available."""
+        return element.platform_ref is not None
+
+    def element_at_position(self, x: float, y: float) -> UIElement | None:
+        """Return the exact native element at screen coordinates when supported."""
+        return None
+
+    def focus_window(self, window: UIElement) -> bool:
+        """Raise an exact native window reference when supported."""
+        return False
+
+    def is_window_focused(self, window: UIElement) -> bool:
+        """Verify the exact native window is focused."""
+        return False
+
+    def is_element_selected(self, element: UIElement) -> bool:
+        """Read whether a selectable element is currently active."""
+        return "selected" in element.states or "focused" in element.states
 
     @abc.abstractmethod
     def set_value(self, element: UIElement, value: str) -> bool:

@@ -1,24 +1,309 @@
 """Chrome DevTools Protocol client for enriched accessibility trees.
 
 Cross-platform: works on macOS, Windows, and Linux — anywhere Chrome runs.
-Gets accessibility trees enriched with bounding boxes and visual metadata
-(colors, fonts, layout) via DOM/CSS domains — giving AI agents spatial
-awareness and visual context without screenshots.
+Gets accessibility trees enriched with bounded DOM targeting metadata and
+bounding boxes, giving AI agents spatial awareness without screenshots.
 """
 from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
+import http.client
+import ipaddress
 import logging
 import re
-import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 from .adapters.base import UIElement
+from .js_bridge import _tree_node_is_secure
 from .platform_utils import discover_cdp_port
 
 logger = logging.getLogger("agent-eyes")
+
+MAX_EVAL_RESULT_LEN = 10_000
+_MAX_PIERCED_DOM_NODES = 500
+_PIERCED_SELECTOR_DEPTH = 8
+_MAX_BUFFERED_EVENTS = 256
+_MAX_AX_CONVERSION_NODES = 5_000
+_MAX_AX_CONVERSION_BYTES = 4 * 1024 * 1024
+_MAX_SECURE_DOM_CANDIDATES = 2_048
+_MAX_SECURE_DOM_MATCHES = 10_000
+_TEXT_VALUE_ROLES = frozenset({"textbox", "searchbox", "textarea"})
+_SECURE_CONTROL_SELECTOR = (
+    'input[type="password" i],'
+    '[autocomplete~="current-password" i],'
+    '[autocomplete~="new-password" i]'
+)
+_SECURE_TEXT_STYLES = (
+    {"name": "-webkit-text-security", "value": "circle"},
+    {"name": "-webkit-text-security", "value": "disc"},
+    {"name": "-webkit-text-security", "value": "square"},
+)
+CDP_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+CDP_HTTP_MAX_BYTES = 4 * 1024 * 1024
+
+_PIERCED_CONTROL_SELECTOR = ",".join(
+    (
+        "a[aria-label]",
+        "a[title]",
+        "button[aria-label]",
+        "button[title]",
+        "button[value]",
+        "input[aria-label]",
+        "input[title]",
+        "input[placeholder]",
+        "input[value]",
+        "select[aria-label]",
+        "select[title]",
+        "textarea[aria-label]",
+        "textarea[title]",
+        "textarea[placeholder]",
+        "img[aria-label]",
+        "img[title]",
+        "img[alt]",
+        "[role][aria-label]",
+        "[role][title]",
+        "[role][placeholder]",
+        "[role][value]",
+        "[tabindex][aria-label]",
+        "[tabindex][title]",
+        "[contenteditable][aria-label]",
+        "[contenteditable][title]",
+    )
+)
+
+
+def _validate_cdp_endpoint(host: str, port: int) -> tuple[str, int]:
+    """Return a canonical loopback-only CDP endpoint."""
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("CDP host must be a loopback address")
+
+    candidate = host.strip()
+    if candidate.casefold() == "localhost":
+        normalized_host = "localhost"
+    else:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError as exc:
+            raise ValueError("CDP host must be a loopback address") from exc
+        if not address.is_loopback:
+            raise ValueError("CDP host must be a loopback address")
+        normalized_host = address.compressed
+
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+        raise ValueError("CDP port must be an integer from 1 through 65535")
+    return normalized_host, port
+
+
+def _cdp_http_authority(host: str, port: int) -> str:
+    """Format one validated CDP endpoint for an HTTP URL."""
+    host, port = _validate_cdp_endpoint(host, port)
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{rendered_host}:{port}"
+
+
+def _validate_cdp_websocket_url(url: str) -> str:
+    """Reject any CDP WebSocket URL outside the local machine."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"ws", "wss"}:
+            raise ValueError
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError
+        if parsed.hostname is None or parsed.port is None:
+            raise ValueError
+        _validate_cdp_endpoint(parsed.hostname, parsed.port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CDP requires a loopback WebSocket URL") from exc
+    return url
+
+
+def _cdp_http_get(
+    host: str,
+    port: int,
+    path: str,
+    *,
+    timeout: float,
+) -> tuple[int, bytes]:
+    """Issue one bounded, redirect-free request to a local CDP endpoint."""
+    host, port = _validate_cdp_endpoint(host, port)
+    if not path.startswith("/") or path.startswith("//") or "\r" in path or "\n" in path:
+        raise ValueError("CDP HTTP path must use origin form")
+
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        content_length = response.getheader("Content-Length")
+        if content_length is not None and int(content_length) > CDP_HTTP_MAX_BYTES:
+            raise ValueError("CDP HTTP response exceeded the size limit")
+        body = response.read(CDP_HTTP_MAX_BYTES + 1)
+        if len(body) > CDP_HTTP_MAX_BYTES:
+            raise ValueError("CDP HTTP response exceeded the size limit")
+        return response.status, body
+    finally:
+        connection.close()
+
+
+def _connect_websocket(url: str):
+    """Open one CDP transport with the shared, finite response ceiling."""
+    import websockets
+
+    return websockets.connect(
+        _validate_cdp_websocket_url(url),
+        max_size=CDP_MAX_MESSAGE_BYTES,
+    )
+
+
+class CDPDocumentChangedError(RuntimeError):
+    """The target document no longer matches the observed snapshot."""
+
+
+class CDPMutationOutcomeUnknown(RuntimeError):
+    """A mutation was dispatched but its response was not confirmed."""
+
+
+def _runtime_exception_details(result: object) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+    details = result.get("exceptionDetails")
+    return details if isinstance(details, dict) else None
+
+
+def _runtime_exception_is_stale(result: object) -> bool:
+    details = _runtime_exception_details(result)
+    if details is None:
+        return False
+    exception = details.get("exception")
+    candidates = [details.get("text")]
+    if isinstance(exception, dict):
+        candidates.extend((exception.get("description"), exception.get("value")))
+    return any(
+        isinstance(candidate, str) and "STALE_ELEMENT" in candidate
+        for candidate in candidates
+    )
+
+
+def _document_revision(frame_result: dict, document_result: dict) -> int:
+    """Build a deterministic revision from the top frame and DOM root."""
+    frame = frame_result.get("frameTree", {}).get("frame", {})
+    frame_identity = frame.get("loaderId") or frame.get("id")
+    root_identity = document_result.get("root", {}).get("backendNodeId")
+    if (
+        not isinstance(frame_identity, str)
+        or not frame_identity
+        or isinstance(root_identity, bool)
+        or not isinstance(root_identity, int)
+        or root_identity <= 0
+    ):
+        raise RuntimeError("CDP page did not expose a document revision")
+    identity = f"{frame_identity}:{root_identity}"
+    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _flatten_dom_nodes(
+    root: dict,
+    *,
+    max_nodes: int = _MAX_PIERCED_DOM_NODES,
+) -> list[dict]:
+    """Flatten a nested ``DOM.getDocument`` result in stable tree order."""
+    if not isinstance(root, dict):
+        raise TypeError("DOM root must be a dictionary")
+    if (
+        isinstance(max_nodes, bool)
+        or not isinstance(max_nodes, int)
+        or max_nodes < 1
+    ):
+        raise ValueError("max_nodes must be a positive integer")
+
+    flattened: list[dict] = []
+    stack = [root]
+    seen: set[tuple[str, int]] = set()
+    while stack and len(flattened) < max_nodes:
+        node = stack.pop()
+        node_id = node.get("nodeId")
+        identity = (
+            ("node", node_id)
+            if isinstance(node_id, int) and not isinstance(node_id, bool)
+            else ("object", id(node))
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        flattened.append(node)
+
+        descendants: list[dict] = []
+        for field in ("children", "shadowRoots", "pseudoElements"):
+            values = node.get(field, [])
+            if isinstance(values, list):
+                descendants.extend(value for value in values if isinstance(value, dict))
+        for field in (
+            "contentDocument",
+            "templateContent",
+            "importedDocument",
+        ):
+            value = node.get(field)
+            if isinstance(value, dict):
+                descendants.append(value)
+        stack.extend(reversed(descendants))
+    return flattened
+
+
+def _bounded_ax_nodes(
+    nodes: list[dict],
+    *,
+    max_nodes: int = _MAX_AX_CONVERSION_NODES,
+    max_bytes: int = _MAX_AX_CONVERSION_BYTES,
+) -> tuple[list[dict], bool]:
+    """Bound AX conversion work by count and compact-JSON byte size."""
+    if (
+        isinstance(max_nodes, bool)
+        or not isinstance(max_nodes, int)
+        or max_nodes < 1
+    ):
+        raise ValueError("max_nodes must be a positive integer")
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 1
+    ):
+        raise ValueError("max_bytes must be a positive integer")
+
+    selected: list[dict] = []
+    total_bytes = 0
+    truncated = False
+    for node in nodes:
+        if len(selected) >= max_nodes:
+            truncated = True
+            break
+        if not isinstance(node, dict):
+            truncated = True
+            break
+        try:
+            node_bytes = len(
+                json.dumps(
+                    node,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+            )
+        except (TypeError, ValueError):
+            truncated = True
+            break
+        if node_bytes > max_bytes - total_bytes:
+            truncated = True
+            break
+        selected.append(node)
+        total_bytes += node_bytes
+
+    if len(selected) < len(nodes):
+        truncated = True
+    return selected, truncated
 
 # Key name → CDP key descriptor mapping for special keys
 _KEY_MAP: dict[str, dict[str, Any]] = {
@@ -62,6 +347,14 @@ class ChromeTab:
     ws_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class SecureDOMMetadata:
+    """Security classification for AX nodes obtained without reading values."""
+
+    secure_backend_node_ids: frozenset[int] = frozenset()
+    complete: bool = False
+
+
 class CDPClient:
     """Lightweight Chrome DevTools Protocol client using websockets.
 
@@ -70,8 +363,7 @@ class CDPClient:
     """
 
     def __init__(self, host: str = "localhost", port: int = 9222):
-        self.host = host
-        self.port = port
+        self.host, self.port = _validate_cdp_endpoint(host, port)
         self._discovered_port: int | None = None
         self._msg_id = 0
         self._id_counter = 0
@@ -116,7 +408,7 @@ class CDPClient:
             import aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"http://{self.host}:{port}/json/version",
+                    f"http://{_cdp_http_authority(self.host, port)}/json/version",
                     timeout=aiohttp.ClientTimeout(total=2),
                 ) as resp:
                     return resp.status == 200
@@ -130,13 +422,14 @@ class CDPClient:
     async def _check_port_urllib(self, port: int) -> bool:
         """Fallback availability check without aiohttp."""
         def _check_sync() -> bool:
-            import urllib.request
             try:
-                req = urllib.request.Request(
-                    f"http://{self.host}:{port}/json/version"
+                status, _body = _cdp_http_get(
+                    self.host,
+                    port,
+                    "/json/version",
+                    timeout=2,
                 )
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    return resp.status == 200
+                return status == 200
             except Exception:
                 return False
         return await asyncio.get_running_loop().run_in_executor(None, _check_sync)
@@ -144,13 +437,16 @@ class CDPClient:
     async def list_tabs(self) -> list[ChromeTab]:
         """List all Chrome tabs."""
         def _list_sync() -> list[ChromeTab]:
-            import urllib.request
             try:
-                req = urllib.request.Request(
-                    f"http://{self.host}:{self.active_port}/json"
+                status, body = _cdp_http_get(
+                    self.host,
+                    self.active_port,
+                    "/json",
+                    timeout=5,
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read())
+                if status != 200:
+                    return []
+                data = json.loads(body)
 
                 tabs = []
                 for item in data:
@@ -160,12 +456,11 @@ class CDPClient:
                     if not ws_url:
                         continue
                     # Validate WebSocket URL points to localhost
-                    import urllib.parse
-                    parsed_ws = urllib.parse.urlparse(ws_url)
-                    if parsed_ws.hostname not in ("localhost", "127.0.0.1", "::1"):
+                    try:
+                        _validate_cdp_websocket_url(ws_url)
+                    except ValueError:
                         logger.warning(
-                            "CDPClient: suspicious WS host %s — skipping tab",
-                            parsed_ws.hostname,
+                            "CDPClient: rejected non-loopback WS endpoint",
                         )
                         continue
                     tabs.append(ChromeTab(
@@ -179,20 +474,209 @@ class CDPClient:
                 return []
         return await asyncio.get_running_loop().run_in_executor(None, _list_sync)
 
+    async def collect_secure_dom_metadata(
+        self,
+        send: Callable[[str, dict], Awaitable[dict]],
+        nodes: list[dict],
+    ) -> SecureDOMMetadata:
+        """Classify value-bearing text controls with bounded batched queries.
+
+        Candidate backend IDs are mapped in one protocol call. A bounded CSS
+        search identifies password/autocomplete controls, while one computed-
+        style query covers stylesheet-applied text security. No whole-document
+        pierced tree or per-element attribute/style round trips are required.
+
+        Any unsupported or malformed protocol response returns incomplete
+        metadata. Callers must treat incomplete metadata as a reason to redact
+        all text-control values.
+        """
+        if not isinstance(nodes, list):
+            return SecureDOMMetadata()
+        nodes, _nodes_truncated = _bounded_ax_nodes(nodes)
+        if not nodes:
+            return SecureDOMMetadata()
+
+        candidate_backend_ids: list[int] = []
+        seen_backend_ids: set[int] = set()
+        has_unclassifiable_value = False
+        for node in nodes:
+            role_value = node.get("role", {})
+            role = (
+                role_value.get("value", "")
+                if isinstance(role_value, dict)
+                else role_value
+            )
+            value_payload = node.get("value", {})
+            value = (
+                value_payload.get("value", "")
+                if isinstance(value_payload, dict)
+                else value_payload
+            )
+            backend_id = node.get("backendDOMNodeId")
+            if str(role).casefold() not in _TEXT_VALUE_ROLES or not value:
+                continue
+            if (
+                isinstance(backend_id, bool)
+                or not isinstance(backend_id, int)
+                or backend_id <= 0
+            ):
+                has_unclassifiable_value = True
+                continue
+            if backend_id in seen_backend_ids:
+                continue
+            seen_backend_ids.add(backend_id)
+            candidate_backend_ids.append(backend_id)
+
+        if has_unclassifiable_value:
+            return SecureDOMMetadata()
+        if not candidate_backend_ids:
+            return SecureDOMMetadata(complete=True)
+        if len(candidate_backend_ids) > _MAX_SECURE_DOM_CANDIDATES:
+            return SecureDOMMetadata()
+
+        search_id = ""
+        try:
+            document = await send(
+                "DOM.getDocument",
+                {"depth": 0, "pierce": False},
+            )
+            root = document.get("root")
+            if not isinstance(root, dict):
+                return SecureDOMMetadata()
+            root_node_id = root.get("nodeId")
+            if (
+                isinstance(root_node_id, bool)
+                or not isinstance(root_node_id, int)
+                or root_node_id <= 0
+            ):
+                return SecureDOMMetadata()
+
+            pushed = await send(
+                "DOM.pushNodesByBackendIdsToFrontend",
+                {"backendNodeIds": candidate_backend_ids},
+            )
+            frontend_node_ids = pushed.get("nodeIds")
+            if (
+                not isinstance(frontend_node_ids, list)
+                or len(frontend_node_ids) != len(candidate_backend_ids)
+                or any(
+                    isinstance(node_id, bool)
+                    or not isinstance(node_id, int)
+                    or node_id <= 0
+                    for node_id in frontend_node_ids
+                )
+            ):
+                return SecureDOMMetadata()
+
+            frontend_by_backend = dict(
+                zip(candidate_backend_ids, frontend_node_ids, strict=True)
+            )
+            search = await send(
+                "DOM.performSearch",
+                {
+                    "query": _SECURE_CONTROL_SELECTOR,
+                    "includeUserAgentShadowDOM": True,
+                },
+            )
+            search_id = search.get("searchId", "")
+            result_count = search.get("resultCount", 0)
+            if (
+                not isinstance(search_id, str)
+                or not search_id
+                or isinstance(result_count, bool)
+                or not isinstance(result_count, int)
+                or not 0 <= result_count <= _MAX_SECURE_DOM_MATCHES
+            ):
+                return SecureDOMMetadata()
+
+            secure_node_ids: list[int] = []
+            if result_count:
+                search_results = await send(
+                    "DOM.getSearchResults",
+                    {
+                        "searchId": search_id,
+                        "fromIndex": 0,
+                        "toIndex": result_count,
+                    },
+                )
+                secure_node_ids = search_results.get("nodeIds", [])
+                if (
+                    not isinstance(secure_node_ids, list)
+                    or len(secure_node_ids) != result_count
+                    or any(
+                        isinstance(node_id, bool)
+                        or not isinstance(node_id, int)
+                        or node_id <= 0
+                        for node_id in secure_node_ids
+                    )
+                ):
+                    return SecureDOMMetadata()
+
+            styled = await send(
+                "DOM.getNodesForSubtreeByStyle",
+                {
+                    "nodeId": root_node_id,
+                    "computedStyles": list(_SECURE_TEXT_STYLES),
+                    "pierce": True,
+                },
+            )
+            styled_node_ids = styled.get("nodeIds")
+            if (
+                not isinstance(styled_node_ids, list)
+                or len(styled_node_ids) > _MAX_SECURE_DOM_MATCHES
+                or any(
+                    isinstance(node_id, bool)
+                    or not isinstance(node_id, int)
+                    or node_id <= 0
+                    for node_id in styled_node_ids
+                )
+            ):
+                return SecureDOMMetadata()
+
+            secure_node_id_set = set(secure_node_ids)
+            secure_node_id_set.update(styled_node_ids)
+            return SecureDOMMetadata(
+                secure_backend_node_ids=frozenset(
+                    backend_id
+                    for backend_id, frontend_id in frontend_by_backend.items()
+                    if frontend_id in secure_node_id_set
+                ),
+                complete=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "CDP secure-field classification failed (%s)",
+                type(exc).__name__,
+            )
+            return SecureDOMMetadata()
+        finally:
+            if search_id:
+                try:
+                    await send(
+                        "DOM.discardSearchResults",
+                        {"searchId": search_id},
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(
+                        "CDP secure-field search cleanup failed (%s)",
+                        type(exc).__name__,
+                    )
+
     async def get_accessibility_tree(
         self, tab: ChromeTab, max_depth: int = 5, enrich: bool = True
     ) -> UIElement | None:
         """Get the accessibility tree of a Chrome tab as a UIElement tree.
 
-        When enrich=True, interactive elements get bounding boxes and
-        visual metadata (colors, font) via DOM/CSS domains — giving
-        Claude spatial awareness and visual context without screenshots.
+        When ``enrich=True``, interactive elements get bounding boxes through
+        one bounded DOM command per element.
         """
-        import websockets
-
         self.reset_ids()
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 # Enable accessibility domain
                 await self._send(ws, "Accessibility.enable")
 
@@ -203,23 +687,41 @@ class CDPClient:
                     {"depth": max_depth},
                 )
 
-                nodes = result.get("nodes", [])
-                if not nodes:
+                raw_nodes = result.get("nodes", [])
+                if not isinstance(raw_nodes, list) or not raw_nodes:
                     return None
+                nodes, nodes_truncated = _bounded_ax_nodes(raw_nodes)
+                if not nodes:
+                    return UIElement(
+                        id=self._next_id(),
+                        role="document",
+                        name="Accessibility tree conversion limit reached",
+                        states=["truncated"],
+                        source="cdp",
+                    )
 
-                tree = self._build_tree(nodes)
+                secure_metadata = await self.collect_secure_dom_metadata(
+                    lambda method, params: self._send(ws, method, params),
+                    nodes,
+                )
+                tree = self._build_tree(
+                    nodes,
+                    secure_metadata=secure_metadata,
+                )
+                if tree is not None and nodes_truncated:
+                    tree.states.append("truncated")
 
                 # Enrich interactive elements with layout + visual data
                 if enrich and tree:
                     await self._enrich_tree(ws, tree)
 
                 return tree
-        except Exception as e:
-            return UIElement(
-                id=self._next_id(),
-                role="error",
-                name=f"CDP connection failed: {e}",
+        except Exception as exc:
+            logger.debug(
+                "Legacy accessibility tree failed (exception_type=%s)",
+                type(exc).__name__,
             )
+            return None
 
     # Interactive roles worth enriching with layout/visual data
     _ENRICH_ROLES = frozenset({
@@ -235,12 +737,13 @@ class CDPClient:
         Enriches up to `limit` elements to keep CDP calls bounded.
         Returns number of elements enriched.
 
-        CSS.enable and DOM.enable are called once here before the walk,
-        not per-element inside _get_visual_summary / _get_box_model.
+        Legacy CDP has a single receive stream, so enrichment keeps only the
+        highest-value one-round-trip field: the element's box model. Visual
+        style summaries cost two extra commands per element and aren't needed
+        for reliable targeting.
         """
-        # Enable domains once before walking the tree
+        # Enable the one required domain once before walking the tree.
         await self._send(ws, "DOM.enable")
-        await self._send(ws, "CSS.enable")
         return await self._enrich_subtree(ws, element, limit)
 
     async def _enrich_subtree(self, ws, element: UIElement, limit: int) -> int:
@@ -251,15 +754,9 @@ class CDPClient:
 
         if element.role in self._ENRICH_ROLES and element.platform_ref:
             try:
-                # Run box model and visual summary in parallel (halves enrichment time)
-                box, vis = await asyncio.gather(
-                    self._get_box_model(ws, element.platform_ref),
-                    self._get_visual_summary(ws, element.platform_ref),
-                )
+                box = await self._get_box_model(ws, element.platform_ref)
                 if box:
                     element.bounds = box
-                if vis:
-                    element.visual = vis
 
                 enriched += 1
             except Exception:
@@ -331,7 +828,7 @@ class CDPClient:
                 parts.append(fs)
             fw = styles.get("font-weight", "")
             if fw and fw not in ("400", "normal"):
-                parts.append(f"bold" if fw in ("700", "bold") else f"fw:{fw}")
+                parts.append("bold" if fw in ("700", "bold") else f"fw:{fw}")
             opacity = styles.get("opacity", "1")
             if opacity != "1":
                 parts.append(f"opacity:{opacity}")
@@ -376,11 +873,9 @@ class CDPClient:
         self, tab: ChromeTab, role: str = "", name: str = ""
     ) -> list[UIElement]:
         """Search for elements by role and/or accessible name."""
-        import websockets
-
         self.reset_ids()
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "Accessibility.enable")
 
                 params: dict[str, Any] = {}
@@ -393,9 +888,21 @@ class CDPClient:
                     ws, "Accessibility.queryAXTree", params
                 )
 
+                nodes = result.get("nodes", [])
+                secure_metadata = await self.collect_secure_dom_metadata(
+                    lambda method, metadata_params: self._send(
+                        ws,
+                        method,
+                        metadata_params,
+                    ),
+                    nodes,
+                )
                 elements = []
-                for node in result.get("nodes", []):
-                    el = self._node_to_element(node)
+                for node in nodes:
+                    el = self._node_to_element(
+                        node,
+                        secure_metadata=secure_metadata,
+                    )
                     if el:
                         elements.append(el)
                 return elements
@@ -408,10 +915,8 @@ class CDPClient:
         Returns True if the element still exists in the DOM, False if stale.
         Use this before actions to give better error messages.
         """
-        import websockets
-
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
                 result = await self._send(
                     ws, "DOM.resolveNode",
@@ -422,16 +927,33 @@ class CDPClient:
         except Exception:
             return False
 
+    async def _read_document_revision(self, ws) -> int:
+        frame_result = await self._send(ws, "Page.getFrameTree")
+        document_result = await self._send(
+            ws,
+            "DOM.getDocument",
+            {"depth": 0, "pierce": False},
+        )
+        return _document_revision(frame_result, document_result)
+
+    async def get_document_revision(self, tab: ChromeTab) -> int:
+        """Read a stable identity for the tab's current top-level document."""
+        async with _connect_websocket(tab.ws_url) as ws:
+            return await self._read_document_revision(ws)
+
+    async def _assert_document_revision(self, ws, expected_revision: int) -> None:
+        current_revision = await self._read_document_revision(ws)
+        if current_revision != expected_revision:
+            raise CDPDocumentChangedError("shadow document changed")
+
     async def get_element_value(self, tab: ChromeTab, backend_node_id: int) -> str | None:
         """Get the current value of an input element.
 
         Returns the value string, or None if the element doesn't exist or has no value.
         Used for typing verification.
         """
-        import websockets
-
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
                 result = await self._send(
                     ws, "DOM.resolveNode",
@@ -459,13 +981,20 @@ class CDPClient:
         except Exception:
             return None
 
-    async def click_element(self, tab: ChromeTab, backend_node_id: int) -> bool:
+    async def click_element(
+        self,
+        tab: ChromeTab,
+        backend_node_id: int,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
         """Click an element by its backend DOM node ID."""
-        import websockets
-
+        dispatched = False
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
 
                 # Resolve to JS object
                 result = await self._send(
@@ -475,26 +1004,59 @@ class CDPClient:
                 object_id = result.get("object", {}).get("objectId")
                 if not object_id:
                     return False
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
 
                 # Click via JS
-                await self._send(
+                dispatched = True
+                click_result = await self._send(
                     ws, "Runtime.callFunctionOn",
                     {
-                        "functionDeclaration": "function() { this.click(); }",
+                        "functionDeclaration": (
+                            "function() { if (!this.isConnected) "
+                            "throw new Error('STALE_ELEMENT'); this.click(); }"
+                        ),
                         "objectId": object_id,
                     },
                 )
+                if _runtime_exception_details(click_result) is not None:
+                    if _runtime_exception_is_stale(click_result):
+                        dispatched = False
+                        raise CDPDocumentChangedError("shadow element changed")
+                    raise CDPMutationOutcomeUnknown(
+                        "legacy shadow click ended with a runtime exception"
+                    )
                 return True
-        except Exception:
+        except CDPDocumentChangedError:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow click outcome is unknown"
+                )
+            raise
+        except CDPMutationOutcomeUnknown:
+            raise
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow click outcome is unknown"
+                ) from exc
             return False
 
-    async def type_text(self, tab: ChromeTab, backend_node_id: int, text: str) -> bool:
+    async def type_text(
+        self,
+        tab: ChromeTab,
+        backend_node_id: int,
+        text: str,
+        *,
+        expected_revision: int | None = None,
+    ) -> bool:
         """Type text into an element."""
-        import websockets
-
+        dispatched = False
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
 
                 # Focus the element
                 result = await self._send(
@@ -504,14 +1066,29 @@ class CDPClient:
                 object_id = result.get("object", {}).get("objectId")
                 if not object_id:
                     return False
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
 
-                await self._send(
+                dispatched = True
+                focus_result = await self._send(
                     ws, "Runtime.callFunctionOn",
                     {
-                        "functionDeclaration": "function() { this.focus(); }",
+                        "functionDeclaration": (
+                            "function() { if (!this.isConnected) "
+                            "throw new Error('STALE_ELEMENT'); this.focus(); }"
+                        ),
                         "objectId": object_id,
                     },
                 )
+                if _runtime_exception_details(focus_result) is not None:
+                    if _runtime_exception_is_stale(focus_result):
+                        dispatched = False
+                        raise CDPDocumentChangedError("shadow element changed")
+                    raise CDPMutationOutcomeUnknown(
+                        "legacy shadow focus ended with a runtime exception; text was not sent"
+                    )
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
 
                 # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
                 await self._send(
@@ -520,48 +1097,66 @@ class CDPClient:
                 )
 
                 return True
-        except Exception:
+        except CDPDocumentChangedError:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow input outcome is unknown"
+                )
+            raise
+        except CDPMutationOutcomeUnknown:
+            raise
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow input outcome is unknown"
+                ) from exc
             return False
 
     # ── New capabilities ─────────────────────────────────────────────
 
     async def navigate(self, tab: ChromeTab, url: str) -> dict:
         """Navigate a tab to a URL. Returns {url, title} after load."""
-        import websockets
-
+        dispatched = False
         try:
-            async with websockets.connect(tab.ws_url) as ws:
-                await self._send(ws, "Page.enable")
+            async with _connect_websocket(tab.ws_url) as ws:
+                events: list[dict] = []
+                await self._send(ws, "Page.enable", event_buffer=events)
+                events.clear()
+                dispatched = True
                 result = await self._send(
-                    ws, "Page.navigate", {"url": url}
+                    ws,
+                    "Page.navigate",
+                    {"url": url},
+                    event_buffer=events,
                 )
                 error_text = result.get("errorText")
                 if error_text:
                     return {"error": error_text}
 
-                # Wait for load event (up to 12s — under the 15s outer server timeout)
-                deadline = time.monotonic() + 12
-                while time.monotonic() < deadline:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        msg = json.loads(raw)
-                        if msg.get("method") in (
-                            "Page.loadEventFired",
-                            "Page.domContentEventFired",
-                        ):
-                            break
-                    except asyncio.TimeoutError:
-                        continue
+                # Events can arrive before the command response. Consume the
+                # bounded buffer first, then block once on the receive stream.
+                await self._wait_for_protocol_event(
+                    ws,
+                    {"Page.loadEventFired", "Page.domContentEventFired"},
+                    deadline=asyncio.get_running_loop().time() + 12.0,
+                    event_buffer=events,
+                )
 
                 # Get final title
                 doc = await self._send(
-                    ws, "Runtime.evaluate",
+                    ws,
+                    "Runtime.evaluate",
                     {"expression": "document.title", "returnByValue": True},
+                    event_buffer=events,
                 )
                 title = doc.get("result", {}).get("value", "")
                 return {"url": url, "title": title}
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow navigation outcome is unknown"
+                ) from exc
+            return {"error": "navigation provider failure"}
 
     async def evaluate(self, tab: ChromeTab, expression: str) -> dict:
         """Execute JavaScript in the tab. Returns {value} or {error}.
@@ -569,16 +1164,12 @@ class CDPClient:
         Return values are truncated to MAX_EVAL_RESULT_LEN to prevent
         excessive data from flooding the MCP response.
         """
-        import websockets
+        logger.debug("eyes_evaluate request (%d characters)", len(expression))
 
-        MAX_EVAL_RESULT_LEN = 10_000
-
-        logger.debug(
-            "eyes_evaluate (len=%d): %.200s", len(expression), expression
-        )
-
+        dispatched = False
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
+                dispatched = True
                 result = await self._send(
                     ws,
                     "Runtime.evaluate",
@@ -600,15 +1191,17 @@ class CDPClient:
                 if isinstance(val, str) and len(val) > MAX_EVAL_RESULT_LEN:
                     val = val[:MAX_EVAL_RESULT_LEN] + f"… [truncated, {len(val)} chars total]"
                 return {"value": val}
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow JavaScript outcome is unknown"
+                ) from exc
+            return {"error": "evaluation provider failure"}
 
     async def press_key(
         self, tab: ChromeTab, key: str, modifiers: list[str] | None = None
     ) -> bool:
         """Press a key (Enter, Tab, Escape, etc.) with optional modifiers."""
-        import websockets
-
         mod_flags = 0
         for m in (modifiers or []):
             m_lower = m.lower()
@@ -634,7 +1227,7 @@ class CDPClient:
             }
 
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 down_params: dict[str, Any] = {
                     "type": "keyDown",
                     "key": key_desc["key"],
@@ -670,32 +1263,76 @@ class CDPClient:
         name: str = "",
         timeout: float = 5.0,
     ) -> UIElement | None:
-        """Poll for an element to appear in the accessibility tree.
+        """Wait for an accessibility match, re-querying only after CDP events.
 
-        Holds a single WebSocket connection open across poll iterations
-        to avoid repeated handshake overhead.
+        This legacy one-WebSocket path remains for compatibility with callers
+        that do not use :class:`CDPConnection`; it does not use timer polling.
         """
-        import websockets
-
-        deadline = time.monotonic() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        event_methods = {
+            "Accessibility.nodesUpdated",
+            "Accessibility.loadComplete",
+        }
         try:
-            async with websockets.connect(tab.ws_url) as ws:
-                await self._send(ws, "Accessibility.enable")
-                while time.monotonic() < deadline:
+            async with _connect_websocket(tab.ws_url) as ws:
+                events: list[dict] = []
+                await self._send(
+                    ws,
+                    "Accessibility.enable",
+                    event_buffer=events,
+                )
+
+                async def query() -> UIElement | None:
+                    root_result = await self._send(
+                        ws,
+                        "Accessibility.getRootAXNode",
+                        event_buffer=events,
+                    )
+                    root = root_result.get("node", {})
                     params: dict[str, Any] = {}
+                    backend_node_id = root.get("backendDOMNodeId")
+                    node_id = root.get("nodeId")
+                    if backend_node_id is not None:
+                        params["backendNodeId"] = backend_node_id
+                    elif node_id:
+                        params["nodeId"] = node_id
+                    else:
+                        return None
                     if role:
                         params["role"] = role
                     if name:
                         params["accessibleName"] = name
                     result = await self._send(
-                        ws, "Accessibility.queryAXTree", params
+                        ws,
+                        "Accessibility.queryAXTree",
+                        params,
+                        event_buffer=events,
                     )
-                    nodes = result.get("nodes", [])
-                    for node in nodes:
-                        el = self._node_to_element(node)
-                        if el:
-                            return el
-                    await asyncio.sleep(0.5)
+                    for node in result.get("nodes", []):
+                        element = self._node_to_element(node)
+                        if element is not None:
+                            return element
+                    return None
+
+                while True:
+                    match = await query()
+                    if match is not None:
+                        return match
+
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        return None
+                    event = await self._wait_for_protocol_event(
+                        ws,
+                        event_methods,
+                        deadline=deadline,
+                        event_buffer=events,
+                    )
+                    if event is None:
+                        return None
+        except asyncio.TimeoutError:
+            return None
         except Exception:
             pass
         return None
@@ -707,96 +1344,101 @@ class CDPClient:
         Page.loadEventFired or Page.domContentEventFired (up to 10s), then
         fetches the actual page title — matching the behaviour of navigate().
         """
-        import websockets
-
         # Need an existing tab's WS URL to issue the browser-level command
         tabs = await self.list_tabs()
         if not tabs:
             return None
 
+        dispatched = False
         try:
-            async with websockets.connect(tabs[0].ws_url) as ws:
+            async with _connect_websocket(tabs[0].ws_url) as ws:
+                dispatched = True
                 result = await self._send(
                     ws, "Target.createTarget", {"url": url}
                 )
                 target_id = result.get("targetId")
                 if not target_id:
                     return None
-
-            # Fetch the new tab's metadata from the JSON endpoint
-            new_tabs = await self.list_tabs()
-            new_tab: ChromeTab | None = None
-            for t in new_tabs:
-                if t.id == target_id:
-                    new_tab = t
-                    break
-
-            if new_tab is None:
-                return None
-
-            # For non-blank URLs: wait for the page to load and get the real title
-            if url != "about:blank" and new_tab.ws_url:
-                try:
-                    async with websockets.connect(new_tab.ws_url) as ws:
-                        await self._send(ws, "Page.enable")
-
-                        # Wait for load event (up to 10s)
-                        deadline = time.monotonic() + 10
-                        while time.monotonic() < deadline:
-                            try:
-                                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                                msg = json.loads(raw)
-                                if msg.get("method") in (
-                                    "Page.loadEventFired",
-                                    "Page.domContentEventFired",
-                                ):
-                                    break
-                            except asyncio.TimeoutError:
-                                continue
-
-                        # Get the real page title after load
-                        doc = await self._send(
-                            ws, "Runtime.evaluate",
-                            {"expression": "document.title", "returnByValue": True},
-                        )
-                        title = doc.get("result", {}).get("value", "")
-                        if title:
-                            new_tab = ChromeTab(
-                                id=new_tab.id,
-                                title=title,
-                                url=url,
-                                ws_url=new_tab.ws_url,
-                            )
-                except Exception as e:
-                    logger.debug("new_tab page load wait failed: %s", e)
-                    # Return tab without title rather than failing entirely
-
-            return new_tab
-        except Exception as e:
-            logger.error("Failed to create new tab: %s", e)
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow new-tab outcome is unknown"
+                ) from exc
             return None
+
+        # Target.createTarget acknowledged creation. Metadata discovery may lag,
+        # so retain the browser-owned ID instead of inviting a duplicate retry.
+        new_tabs = await self.list_tabs()
+        new_tab = next((candidate for candidate in new_tabs if candidate.id == target_id), None)
+        if new_tab is None:
+            return ChromeTab(id=target_id, title="", url=url, ws_url="")
+
+        # For non-blank URLs: observe ready state/events and get the real title.
+        if url != "about:blank" and new_tab.ws_url:
+            try:
+                async with _connect_websocket(new_tab.ws_url) as ws:
+                    events: list[dict] = []
+                    await self._send(ws, "Page.enable", event_buffer=events)
+                    ready = await self._send(
+                        ws,
+                        "Runtime.evaluate",
+                        {
+                            "expression": "document.readyState",
+                            "returnByValue": True,
+                        },
+                        event_buffer=events,
+                    )
+                    ready_state = ready.get("result", {}).get("value", "")
+                    if ready_state not in {"interactive", "complete"}:
+                        await self._wait_for_protocol_event(
+                            ws,
+                            {"Page.loadEventFired", "Page.domContentEventFired"},
+                            deadline=asyncio.get_running_loop().time() + 10.0,
+                            event_buffer=events,
+                        )
+                    doc = await self._send(
+                        ws,
+                        "Runtime.evaluate",
+                        {"expression": "document.title", "returnByValue": True},
+                        event_buffer=events,
+                    )
+                    title = doc.get("result", {}).get("value", "")
+                    if title:
+                        new_tab = ChromeTab(
+                            id=new_tab.id,
+                            title=title,
+                            url=url,
+                            ws_url=new_tab.ws_url,
+                        )
+            except Exception as exc:
+                logger.debug(
+                    "new_tab page observation failed (exception_type=%s)",
+                    type(exc).__name__,
+                )
+        return new_tab
 
     async def close_tab(self, tab: ChromeTab) -> bool:
         """Close a browser tab."""
-        import urllib.request
+        def close() -> bool:
+            try:
+                status, _body = _cdp_http_get(
+                    self.host,
+                    self.active_port,
+                    f"/json/close/{quote(tab.id, safe='')}",
+                    timeout=5,
+                )
+                return status == 200
+            except Exception:
+                return False
 
-        try:
-            req = urllib.request.Request(
-                f"http://{self.host}:{self.active_port}/json/close/{tab.id}"
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        return await asyncio.to_thread(close)
 
     async def handle_dialog(
         self, tab: ChromeTab, accept: bool = True, prompt_text: str = ""
     ) -> bool:
         """Handle a JavaScript dialog (alert, confirm, prompt)."""
-        import websockets
-
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "Page.enable")
                 params: dict[str, Any] = {"accept": accept}
                 if prompt_text:
@@ -806,25 +1448,55 @@ class CDPClient:
                 )
                 return True
         except Exception as e:
-            logger.debug("handle_dialog failed (no dialog open?): %s", e)
+            logger.debug(
+                "handle_dialog failed (no dialog open; exception_type=%s)",
+                type(e).__name__,
+            )
             return False
 
     async def set_file_input(
-        self, tab: ChromeTab, backend_node_id: int, files: list[str]
+        self,
+        tab: ChromeTab,
+        backend_node_id: int,
+        files: list[str],
+        *,
+        expected_revision: int | None = None,
     ) -> bool:
         """Set files on a file input element."""
-        import websockets
-
+        dispatched = False
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
+                if expected_revision is not None:
+                    await self._assert_document_revision(ws, expected_revision)
+                    resolved = await self._send(
+                        ws,
+                        "DOM.resolveNode",
+                        {"backendNodeId": backend_node_id},
+                    )
+                    if not resolved.get("object", {}).get("objectId"):
+                        return False
+                    await self._assert_document_revision(ws, expected_revision)
+                dispatched = True
                 await self._send(
                     ws,
                     "DOM.setFileInputFiles",
                     {"files": files, "backendNodeId": backend_node_id},
                 )
                 return True
-        except Exception:
+        except CDPDocumentChangedError:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow file-input outcome is unknown"
+                )
+            raise
+        except CDPMutationOutcomeUnknown:
+            raise
+        except Exception as exc:
+            if dispatched:
+                raise CDPMutationOutcomeUnknown(
+                    "legacy shadow file-input outcome is unknown"
+                ) from exc
             return False
 
     async def scroll(
@@ -836,10 +1508,8 @@ class CDPClient:
         delta_y: int = 0,
     ) -> bool:
         """Scroll the page at coordinates (x, y) by (delta_x, delta_y)."""
-        import websockets
-
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(
                     ws,
                     "Input.dispatchMouseEvent",
@@ -865,10 +1535,8 @@ class CDPClient:
         steps: int = 10,
     ) -> bool:
         """Drag from one point to another with smooth mouse movement."""
-        import websockets
-
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 # Mouse down at start
                 await self._send(
                     ws,
@@ -897,7 +1565,6 @@ class CDPClient:
                             "button": "left",
                         },
                     )
-                    await asyncio.sleep(0.02)
 
                 # Mouse up at end
                 await self._send(
@@ -922,8 +1589,6 @@ class CDPClient:
         This is the equivalent of applescript.get_page_accessibility_summary() but
         uses CDP JavaScript execution instead of AppleScript/JXA.
         """
-        import websockets
-
         js_code = """
         (function() {
             var result = [];
@@ -1003,7 +1668,7 @@ class CDPClient:
         """
 
         try:
-            async with websockets.connect(tab.ws_url) as ws:
+            async with _connect_websocket(tab.ws_url) as ws:
                 result = await self._send(
                     ws, "Runtime.evaluate",
                     {"expression": js_code, "returnByValue": True},
@@ -1013,7 +1678,54 @@ class CDPClient:
         except Exception as e:
             return f"ERROR: CDP JS execution failed: {e}"
 
-    async def _send(self, ws, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+    @staticmethod
+    def _pop_buffered_event(
+        event_buffer: list[dict],
+        methods: set[str],
+    ) -> dict | None:
+        for index, message in enumerate(event_buffer):
+            if message.get("method") in methods:
+                return event_buffer.pop(index)
+        return None
+
+    async def _wait_for_protocol_event(
+        self,
+        ws,
+        methods: set[str],
+        *,
+        deadline: float,
+        event_buffer: list[dict],
+    ) -> dict | None:
+        buffered = self._pop_buffered_event(event_buffer, methods)
+        if buffered is not None:
+            return buffered
+
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            message = json.loads(raw)
+            if message.get("method") in methods:
+                return message
+            if isinstance(message.get("method"), str):
+                event_buffer.append(message)
+                if len(event_buffer) > _MAX_BUFFERED_EVENTS:
+                    del event_buffer[: len(event_buffer) - _MAX_BUFFERED_EVENTS]
+
+    async def _send(
+        self,
+        ws,
+        method: str,
+        params: dict | None = None,
+        timeout: float = 15.0,
+        *,
+        event_buffer: list[dict] | None = None,
+    ) -> dict:
         """Send a CDP command and wait for response.
 
         Uses a locally-captured message ID to avoid race conditions
@@ -1039,14 +1751,32 @@ class CDPClient:
             response = json.loads(raw)
             if response.get("id") == msg_id:
                 if "error" in response:
-                    raise RuntimeError(
-                        f"CDP error: {response['error'].get('message', response['error'])}"
-                    )
+                    raise RuntimeError(f"CDP command {method} failed")
                 return response.get("result", {})
+            if event_buffer is not None and isinstance(response.get("method"), str):
+                event_buffer.append(response)
+                if len(event_buffer) > _MAX_BUFFERED_EVENTS:
+                    del event_buffer[: len(event_buffer) - _MAX_BUFFERED_EVENTS]
 
-    def _build_tree(self, nodes: list[dict]) -> UIElement | None:
+    def _build_tree(
+        self,
+        nodes: list[dict],
+        *,
+        secure_metadata: SecureDOMMetadata | None = None,
+    ) -> UIElement | None:
         """Build UIElement tree from flat CDP node list."""
         if not nodes:
+            return None
+        nodes, nodes_truncated = _bounded_ax_nodes(nodes)
+        if not nodes:
+            if nodes_truncated:
+                return UIElement(
+                    id=self._next_id(),
+                    role="document",
+                    name="Accessibility tree conversion limit reached",
+                    states=["truncated"],
+                    source="cdp",
+                )
             return None
 
         # Build lookup
@@ -1067,45 +1797,86 @@ class CDPClient:
         if root_node is None:
             return None
 
-        return self._build_subtree(root_node, node_map, set())
+        roots = self._build_subtree(
+            root_node,
+            node_map,
+            set(),
+            secure_metadata=secure_metadata,
+        )
+        if len(roots) == 1:
+            tree = roots[0]
+        elif roots:
+            tree = UIElement(id=self._next_id(), role="group", source="cdp")
+            tree.children = roots
+        else:
+            tree = None
+        if tree is not None and nodes_truncated:
+            tree.states.append("truncated")
+        return tree
 
     def _build_subtree(
-        self, node: dict, node_map: dict, visited: set
-    ) -> UIElement | None:
+        self,
+        node: dict,
+        node_map: dict,
+        visited: set,
+        *,
+        secure_metadata: SecureDOMMetadata | None,
+    ) -> list[UIElement]:
         node_id = node.get("nodeId", "")
         if node_id in visited:
-            return None
+            return []
         visited.add(node_id)
 
-        if node.get("ignored", False):
-            # Process children of ignored nodes directly
-            children = []
+        role_value = node.get("role", {})
+        role = (
+            role_value.get("value", "unknown")
+            if isinstance(role_value, dict)
+            else str(role_value)
+        )
+        if role == "InlineTextBox":
+            return []
+
+        transparent = node.get("ignored", False) or role in {"none", "generic"}
+        if transparent:
+            descendants: list[UIElement] = []
             for child_id in node.get("childIds", []):
                 if child_id in node_map:
-                    child = self._build_subtree(node_map[child_id], node_map, visited)
-                    if child:
-                        children.append(child)
-            if len(children) == 1:
-                return children[0]
-            if children:
-                container = UIElement(id=self._next_id(), role="group")
-                container.children = children
-                return container
-            return None
+                    descendants.extend(
+                        self._build_subtree(
+                            node_map[child_id],
+                            node_map,
+                            visited,
+                            secure_metadata=secure_metadata,
+                        )
+                    )
+            return descendants
 
-        element = self._node_to_element(node)
+        element = self._node_to_element(
+            node,
+            secure_metadata=secure_metadata,
+        )
         if element is None:
-            return None
+            return []
 
         for child_id in node.get("childIds", []):
             if child_id in node_map:
-                child = self._build_subtree(node_map[child_id], node_map, visited)
-                if child:
-                    element.children.append(child)
+                element.children.extend(
+                    self._build_subtree(
+                        node_map[child_id],
+                        node_map,
+                        visited,
+                        secure_metadata=secure_metadata,
+                    )
+                )
 
-        return element
+        return [element]
 
-    def _node_to_element(self, node: dict) -> UIElement | None:
+    def _node_to_element(
+        self,
+        node: dict,
+        *,
+        secure_metadata: SecureDOMMetadata | None = None,
+    ) -> UIElement | None:
         """Convert a CDP AXNode to UIElement."""
         role_val = node.get("role", {})
         role = role_val.get("value", "unknown") if isinstance(role_val, dict) else str(role_val)
@@ -1122,8 +1893,11 @@ class CDPClient:
         desc_val = node.get("description", {})
         description = desc_val.get("value", "") if isinstance(desc_val, dict) else str(desc_val or "")
 
-        # Extract states from properties
+        # Extract states from properties. Chromium normally identifies native
+        # password controls here, but DOM metadata remains authoritative for
+        # custom/autocomplete/CSS-secured textboxes.
         states = []
+        ax_secure = False
         for prop in node.get("properties", []):
             prop_name = prop.get("name", "")
             prop_value = prop.get("value", {}).get("value", False)
@@ -1138,41 +1912,142 @@ class CDPClient:
             elif prop_name == "checked":
                 if prop_value == "true" or prop_value is True:
                     states.append("checked")
+            elif prop_name in {"password", "protected", "secure"}:
+                if prop_value is True or str(prop_value).casefold() == "true":
+                    ax_secure = True
 
         # Store backend DOM node ID for actions
         backend_id = node.get("backendDOMNodeId")
+        secure_backend_ids = (
+            secure_metadata.secure_backend_node_ids
+            if secure_metadata is not None
+            else frozenset()
+        )
+        secure = _tree_node_is_secure({"role": role, "secure": ax_secure}) or (
+            isinstance(backend_id, int)
+            and not isinstance(backend_id, bool)
+            and backend_id in secure_backend_ids
+        )
+        metadata_complete = secure_metadata is not None and secure_metadata.complete
+        redact_unverified = (
+            str(role).casefold() in _TEXT_VALUE_ROLES
+            and bool(value)
+            and not metadata_complete
+        )
+        if secure:
+            states.append("secure")
+        elif redact_unverified:
+            states.append("value-redacted")
 
         return UIElement(
             id=self._next_id(),
             role=role,
             name=name,
-            value=str(value)[:200] if value else "",
+            value="" if secure or redact_unverified else str(value)[:200] if value else "",
             description=description,
             states=states,
             platform_ref=backend_id,  # Store backend DOM node ID
             source="cdp",
         )
 
-    async def get_pierced_dom(self, tab: ChromeTab) -> list[dict]:
-        """Get full DOM including shadow roots via CDP pierce mode.
+    async def get_pierced_dom(
+        self,
+        tab: ChromeTab,
+        *,
+        max_nodes: int = _MAX_PIERCED_DOM_NODES,
+    ) -> list[dict]:
+        """Read a bounded set of named controls across open shadow roots.
 
-        Uses DOM.getFlattenedDocument with pierce=True to traverse into
-        shadow roots that are invisible to the Accessibility tree.
-        Returns the flat list of DOM nodes, or [] on any failure.
+        A whole-document ``depth=-1`` response can allocate thousands of nodes
+        before a local cap can help. ``DOM.performSearch`` applies the cap in
+        Chrome first, then only the exact matches needed by shadow augmentation
+        are described.
         """
-        import websockets
+        if (
+            isinstance(max_nodes, bool)
+            or not isinstance(max_nodes, int)
+            or not 1 <= max_nodes <= _MAX_PIERCED_DOM_NODES
+        ):
+            raise ValueError(
+                "max_nodes must be an integer between 1 and "
+                f"{_MAX_PIERCED_DOM_NODES}"
+            )
 
         try:
-            async with websockets.connect(tab.ws_url) as ws:
-                # Enable DOM domain first
+            async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
-                result = await self._send(
-                    ws,
-                    "DOM.getFlattenedDocument",
-                    {"depth": -1, "pierce": True},
-                    timeout=3.0,
-                )
-                return result.get("nodes", [])
-        except Exception as e:
-            logger.debug("get_pierced_dom failed (non-critical): %s", e)
+                search_id = ""
+                try:
+                    search = await self._send(
+                        ws,
+                        "DOM.performSearch",
+                        {
+                            "query": _PIERCED_CONTROL_SELECTOR,
+                            "includeUserAgentShadowDOM": True,
+                        },
+                        timeout=3.0,
+                    )
+                    search_id = search.get("searchId", "")
+                    result_count = search.get("resultCount", 0)
+                    if not isinstance(search_id, str) or not search_id:
+                        return []
+                    if (
+                        isinstance(result_count, bool)
+                        or not isinstance(result_count, int)
+                        or result_count <= 0
+                    ):
+                        return []
+                    to_index = min(result_count, max_nodes)
+                    results = await self._send(
+                        ws,
+                        "DOM.getSearchResults",
+                        {
+                            "searchId": search_id,
+                            "fromIndex": 0,
+                            "toIndex": to_index,
+                        },
+                        timeout=3.0,
+                    )
+                    node_ids = results.get("nodeIds", [])
+                    if not isinstance(node_ids, list):
+                        return []
+
+                    nodes: list[dict] = []
+                    for node_id in node_ids[:to_index]:
+                        if (
+                            isinstance(node_id, bool)
+                            or not isinstance(node_id, int)
+                            or node_id <= 0
+                        ):
+                            continue
+                        description = await self._send(
+                            ws,
+                            "DOM.describeNode",
+                            {"nodeId": node_id, "depth": 0},
+                            timeout=3.0,
+                        )
+                        node = description.get("node")
+                        if isinstance(node, dict):
+                            nodes.append(node)
+                    return nodes
+                finally:
+                    if search_id:
+                        try:
+                            await self._send(
+                                ws,
+                                "DOM.discardSearchResults",
+                                {"searchId": search_id},
+                                timeout=1.0,
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Could not discard legacy DOM search state "
+                                "(exception_type=%s)",
+                                type(exc).__name__,
+                            )
+        except Exception as exc:
+            logger.debug(
+                "get_pierced_dom failed with %s (non-critical)",
+                type(exc).__name__,
+            )
             return []

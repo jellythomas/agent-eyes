@@ -1,7 +1,7 @@
 {
   "name": "agent-eyes",
-  "version": "0.5.0",
-  "description": "Accessibility-tree vision for AI agents — see and interact with any application without screenshots",
+  "version": "0.9.0",
+  "description": "Model-independent native computer use with cross-browser tab reuse and explicit background automation",
   "author": {
     "name": "Jelly Thomas",
     "url": "https://github.com/jellythomas"
@@ -12,8 +12,8 @@
   "keywords": ["mcp", "accessibility", "browser", "desktop", "automation", "ui"],
   "mcpServers": {
     "agent-eyes": {
-      "command": "uvx",
-      "args": ["agent-eyes"]
+      "command": "agent-eyes",
+      "args": ["serve"]
     }
   },
   "skills": "./skills/"

@@ -1,0 +1,11 @@
+{
+  "current_measured_elapsed_ms": 73.14,
+  "current_serial_round_trips": 61,
+  "elements": 60,
+  "enriched": 60,
+  "measured_speedup": 2.92,
+  "previous_measured_elapsed_ms": 213.32,
+  "previous_serial_round_trips": 182,
+  "round_trip_reduction_percent": 66.48,
+  "simulated_round_trip_ms": 1.0
+}

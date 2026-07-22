@@ -37,6 +37,27 @@ def test_registry_cap_at_500():
     assert reg.count() <= 500
 
 
+def test_incremental_registration_remains_bounded_and_keeps_newest():
+    reg = ElementRegistry()
+
+    for element_id in range(750):
+        reg.register_element(UIElement(id=element_id, role="button"))
+
+    assert reg.count() == 500
+    assert reg.get(749) is not None
+    assert reg.get(0) is None
+
+
+def test_bulk_incremental_registration_remains_bounded():
+    reg = ElementRegistry()
+
+    reg.register_elements(
+        [UIElement(id=element_id, role="button") for element_id in range(750)]
+    )
+
+    assert reg.count() == 500
+
+
 def test_registry_get_checked_element_not_found():
     reg = ElementRegistry()
     tree = UIElement(id=1, role="button", name="Only")

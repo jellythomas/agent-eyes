@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "agent-eyes": {
-      "command": "uv",
-      "args": ["run", "--directory", "/Users/mekari/mcp-servers/agent-eyes", "agent-eyes"],
-      "env": {}
-    }
-  }
-}
