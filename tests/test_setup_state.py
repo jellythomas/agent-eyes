@@ -158,6 +158,40 @@ def test_windows_setup_lock_has_bounded_nonblocking_acquisition(tmp_path):
     assert msvcrt.modes == [msvcrt.LK_NBLCK]
 
 
+def test_setup_lock_stream_keeps_raw_file_position_aligned(tmp_path, monkeypatch):
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.offsets = []
+
+        def locking(self, descriptor, _mode, _nbytes):
+            self.offsets.append(os.lseek(descriptor, 0, os.SEEK_CUR))
+
+    lock_path = tmp_path / ".setup.lock"
+    lock_path.write_bytes(b"\0\0")
+    opened_streams = []
+    real_fdopen = os.fdopen
+    msvcrt = Msvcrt()
+
+    def capture_stream(*args, **kwargs):
+        stream = real_fdopen(*args, **kwargs)
+        opened_streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(state.os, "fdopen", capture_stream)
+
+    with state._exclusive_file_lock(lock_path, label="Setup lock"):
+        state._acquire_windows_setup_lock(
+            opened_streams[-1],
+            msvcrt,
+            label="Setup lock",
+            path=lock_path,
+        )
+
+    assert msvcrt.offsets == [0]
+
+
 def test_state_save_never_opens_a_symlinked_readiness_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "_state_dir", lambda: tmp_path)
     victim = tmp_path / "unrelated"

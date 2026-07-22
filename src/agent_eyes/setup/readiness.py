@@ -452,7 +452,8 @@ def _open_readiness_lock(path: Path):
             raise ReadinessStateError("Readiness lock file must be a regular file")
         if os.name != "nt":
             os.fchmod(descriptor, 0o600)
-        return os.fdopen(descriptor, "a+b")
+        # msvcrt.locking uses the descriptor's raw position, so keep it aligned.
+        return os.fdopen(descriptor, "a+b", buffering=0)
     except ReadinessStateError:
         if descriptor >= 0:
             os.close(descriptor)

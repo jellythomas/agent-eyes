@@ -495,30 +495,78 @@ def test_event_wait_timeout_is_precise_and_does_not_requery_without_event():
     asyncio.run(run())
 
 
-def test_event_watchdog_query_rate_is_low_and_total_timeout_remains_precise():
+def test_event_watchdog_query_rate_is_bounded_when_timer_fires_early(monkeypatch):
     async def run():
+        timeout = 0.16
         adapter = FakeAdapter([[]])
-        subscription = FakeSubscription()
+        subscription = NativeChangeSubscription(11)
+        subscription._loop = asyncio.get_running_loop()
+        subscription._wake = asyncio.Event()
+        original_sleep = asyncio.sleep
+        positive_sleeps = 0
+
+        async def sleep_early_twice(delay: float):
+            nonlocal positive_sleeps
+            if delay > 0 and positive_sleeps < 2:
+                positive_sleeps += 1
+                await original_sleep(0)
+                return
+            await original_sleep(delay)
+
+        monkeypatch.setattr("agent_eyes.native_events.asyncio.sleep", sleep_early_twice)
 
         async def factory(pid: int):
             return subscription
 
-        started = time.monotonic()
-        result = await wait_for_native_element(
-            adapter,
-            11,
-            role="dialog",
-            timeout=0.16,
-            subscription_factory=factory,
+        result = await asyncio.wait_for(
+            wait_for_native_element(
+                adapter,
+                11,
+                role="dialog",
+                timeout=timeout,
+                subscription_factory=factory,
+            ),
+            timeout=1.0,
         )
-        elapsed = time.monotonic() - started
 
         assert result.element is None
         assert result.event_driven is True
         assert result.checks == 2
         assert adapter.calls == 2
-        assert 0.14 <= elapsed < 0.3
-        assert subscription.closed is True
+        assert positive_sleeps == 1
+        assert 0.14 <= result.elapsed < 0.3
+        assert subscription._closed is True
+
+    asyncio.run(run())
+
+
+def test_native_subscription_retries_an_early_asyncio_timeout(monkeypatch):
+    async def run():
+        subscription = NativeChangeSubscription(12)
+        subscription._loop = asyncio.get_running_loop()
+        subscription._wake = asyncio.Event()
+        original_wait_for = asyncio.wait_for
+        wait_calls = 0
+
+        async def wait_for_with_one_early_timeout(awaitable, timeout):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                awaitable.close()
+                raise asyncio.TimeoutError
+            return await original_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(
+            "agent_eyes.native_events.asyncio.wait_for",
+            wait_for_with_one_early_timeout,
+        )
+        asyncio.get_running_loop().call_soon(subscription._signal_change)
+
+        changed = await subscription.wait_for_change(0, timeout=0.1)
+
+        assert changed is True
+        assert wait_calls == 2
+        assert subscription.generation == 1
 
     asyncio.run(run())
 

@@ -93,7 +93,8 @@ def _exclusive_file_lock(path: Path, *, label: str) -> Iterator[None]:
             if os.name != "nt":
                 os.fchmod(descriptor, 0o600)
 
-            with os.fdopen(descriptor, "a+b") as stream:
+            # msvcrt.locking uses the descriptor's raw position, so keep it aligned.
+            with os.fdopen(descriptor, "a+b", buffering=0) as stream:
                 descriptor = -1
                 if os.name == "nt":
                     import msvcrt

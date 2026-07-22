@@ -126,20 +126,29 @@ async def _wait_for_change_or_watchdog(
     *,
     budget: OperationBudget,
     operation: str,
+    watchdog_rechecks: int,
 ) -> tuple[bool, bool]:
     """Wait for a native event while retaining one low-rate safety recheck.
 
-    Returns ``(changed, watchdog_elapsed)``.  The steady-state watchdog is
-    capped at two checks per second and reserves part of short request deadlines
-    for the verification query itself.  Generation checks in the subscription
-    make cancelling and restarting the event wait lossless at the boundary.
+    Returns ``(changed, watchdog_elapsed)``.  The first watchdog reserves part
+    of a short request deadline for the verification query.  Later watchdogs
+    retain the full interval so an early platform timer cannot cause a burst of
+    rechecks.  Generation checks in the subscription make cancelling and
+    restarting the event wait lossless at the boundary.
     """
     remaining = budget.remaining()
     budget.checkpoint(operation)
-    watchdog_delay = min(
-        _EVENT_WATCHDOG_INTERVAL,
-        max(0.0, remaining - _EVENT_WATCHDOG_DEADLINE_RESERVE),
-    )
+    if watchdog_rechecks == 0:
+        watchdog_delay = min(
+            _EVENT_WATCHDOG_INTERVAL,
+            max(0.0, remaining - _EVENT_WATCHDOG_DEADLINE_RESERVE),
+        )
+    else:
+        watchdog_delay = (
+            _EVENT_WATCHDOG_INTERVAL
+            if remaining > _EVENT_WATCHDOG_INTERVAL
+            else 0.0
+        )
     if watchdog_delay <= 0:
         changed = await _await_with_budget(
             subscription.wait_for_change(after_generation, remaining),
@@ -262,7 +271,11 @@ class NativeChangeSubscription:
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                return False
+                # Event-loop timers may wake up to one clock tick early.  Keep
+                # the subscription authoritative until its absolute deadline;
+                # otherwise callers can enter polling fallback prematurely.
+                if deadline - loop.time() <= 0:
+                    return False
 
     async def aclose(self) -> None:
         """Stop the observer and join its owner thread."""
@@ -894,6 +907,7 @@ async def run_native_action_until(
     observation_worker = condition_worker or worker
     subscription: _ChangeSubscription | None = None
     checks = 0
+    watchdog_rechecks = 0
 
     if not operation_budget.expired:
         try:
@@ -973,6 +987,7 @@ async def run_native_action_until(
                         generation,
                         budget=operation_budget,
                         operation="native completion event",
+                        watchdog_rechecks=watchdog_rechecks,
                     )
                 except OperationError as exc:
                     if exc.code is OperationErrorCode.DEADLINE_EXCEEDED:
@@ -981,6 +996,8 @@ async def run_native_action_until(
                 if not changed and not watchdog_elapsed:
                     fallback_required = True
                     break
+                if watchdog_elapsed:
+                    watchdog_rechecks += 1
                 generation = subscription.generation
                 try:
                     is_complete = await completed()
@@ -1061,6 +1078,7 @@ async def wait_for_native_element(
     operation_budget = budget or OperationBudget.start(timeout)
     subscription: _ChangeSubscription | None = None
     checks = 0
+    watchdog_rechecks = 0
 
     async def find_first() -> UIElement | None:
         nonlocal checks
@@ -1150,6 +1168,7 @@ async def wait_for_native_element(
                         generation,
                         budget=operation_budget,
                         operation="native element event",
+                        watchdog_rechecks=watchdog_rechecks,
                     )
                 except OperationError as exc:
                     if exc.code is OperationErrorCode.DEADLINE_EXCEEDED:
@@ -1162,6 +1181,8 @@ async def wait_for_native_element(
                     raise
                 if not changed and not watchdog_elapsed:
                     break
+                if watchdog_elapsed:
+                    watchdog_rechecks += 1
                 generation = subscription.generation
                 try:
                     element = await find_first()

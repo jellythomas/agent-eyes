@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -334,3 +335,25 @@ def test_windows_readiness_lock_has_bounded_nonblocking_acquisition():
         )
 
     assert msvcrt.modes == [msvcrt.LK_NBLCK]
+
+
+def test_readiness_lock_stream_keeps_raw_file_position_aligned(tmp_path):
+    from agent_eyes.setup import readiness
+
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.offsets = []
+
+        def locking(self, descriptor, _mode, _nbytes):
+            self.offsets.append(os.lseek(descriptor, 0, os.SEEK_CUR))
+
+    lock_path = tmp_path / ".readiness.lock"
+    lock_path.write_bytes(b"\0\0")
+    msvcrt = Msvcrt()
+
+    with readiness._open_readiness_lock(lock_path) as stream:
+        readiness._acquire_windows_file_lock(stream, msvcrt)
+
+    assert msvcrt.offsets == [0]
