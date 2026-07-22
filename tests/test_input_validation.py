@@ -127,3 +127,105 @@ def test_conditional_requirement_is_enforced_only_when_condition_matches():
 
     with pytest.raises(InputValidationError, match="arguments.target_id is required"):
         validate_tool_arguments(schema, {"shadow": True})
+
+
+def test_all_of_and_any_of_argument_shapes_are_enforced():
+    schema = {
+        "type": "object",
+        "properties": {
+            "pid": {"type": "integer"},
+            "snapshot": {"type": "string", "minLength": 1},
+            "role": {"type": "string", "minLength": 1},
+            "name": {"type": "string", "minLength": 1},
+        },
+        "allOf": [
+            {
+                "anyOf": [
+                    {"required": ["pid"]},
+                    {"required": ["snapshot"]},
+                ]
+            },
+            {
+                "anyOf": [
+                    {"required": ["role"]},
+                    {"required": ["name"]},
+                ]
+            },
+        ],
+        "additionalProperties": False,
+    }
+
+    validate_tool_arguments(schema, {"pid": 42, "role": "button"})
+    validate_tool_arguments(schema, {"snapshot": "n-live", "name": "Save"})
+
+    with pytest.raises(InputValidationError, match="allowed argument shape"):
+        validate_tool_arguments(schema, {"role": "button"})
+    with pytest.raises(InputValidationError, match="allowed argument shape"):
+        validate_tool_arguments(schema, {"pid": 42})
+
+
+def test_else_branch_can_enforce_any_of_shapes():
+    schema = {
+        "type": "object",
+        "properties": {
+            "shadow": {"type": "boolean"},
+            "target_id": {"type": "string", "minLength": 1},
+            "title": {"type": "string", "minLength": 1},
+        },
+        "if": {
+            "properties": {"shadow": {"enum": [True]}},
+            "required": ["shadow"],
+        },
+        "then": {"required": ["target_id"]},
+        "else": {
+            "anyOf": [
+                {"required": ["target_id"]},
+                {"required": ["title"]},
+            ]
+        },
+        "additionalProperties": False,
+    }
+
+    validate_tool_arguments(schema, {"shadow": True, "target_id": "cdp:1"})
+    validate_tool_arguments(schema, {"title": "Quarterly report"})
+
+    with pytest.raises(InputValidationError, match="allowed argument shape"):
+        validate_tool_arguments(schema, {})
+
+
+def test_not_rejects_forbidden_argument_shapes():
+    schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "x": {"type": "integer"},
+        },
+        "required": ["id"],
+        "not": {"required": ["x"]},
+        "additionalProperties": False,
+    }
+
+    validate_tool_arguments(schema, {"id": 4})
+
+    with pytest.raises(InputValidationError, match="forbidden argument shape"):
+        validate_tool_arguments(schema, {"id": 4, "x": 10})
+
+
+@pytest.mark.parametrize("any_of", [[], [{"required": ["name"]}, "invalid"]])
+def test_malformed_any_of_schema_is_rejected(any_of):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "anyOf": any_of,
+    }
+
+    with pytest.raises(ValueError, match="anyOf"):
+        validate_tool_arguments(schema, {"name": "Save"})
+
+
+def test_malformed_not_schema_is_rejected():
+    with pytest.raises(ValueError, match="not"):
+        validate_tool_arguments(
+            {"type": "object", "not": "invalid"},
+            {},
+        )

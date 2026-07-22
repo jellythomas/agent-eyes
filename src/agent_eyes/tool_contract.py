@@ -94,6 +94,8 @@ _INTEGER_LIMITS = {
     "pid": (1, 2_147_483_647),
     "id": (0, 2_147_483_647),
     "max_depth": (0, 20),
+    "web_tree.max_depth": (0, 10),
+    "subtree.max_depth": (0, 15),
     "max_items": (1, 200),
     "max_results": (1, 50),
     "tab_index": (0, 100_000),
@@ -110,6 +112,158 @@ _INTEGER_LIMITS = {
     "width": (1, 1_000_000),
     "height": (1, 1_000_000),
 }
+
+
+def _required_nonempty_string(property_name: str) -> dict[str, Any]:
+    return {
+        "properties": {property_name: {"minLength": 1}},
+        "required": [property_name],
+    }
+
+
+def align_runtime_argument_contracts(tools: Iterable[_T]) -> list[_T]:
+    """Encode handler-required argument combinations in public schemas."""
+    aligned = list(tools)
+    for tool in aligned:
+        name = getattr(tool, "name", "")
+        schema = getattr(tool, "inputSchema", None)
+        if not isinstance(name, str) or not isinstance(schema, dict):
+            raise TypeError("tools must expose string name and dictionary inputSchema")
+
+        if name == "find":
+            schema["allOf"] = [
+                {
+                    "anyOf": [
+                        _required_nonempty_string("role"),
+                        _required_nonempty_string("name"),
+                        _required_nonempty_string("value"),
+                    ]
+                },
+                {
+                    "anyOf": [
+                        {"required": ["pid"]},
+                        _required_nonempty_string("snapshot"),
+                    ]
+                },
+            ]
+        elif name == "click":
+            schema["if"] = {
+                "properties": {"shadow": {"enum": [True]}},
+                "required": ["shadow"],
+            }
+            schema["then"] = {
+                "required": ["id", "snapshot"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["x"]},
+                        {"required": ["y"]},
+                        {"required": ["pid"]},
+                    ]
+                },
+            }
+            schema["else"] = {
+                "anyOf": [
+                    {
+                        "required": ["id"],
+                        "not": {
+                            "anyOf": [
+                                {"required": ["x"]},
+                                {"required": ["y"]},
+                                {"required": ["pid"]},
+                            ]
+                        },
+                    },
+                    {
+                        "required": ["x", "y", "pid"],
+                        "not": {
+                            "anyOf": [
+                                {"required": ["id"]},
+                                {"required": ["snapshot"]},
+                            ]
+                        },
+                    },
+                ]
+            }
+        elif name == "type":
+            schema["if"] = {
+                "properties": {"shadow": {"enum": [True]}},
+                "required": ["shadow"],
+            }
+            schema["then"] = {"required": ["snapshot"]}
+        elif name == "wait":
+            schema["allOf"] = [
+                {
+                    "anyOf": [
+                        _required_nonempty_string("role"),
+                        _required_nonempty_string("name"),
+                    ]
+                }
+            ]
+            schema["then"] = {
+                "required": ["target_id"],
+                "not": {"required": ["pid"]},
+            }
+            schema["else"] = {
+                "required": ["pid"],
+                "not": {"required": ["target_id"]},
+            }
+        elif name == "close_tab":
+            schema["else"] = {
+                "anyOf": [
+                    _required_nonempty_string("target_id"),
+                    _required_nonempty_string("title"),
+                ]
+            }
+        elif name == "hover":
+            schema["anyOf"] = [
+                {
+                    "required": ["id", "snapshot"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["x"]},
+                            {"required": ["y"]},
+                        ]
+                    },
+                },
+                {
+                    "required": ["x", "y"],
+                    "not": {
+                        "anyOf": [
+                            {"required": ["id"]},
+                            {"required": ["snapshot"]},
+                        ]
+                    },
+                },
+            ]
+        elif name == "window":
+            schema["allOf"] = [
+                {
+                    "if": {
+                        "properties": {
+                            "action": {
+                                "enum": ["focus", "minimize", "close", "move", "resize"]
+                            }
+                        },
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["pid", "snapshot", "id"]},
+                },
+                {
+                    "if": {
+                        "properties": {"action": {"enum": ["move"]}},
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["x", "y"]},
+                },
+                {
+                    "if": {
+                        "properties": {"action": {"enum": ["resize"]}},
+                        "required": ["action"],
+                    },
+                    "then": {"required": ["width", "height"]},
+                },
+            ]
+    return aligned
 
 
 def harden_tool_schemas(tools: Iterable[_T]) -> list[_T]:

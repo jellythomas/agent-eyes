@@ -36,7 +36,11 @@ from .operation import (
 from .provider_worker import ProviderCallState, ProviderWorker
 from .result_format import BoundedResultFormatter, bounded_json_utf8_size
 from .input_validation import InputValidationError, validate_tool_arguments
-from .tool_contract import expose_shadow_target_ids, harden_tool_schemas
+from .tool_contract import (
+    align_runtime_argument_contracts,
+    expose_shadow_target_ids,
+    harden_tool_schemas,
+)
 from . import platform_utils as _pu
 from .__init__ import __version__
 from .js_bridge import build_ax_tree_script, merge_pierced_nodes
@@ -202,7 +206,9 @@ _runtime_async_locks_guard = threading.Lock()
 _runtime_async_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
-_RUNTIME_READINESS_TIMEOUT_SECONDS = 5.0
+# Fresh platform bindings can spend several seconds populating import/dyld caches.
+# This is a deadline, not a delay; warm readiness returns as soon as probes finish.
+_RUNTIME_READINESS_TIMEOUT_SECONDS = 15.0
 _NATIVE_TREE_PROVIDER_TIMEOUT_SECONDS = 30.0
 
 
@@ -239,7 +245,7 @@ def _platform_status() -> str:
 
 
 # ── Tool definitions ────────────────────────────────────────────────
-TOOLS = harden_tool_schemas(expose_shadow_target_ids([
+TOOLS = harden_tool_schemas(align_runtime_argument_contracts(expose_shadow_target_ids([
     Tool(
         name="status",
         description=(
@@ -350,7 +356,8 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
         description=(
             "Click/press a UI element by its [id] from the tree. "
             "Works for buttons, links, checkboxes, menu items, etc. "
-            "Alternatively, click by screen coordinates (x, y) with a target pid."
+            "Alternatively, click by screen coordinates (x, y); this requires a PID "
+            "so Agent Eyes can focus and verify the target application first."
         ),
         inputSchema={
             "type": "object",
@@ -361,15 +368,17 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
                 },
                 "x": {
                     "type": "integer",
-                    "description": "Screen X coordinate (use with y and pid for coordinate click)",
+                    "description": "Screen X coordinate (use with y and pid)",
                 },
                 "y": {
                     "type": "integer",
-                    "description": "Screen Y coordinate (use with x and pid for coordinate click)",
+                    "description": "Screen Y coordinate (use with x and pid)",
                 },
                 "pid": {
                     "type": "integer",
-                    "description": "Target app PID (required for coordinate click)",
+                    "description": (
+                        "Target app PID required to focus and verify a coordinate click"
+                    ),
                 },
                 "snapshot": {
                     "type": "string",
@@ -446,7 +455,10 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum ranked matches returned when query is set (default: 10, max: 50)",
+                    "description": (
+                        "Maximum targets returned from each foreground or shadow inventory, "
+                        "with or without a query (default: 10, max: 50)"
+                    ),
                     "default": 10,
                     "minimum": 1,
                     "maximum": 50,
@@ -469,7 +481,7 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
             "properties": {
                 "max_depth": {
                     "type": "integer",
-                    "description": "Max tree depth (default 5)",
+                    "description": "Max tree depth (default 5, max 10)",
                     "default": 5,
                 },
                 "interactive_only": {
@@ -712,7 +724,8 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
         name="upload",
         description=(
             "Inject file(s) into a DOM file input through the optional shadow provider. "
-            "Requires explicit shadow=true and absolute file paths."
+            "Requires explicit shadow=true. Paths are canonicalized before the runtime "
+            "requires regular files outside protected locations."
         ),
         inputSchema={
             "type": "object",
@@ -724,7 +737,7 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of absolute file paths to upload",
+                    "description": "File paths to canonicalize, validate, and attach",
                 },
                 "shadow": {
                     "type": "boolean",
@@ -902,7 +915,7 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "How many levels deep to expand (default 5)",
+                    "description": "How many levels deep to expand (default 5, max 15)",
                     "default": 5,
                 },
             },
@@ -1040,10 +1053,12 @@ TOOLS = harden_tool_schemas(expose_shadow_target_ids([
             "properties": {},
         },
     ),
-]))
+])))
 
 if sys.platform != "darwin":
-    TOOLS[:] = [tool for tool in TOOLS if tool.name not in {"app", "window"}]
+    TOOLS[:] = [
+        tool for tool in TOOLS if tool.name not in {"app", "window", "shadow"}
+    ]
 
 
 # Keep tools/list small: property names, enums, defaults, and enforced bounds carry
@@ -1057,7 +1072,7 @@ _COMPACT_TOOL_DESCRIPTIONS = {
     ),
     "find": "Find loaded native-tree elements by role/name/value; optional pid refreshes the tree.",
     "click": (
-        "Click a tree/web_tree [id] (qualify with snapshot), or native x/y with pid. "
+        "Click a tree/web_tree [id] (qualify with snapshot), or native x/y (requires pid). "
         "Set shadow=true only for an explicit background snapshot."
     ),
     "type": (
@@ -1066,8 +1081,9 @@ _COMPACT_TOOL_DESCRIPTIONS = {
     ),
     "focused": "Return the focused UI element.",
     "list_tabs": (
-        "Scan and rank all open browser tabs via foreground native accessibility; reuse one "
-        "before opening. shadow=true explicitly opts into background protocol metadata."
+        "Scan and rank open browser tabs via foreground native accessibility; max_results "
+        "limits returned targets with or without a query. shadow=true explicitly opts into "
+        "background protocol metadata."
     ),
     "web_tree": (
         "Get a background protocol DOM tree; requires explicit shadow=true and target_id from "
@@ -1102,8 +1118,8 @@ _COMPACT_TOOL_DESCRIPTIONS = {
         "Use tree/click for a visible native dialog."
     ),
     "upload": (
-        "Set a DOM file input; requires explicit shadow=true, a web_tree snapshot, and absolute "
-        "file paths."
+        "Set a DOM file input; requires explicit shadow=true and a web_tree snapshot. File paths "
+        "are canonicalized and must resolve to regular files outside protected locations."
     ),
     "scroll": (
         "Scroll the foreground app (optional pid) via OS input. shadow=true explicitly scrolls "
@@ -1136,6 +1152,7 @@ _COMPACT_TOOL_DESCRIPTIONS = {
 if sys.platform != "darwin":
     _COMPACT_TOOL_DESCRIPTIONS.pop("app", None)
     _COMPACT_TOOL_DESCRIPTIONS.pop("window", None)
+    _COMPACT_TOOL_DESCRIPTIONS.pop("shadow", None)
 
 
 def _drop_schema_descriptions(value: object) -> None:
@@ -1232,7 +1249,7 @@ def _runtime_capability_error(unavailable: list) -> str:
         for probe in unavailable
     )
     return (
-        f"{status}: Required runtime capability unavailable: {names}.\n"
+        f"ERROR: {status}: Required runtime capability unavailable: {names}.\n"
         "Recovery: agent-eyes setup"
     )
 
@@ -2096,7 +2113,18 @@ def _persistent_runtime_exception_is_stale(result: object) -> bool:
 
 async def _handle_click(args: dict) -> str:
     budget = OperationBudget.start(5.0)
-    if args.get("x") is not None and args.get("y") is not None:
+    click_x = args.get("x")
+    click_y = args.get("y")
+    has_coordinates = click_x is not None or click_y is not None
+    if has_coordinates:
+        if click_x is None or click_y is None:
+            return "ERROR: Coordinate click requires both x and y."
+        if args.get("shadow", False):
+            return "ERROR: Coordinate click is foreground-only; remove shadow=true."
+        if args.get("id") is not None or args.get("snapshot") is not None:
+            return "ERROR: Choose either element ID or coordinates for click, not both."
+        if args.get("pid") is None:
+            return "ERROR: Coordinate click requires pid for focus verification."
         return await coordinator.execute_foreground(
             lambda: _handle_click_resolved(args, None, budget=budget),
             budget=budget,
@@ -2142,6 +2170,8 @@ async def _handle_click_resolved(
 
     # Coordinate-based click (from OCR hints or manual)
     if click_x is not None and click_y is not None:
+        if click_pid is None:
+            return "ERROR: Coordinate click requires pid for focus verification."
         input_backend = _input_backend
         if input_backend is None or not await input_worker.run(
             input_backend.is_available,
@@ -2149,13 +2179,12 @@ async def _handle_click_resolved(
             operation="coordinate click capability check",
         ):
             return "ERROR: No input backend available for coordinate click."
-        if click_pid:
-            focus_ok, focus_err = await _verify_focus(
-                click_pid,
-                budget=operation_budget,
-            )
-            if not focus_ok:
-                return f"ERROR: {focus_err}. Click aborted to prevent wrong target."
+        focus_ok, focus_err = await _verify_focus(
+            click_pid,
+            budget=operation_budget,
+        )
+        if not focus_ok:
+            return f"ERROR: {focus_err}. Click aborted to prevent wrong target."
         try:
             clicked = await _run_native_mutation(
                 lambda: input_backend.click(click_x, click_y),
@@ -4584,6 +4613,11 @@ async def _handle_wait_for(args: dict) -> str:
         return "ERROR: Specify at least one of: role, name"
 
     pid = args.get("pid")
+    shadow = bool(args.get("shadow", False))
+    if shadow and pid is not None:
+        return "ERROR: Shadow wait cannot include foreground pid."
+    if not shadow and args.get("target_id") is not None:
+        return "ERROR: Foreground wait cannot include shadow target_id."
     if pid is not None and native_adapter:
         result = await wait_for_native_element(
             native_adapter,
@@ -4615,14 +4649,14 @@ async def _handle_wait_for(args: dict) -> str:
                 f"Found [{result.element.id}] {result.element.role} "
                 f"\"{result.element.name}\" after {result.elapsed:.2f}s ({mode})"
             )
-        return f"Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
+        return f"ERROR: Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
 
-    if pid is not None and not args.get("shadow", False):
+    if pid is not None and not shadow:
         return "ERROR: The foreground native accessibility provider is unavailable."
 
-    if not args.get("shadow", False):
+    if not shadow:
         return (
-            "Foreground wait requires pid. Call list_tabs with a query, then use the "
+            "ERROR: Foreground wait requires pid. Call list_tabs with a query, then use the "
             "returned browser PID; set shadow=true only for explicit background CDP waiting."
         )
 
@@ -4673,7 +4707,7 @@ async def _handle_wait_for(args: dict) -> str:
         if attempt == 1:
             return "ERROR: Shadow document changed during wait; retry."
     if raw_node is None:
-        return f"Timeout: element not found after {timeout}s."
+        return f"ERROR: Timeout: element not found after {timeout}s."
 
     element = cdp_client._node_to_element(raw_node)
     if element is None:
@@ -5520,6 +5554,10 @@ async def _handle_hover(args: dict) -> str:
     hover_x = args.get("x")
     hover_y = args.get("y")
     element_id = args.get("id")
+    has_coordinates = hover_x is not None or hover_y is not None
+    has_element_identity = element_id is not None or args.get("snapshot") is not None
+    if has_coordinates and has_element_identity:
+        return "ERROR: Choose either element ID or coordinates for hover, not both."
     budget = _shared_operation_budget(args, 5.0)
     if not args.get("_foreground_coordinator_locked", False):
         internal = _coordinator_args(
@@ -6307,7 +6345,7 @@ def _handle_shadow(args: dict) -> str | _AppleShadowResult:
         result = _as.shadow_read_interactive(**target_args)
         if result:
             return f"Interactive elements (background scan):\n\n{result}"
-        return "No interactive elements found or the shadow provider is unavailable."
+        return "No interactive elements found."
 
     elif action == "js":
         if not text:

@@ -44,11 +44,32 @@ def validate_tool_arguments(
 
 
 def _validate(schema: Mapping[str, Any], value: Any, *, path: str) -> None:
+    if "not" in schema:
+        negated = schema["not"]
+        if not isinstance(negated, Mapping):
+            raise ValueError("not must be a schema")
+        if _matches(negated, value):
+            raise InputValidationError(f"{path} matches a forbidden argument shape")
+
     conditional = schema.get("if")
     if isinstance(conditional, Mapping):
         branch = schema.get("then") if _matches(conditional, value) else schema.get("else")
         if isinstance(branch, Mapping):
             _validate(branch, value, path=path)
+
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        for branch in all_of:
+            if not isinstance(branch, Mapping):
+                raise ValueError("allOf entries must be schemas")
+            _validate(branch, value, path=path)
+
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        if not any_of or not all(isinstance(branch, Mapping) for branch in any_of):
+            raise ValueError("anyOf must contain only schemas")
+        if not any(_matches(branch, value) for branch in any_of):
+            raise InputValidationError(f"{path} does not match an allowed argument shape")
 
     expected = schema.get("type")
     if expected is not None:

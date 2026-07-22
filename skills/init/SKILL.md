@@ -1,48 +1,56 @@
 ---
 name: init
 description: >
-  Safely configure Agent Eyes in detected MCP clients after runtime installation.
-  Uses the model-independent CLI, persistent absolute launcher paths, previews,
-  backups, atomic writes, and live verification. Keeps existing MCP servers by default.
+  Safely configure Agent Eyes in supported MCP clients after runtime
+  installation. Use for config previews, selected-client setup, canonical skill
+  synchronization, backups, idempotent reconfiguration, and restart guidance.
 ---
 
-# Agent Eyes init
+# Initialize MCP clients
 
-Use the CLI rather than editing MCP files from model-generated instructions.
+Use the CLI instead of hand-editing client configuration.
 
-1. Verify runtime readiness:
-
-   ```bash
-   agent-eyes doctor --verbose
-   ```
-
-2. Preview detected client changes:
-
-   ```bash
-   agent-eyes init --dry-run
-   ```
-
-3. Apply the reviewed configuration:
-
-   ```bash
-   agent-eyes init
-   ```
-
-Configure one client when requested:
+## Configure detected clients
 
 ```bash
-agent-eyes init --client cursor
+agent-eyes --version
+agent-eyes doctor --verbose
+agent-eyes init --dry-run
+agent-eyes init
 ```
 
-The initializer must:
+Review the complete dry-run plan before applying it. Restart every client the
+result reports as changed.
 
-- use an absolute persistent `agent-eyes` executable with `args: ["serve"]`;
-- synchronize the canonical Agent Eyes skill for selected clients that support skills;
-- preserve unrelated config and all competing MCP servers unless the user separately asks to remove them;
-- preserve supported JSON, JSONC, and TOML formats and reject malformed input rather than replacing it;
-- preflight every selected config and skill artifact, then apply them as one rollback-capable transaction;
-- create a backup for every existing changed artifact;
-- be idempotent;
-- tell the user which clients need a restart/reload.
+Configure one or more supported clients when requested:
 
-If the persistent launcher or a required provider is missing, run `agent-eyes setup` rather than attempting an inline install.
+```bash
+agent-eyes init --client codex --client claude-code --dry-run
+agent-eyes init --client codex --client claude-code
+```
+
+Without `--client`, init selects every detected supported client.
+`--all-detected` is the explicit spelling of that default.
+
+The initializer:
+
+- writes an absolute persistent `agent-eyes` executable with `args: ["serve"]`;
+- supports the client-native JSON, JSONC, and TOML configuration paths;
+- synchronizes the canonical Agent Eyes skill for Claude Code and Codex;
+- installs `agents/openai.yaml` metadata for Codex;
+- preserves unrelated configuration and competing MCP servers;
+- rejects malformed input and unsafe paths rather than replacing them;
+- preflights all selected config/skill artifacts and applies one rollback-capable
+  transaction with backups for existing changed files;
+- leaves already-current MCP/skill artifacts unchanged, refreshes initialization
+  metadata, and reports which clients require restart/reload.
+
+`agent-eyes init` does not install or repair the runtime. If the current
+persistent launcher is missing, run:
+
+```bash
+uvx agent-eyes@latest setup --dry-run
+uvx agent-eyes@latest setup
+```
+
+Do not install packages or grant permissions from inside an MCP tool call.

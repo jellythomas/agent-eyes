@@ -26,3 +26,9 @@ def test_artifact_smoke_environment_rejects_python_import_injection(
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert environment["HOME"] == str(tmp_path / "home")
     assert environment["AGENT_EYES_STATE_DIR"] == str(tmp_path / "state")
+
+
+def test_artifact_smoke_uses_platform_filtered_tool_counts() -> None:
+    assert smoke_installed_artifact._expected_tool_count("darwin") == 28
+    assert smoke_installed_artifact._expected_tool_count("win32") == 25
+    assert smoke_installed_artifact._expected_tool_count("linux") == 25

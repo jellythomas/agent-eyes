@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
 import math
@@ -26,6 +27,60 @@ from agent_eyes.server import TOOLS
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_ROOT = _PROJECT_ROOT / "src" / "agent_eyes"
+_ALLOWED_SLEEP_MODULES = frozenset({
+    Path("input_sim.py"),
+    Path("native_events.py"),
+    Path("setup/readiness.py"),
+})
+
+
+def _sleep_calls_in(source_paths: tuple[Path, ...]) -> list[str]:
+    """Return imported time/asyncio sleep call locations in Python sources."""
+    locations: list[str] = []
+    for source_path in source_paths:
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=source_path)
+        module_aliases: set[str] = set()
+        direct_aliases: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for imported in node.names:
+                    if imported.name in {"asyncio", "time"}:
+                        module_aliases.add(imported.asname or imported.name)
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.module in {"asyncio", "time"}
+            ):
+                for imported in node.names:
+                    if imported.name == "sleep":
+                        direct_aliases.add(imported.asname or imported.name)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            is_module_sleep = (
+                isinstance(function, ast.Attribute)
+                and function.attr == "sleep"
+                and isinstance(function.value, ast.Name)
+                and function.value.id in module_aliases
+            )
+            is_direct_sleep = (
+                isinstance(function, ast.Name) and function.id in direct_aliases
+            )
+            if is_module_sleep or is_direct_sleep:
+                locations.append(f"{source_path}:{node.lineno}")
+    return sorted(locations)
+
+
+def _fixed_orchestration_sleep_calls() -> list[str]:
+    """Find sleeps outside explicit input, adaptive-wait, and setup polling paths."""
+    source_paths = tuple(
+        source_path
+        for source_path in sorted(_SOURCE_ROOT.rglob("*.py"))
+        if source_path.relative_to(_SOURCE_ROOT) not in _ALLOWED_SLEEP_MODULES
+    )
+    return _sleep_calls_in(source_paths)
 
 
 def _summary(samples: list[float]) -> dict[str, float]:
@@ -242,6 +297,11 @@ async def _deadline_sample() -> float:
 
 
 async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, object]:
+    fixed_orchestration_sleep_calls = _fixed_orchestration_sleep_calls()
+    if fixed_orchestration_sleep_calls:
+        joined = ", ".join(fixed_orchestration_sleep_calls)
+        raise RuntimeError(f"fixed orchestration sleep call found: {joined}")
+
     cli_import = _summary([
         _subprocess_sample([sys.executable, "-c", "import agent_eyes.cli"])
         for _ in range(samples + warmups)
@@ -355,7 +415,7 @@ async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, 
     ).encode("utf-8")
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "environment": {
             "platform": platform.platform(),
             "architecture": platform.machine(),
@@ -383,7 +443,12 @@ async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, 
         },
         "correctness": {
             "singleflight_provider_calls": sorted(singleflight_calls),
-            "input_fixed_orchestration_sleeps": 0,
+            "fixed_orchestration_sleep_calls": len(
+                fixed_orchestration_sleep_calls
+            ),
+            "allowed_sleep_modules": sorted(
+                str(source_path) for source_path in _ALLOWED_SLEEP_MODULES
+            ),
         },
         "formatting": format_results,
         "context": {

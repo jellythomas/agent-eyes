@@ -53,6 +53,20 @@ def test_browser_pid_press_key_uses_foreground_os_input(monkeypatch):
     backend.press_key.assert_called_once_with("return")
 
 
+def test_coordinate_click_without_pid_fails_before_input(monkeypatch):
+    from agent_eyes import server
+
+    backend = MagicMock()
+    backend.is_available.return_value = True
+    monkeypatch.setattr(server, "_input_backend", backend)
+
+    result = asyncio.run(server._handle_click({"x": 10, "y": 20}))
+
+    assert result == "ERROR: Coordinate click requires pid for focus verification."
+    backend.is_available.assert_not_called()
+    backend.click.assert_not_called()
+
+
 def test_explicit_shadow_key_requires_stable_target_and_never_uses_foreground(monkeypatch):
     from agent_eyes import server
 
@@ -407,6 +421,34 @@ def test_legacy_apple_shadow_action_requires_exact_stable_target(monkeypatch):
         tab_id="tab-c",
         window_id="window-c",
     )
+
+
+def test_legacy_apple_shadow_empty_read_does_not_report_provider_unavailable(monkeypatch):
+    from agent_eyes import applescript, server
+
+    target = applescript.AppleScriptTab(
+        index=0,
+        window_index=0,
+        title="Empty",
+        url="https://example.test",
+        id="tab-empty",
+        window_id="window-empty",
+    )
+    apple = MagicMock()
+    apple.is_available.return_value = True
+    apple.list_chrome_tabs.return_value = [target]
+    apple.shadow_read_interactive.return_value = ""
+    monkeypatch.setattr(server, "_as", apple)
+    monkeypatch.setattr(server.sys, "platform", "darwin")
+    monkeypatch.setattr(server, "_as_tabs_cache", [])
+
+    result = asyncio.run(
+        server._handle_shadow_async(
+            {"action": "read", "target_id": target.identifier}
+        )
+    )
+
+    assert result == "No interactive elements found."
 
 
 def test_scroll_defaults_to_foreground_input_without_pid(monkeypatch):
