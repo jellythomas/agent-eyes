@@ -206,7 +206,9 @@ _runtime_async_locks_guard = threading.Lock()
 _runtime_async_locks: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Lock
 ] = weakref.WeakKeyDictionary()
-_RUNTIME_READINESS_TIMEOUT_SECONDS = 5.0
+# Fresh platform bindings can spend several seconds populating import/dyld caches.
+# This is a deadline, not a delay; warm readiness returns as soon as probes finish.
+_RUNTIME_READINESS_TIMEOUT_SECONDS = 15.0
 _NATIVE_TREE_PROVIDER_TIMEOUT_SECONDS = 30.0
 
 

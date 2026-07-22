@@ -317,6 +317,51 @@ def test_slow_first_provider_load_does_not_block_event_loop(monkeypatch):
     assert report.core_ready is True
 
 
+def test_readiness_budget_covers_cold_provider_construction(monkeypatch):
+    from agent_eyes import server
+    from agent_eyes.operation import OperationBudget
+
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    requested_timeouts: list[float] = []
+
+    class BudgetFactory:
+        @staticmethod
+        def start(timeout):
+            requested_timeouts.append(float(timeout))
+            return OperationBudget.start(timeout, clock=clock)
+
+    class ColdStartWorker:
+        async def run(self, function, *, budget, operation):
+            result = function()
+            if operation == "native provider construction":
+                clock.advance(8.0)
+            budget.checkpoint(operation)
+            return result
+
+    monkeypatch.setattr(server, "native_adapter", None)
+    monkeypatch.setattr(server, "_input_backend", None)
+    monkeypatch.setattr(server, "_runtime_readiness", None)
+    monkeypatch.setattr(server, "_get_native_adapter", AvailableNative)
+    monkeypatch.setattr(server, "load_input_provider", AvailableInput)
+    monkeypatch.setattr(server, "native_worker", ColdStartWorker())
+    monkeypatch.setattr(server, "input_worker", ColdStartWorker())
+    monkeypatch.setattr(server, "OperationBudget", BudgetFactory)
+
+    report = asyncio.run(server._ensure_runtime_readiness())
+
+    assert report.core_ready is True
+    assert requested_timeouts == [server._RUNTIME_READINESS_TIMEOUT_SECONDS]
+
+
 def test_runtime_shutdown_closes_coordinator_browser_and_all_provider_lanes(monkeypatch):
     from agent_eyes import server
 
