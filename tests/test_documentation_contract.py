@@ -15,6 +15,25 @@ ROOT = Path(__file__).parents[1]
 CLI_REFERENCE = ROOT / "docs" / "api" / "agent-eyes-cli.md"
 MCP_REFERENCE = ROOT / "docs" / "api" / "mcp-tools.md"
 README = ROOT / "README.md"
+BENCHMARK_RESULTS_README = ROOT / "benchmarks" / "results" / "README.md"
+RUNTIME_RESULT = (
+    ROOT
+    / "benchmarks"
+    / "results"
+    / "macos-arm64-py312-v0.9.0-runtime.json"
+)
+STARTUP_RESULT = (
+    ROOT
+    / "benchmarks"
+    / "results"
+    / "macos-arm64-py312-v0.9.0-startup.json"
+)
+BASELINE_RESULT = (
+    ROOT
+    / "benchmarks"
+    / "baselines"
+    / "macos-arm64-py312-pre-hardening.json"
+)
 
 
 def _subparsers(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
@@ -82,3 +101,42 @@ def test_local_documentation_links_resolve():
                 continue
             resolved = (path.parent / target).resolve()
             assert resolved.exists(), f"broken local link in {path}: {raw_target}"
+
+
+def test_readme_benchmark_table_matches_checked_in_results():
+    readme = README.read_text(encoding="utf-8")
+    result_notes = BENCHMARK_RESULTS_README.read_text(encoding="utf-8")
+    runtime = json.loads(RUNTIME_RESULT.read_text(encoding="utf-8"))
+    startup = json.loads(STARTUP_RESULT.read_text(encoding="utf-8"))
+    baseline = json.loads(BASELINE_RESULT.read_text(encoding="utf-8"))
+
+    assert runtime["schema_version"] == 2
+    assert runtime["correctness"]["fixed_orchestration_sleep_calls"] == 0
+    assert runtime["correctness"]["singleflight_provider_calls"] == [1]
+    assert runtime["environment"]["git_head"] in result_notes
+
+    immediate_p95 = runtime["latency"]["immediate_event_completion"]["p95_ms"]
+    formatting_p95 = runtime["formatting"]["1000"]["latency"]["p95_ms"]
+    catalog_bytes = runtime["context"]["tools_list_compact_json_bytes"]
+    import_p95 = startup["latency"]["server_import"]["p95_ms"]
+    mcp_p95 = startup["latency"]["mcp_initialize_and_tools_list"]["p95_ms"]
+    baseline_immediate = baseline["latency_ms"]["native_event_immediate_completion"][
+        "p95"
+    ]
+    baseline_formatting = baseline["latency_ms"]["format_1000_browser_targets"][
+        "p95"
+    ]
+    baseline_catalog = baseline["context_bytes"]["tools_list_compact_json"]
+
+    expected_values = (
+        f"{import_p95:.2f} ms",
+        f"{mcp_p95:.2f} ms",
+        f"{immediate_p95:.3f} ms",
+        f"{formatting_p95:.3f} ms",
+        f"{catalog_bytes:,}",
+        f"{(baseline_immediate - immediate_p95) / baseline_immediate:.1%} lower",
+        f"{(baseline_formatting - formatting_p95) / baseline_formatting:.1%} lower",
+        f"{(baseline_catalog - catalog_bytes) / baseline_catalog:.1%} lower",
+    )
+    for value in expected_values:
+        assert value in readme

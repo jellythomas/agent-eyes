@@ -1,6 +1,6 @@
 # Agent Eyes Documentation and Contract Alignment Implementation Plan
 
-**Status:** In progress
+**Status:** Complete
 
 **Approved design:** [Install-to-ready and MCP reference documentation](2026-07-22-agent-eyes-documentation-design.md)
 
@@ -20,10 +20,10 @@ surface is defined by:
 - Client discovery/configuration: [`src/agent_eyes/setup/scanner.py`](../../src/agent_eyes/setup/scanner.py)
 - Canonical agent workflow: [`skills/agent-eyes/SKILL.md`](../../skills/agent-eyes/SKILL.md)
 
-The current README is accurate about the setup consent boundary, native-first
-browser policy, readiness states, event-driven waits, platform model, and v0.9.0
-benchmarks. It is incomplete as an install-to-ready guide and exhaustive CLI/MCP
-reference.
+The original README audit found accurate setup-consent, native-first browser,
+readiness, event-driven wait, platform, and benchmark summaries, but no complete
+install-to-ready guide or exhaustive CLI/MCP reference. The completed work adds
+those guides and keeps them covered by parser- and schema-derived contract tests.
 
 ## 2. Files in Scope
 
@@ -36,6 +36,13 @@ reference.
 - `skills/install/SKILL.md`
 - `skills/init/SKILL.md`
 - `src/agent_eyes/setup/templates/skill.py`
+
+### Benchmarks
+
+- `benchmarks/benchmark_runtime.py`
+- `benchmarks/results/README.md`
+- `benchmarks/results/macos-arm64-py312-v0.9.0-runtime.json`
+- `benchmarks/results/macos-arm64-py312-v0.9.0-startup.json`
 
 ### Public contract implementation
 
@@ -50,12 +57,15 @@ reference.
 - `tests/test_cli.py`
 - `tests/test_tool_contract.py`
 - `tests/test_server_input_safety.py`
+- `tests/test_server_readiness.py`
 - `tests/test_event_wait.py`
 - `tests/test_browser_foreground_policy.py`
 - `tests/test_input_validation.py`
 - `tests/test_readme_commands.py`
 - `tests/test_documentation_contract.py` (new)
 - `tests/test_smoke_installed_artifact.py`
+- `tests/test_server_lazy_startup.py`
+- `tests/test_benchmark_runtime.py`
 - `scripts/smoke_installed_artifact.py`
 
 ### Cleanup
@@ -221,7 +231,42 @@ The generic quality-gates skill does not recognize Python projects, so this
 repository's checked-in Python lint, security, test, build, and installed-artifact
 commands are the authoritative fallback.
 
-## 9. Completion Criteria
+## 9. Final Verification Evidence
+
+- Source verification: `966 passed in 6.94s`; Ruff, Bandit, and
+  `git diff --check` passed.
+- Packaging verification: `uv build` and Twine metadata checks passed for both
+  the wheel and source distribution.
+- Installed-artifact verification: the isolated wheel smoke passed CLI version,
+  help, side-effect-free setup dry-run, MCP initialization, the 28-tool macOS
+  catalog, `status`, and guarded-payload rejection.
+- Cold-start verification: five additional fresh virtual environments installed
+  the canonical wheel and completed the full installed-artifact smoke with zero
+  failures.
+- Published-bootstrap verification: a refreshed `uvx agent-eyes@latest` resolved
+  version 0.9.0 and its isolated setup dry-run returned `status=planned` without
+  creating readiness state.
+- Current post-tag branch startup p95: 283.72 ms for server import and 314.00 ms
+  through MCP `tools/list`, within the 450 ms and 500 ms gates respectively
+  ([startup result](../../benchmarks/results/macos-arm64-py312-v0.9.0-startup.json)).
+- Current post-tag branch context and runtime evidence: 15,143 compact
+  tool-catalog bytes, one provider call for 32 identical concurrent
+  observations, 0.579 ms immediate-event p95, and 3.298 ms p95 formatting 1,000
+  targets. An AST-backed benchmark gate verifies zero fixed sleep calls outside
+  the explicitly allowed physical-input pacing, adaptive native-event fallback,
+  and setup-readiness polling modules
+  ([runtime result](../../benchmarks/results/macos-arm64-py312-v0.9.0-runtime.json)).
+- Stress evidence: 10,000 CDP lifecycle cycles, 1,000 reconnect cycles, 1,000
+  singleflight schedules, 10,000 snapshot cycles, 1,000 cross-target schedules,
+  and 100 cross-process setup-lock acquisitions completed with zero leaked
+  records/flights/snapshots, wrong bindings/results/resolutions, child errors, or
+  measured RSS growth
+  ([stress result](../../benchmarks/results/macos-arm64-py312-v0.9.0-stress.json)).
+- Independent code, cross-platform, and documentation audits found no remaining
+  actionable correctness, security, architecture, performance, contract, or
+  documentation issue after the accepted benchmark refresh.
+
+## 10. Completion Criteria
 
 - README alone takes a new user from prerequisites to a recognized ready state.
 - CLI and MCP references exhaustively match their executable contracts.

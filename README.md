@@ -396,16 +396,17 @@ rollback orchestration is not implemented.
 
 The checked-in pre-hardening baseline and benchmark programs use deterministic
 fixtures so results are attributable to Agent Eyes rather than a website or
-network. The reference v0.9.0 run used macOS arm64, Python 3.12, 30 measured
-samples after three warmups, and p95=`sorted[ceil(0.95*n)-1]`.
+network. The current post-tag, 0.9.0-version branch reference used macOS arm64
+and Python 3.12. Benchmarks use 30 measured samples after three warmups and
+p95=`sorted[ceil(0.95*n)-1]` unless a result records a different protocol.
 
-| Gate | Before | v0.9.0 | Change |
+| Gate | Before | Post-tag branch | Change |
 |---|---:|---:|---:|
-| Server import p95 | Not comparable* | 286.58 ms | Passes <=450 ms gate |
-| MCP initialize + tools/list p95 | Not comparable* | 319.39 ms | Passes <=500 ms gate |
-| Immediate event completion p95 | 4.750 ms | 0.494 ms | 89.6% lower |
-| Format 1,000 targets p95 | 6.839 ms | 3.311 ms | 51.6% lower |
-| Compact tool-catalog bytes | 18,881 | 13,291 | 29.6% lower |
+| Server import p95 | Not comparable* | 283.72 ms | Passes <=450 ms gate |
+| MCP initialize + tools/list p95 | Not comparable* | 314.00 ms | Passes <=500 ms gate |
+| Immediate event completion p95 | 4.750 ms | 0.579 ms | 87.8% lower |
+| Format 1,000 targets p95 | 6.839 ms | 3.298 ms | 51.8% lower |
+| Compact tool-catalog bytes | 18,881 | 15,143 | 19.8% lower |
 | Provider calls for 32 identical observations | 32 | 1 | 96.9% fewer |
 | CDP enrichment, 60 elements / 1 ms RTT | 182 round trips | 61 round trips | 66.5% fewer; 2.92x measured speedup |
 
