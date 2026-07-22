@@ -215,6 +215,9 @@ cycles. Each cycle owns and releases one 4 KiB provider payload, the store may
 retain at most one live snapshot, and RSS growth must not exceed the greater of
 10 MiB or 5% of its baseline. Linux reads `/proc/self/statm`, Windows reads the
 process working set, and other supported Unix hosts use `ps` RSS.
+It also starts four fresh interpreter processes for 25 barrier-synchronized
+setup-lock rounds each. All 100 acquisitions must complete, and a shared counter
+must reach exactly 100 without corruption.
 
 Machine-readable results and the baseline protocol are under
 `benchmarks/results/` and `benchmarks/baselines/`.
@@ -255,12 +258,18 @@ For pipx installations, use `pipx upgrade agent-eyes`. To remove the executable,
 uv sync --all-groups
 uv run python -m pytest -q
 uv run python -m pytest --cov=agent_eyes.coordinator --cov=agent_eyes.input_validation --cov=agent_eyes.observations --cov=agent_eyes.operation --cov=agent_eyes.tool_contract --cov-report=term-missing tests/test_coordinator_concurrency.py tests/test_input_validation.py tests/test_observation_store.py tests/test_operation_budget.py tests/test_tool_contract.py
-uvx ruff check src benchmarks
-uvx bandit -r src -q -ll
+uvx ruff check src benchmarks scripts
+uvx bandit -r src scripts -q -ll
 uv run agent-eyes doctor --verbose
 ```
 
 Python 3.10 through 3.14 is tested. The project uses MCP over stdio, so runtime logging must go to stderr; stdout is reserved for JSON-RPC frames.
+
+The package and publish jobs build twice from independent clean Git archives,
+normalize each sdist with `SOURCE_DATE_EPOCH`, require byte-identical wheels and
+sdists, rebuild the wheel from the normalized sdist, and smoke-test the exact
+wheel selected for upload. A release is blocked if any comparison or installed
+CLI/MCP/setup smoke check differs.
 
 ## License
 

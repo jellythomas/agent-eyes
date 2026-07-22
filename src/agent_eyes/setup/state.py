@@ -15,6 +15,7 @@ from .readiness import (
     SCHEMA_VERSION,
     _READINESS_LOCK_TIMEOUT_SECONDS,
     _READINESS_THREAD_LOCK,
+    _ReadinessLockTimeout,
     _acquire_windows_file_lock,
 )
 
@@ -58,10 +59,12 @@ def _acquire_windows_setup_lock(
     """Acquire a Windows setup lock without retrying permanent errors forever."""
     try:
         _acquire_windows_file_lock(stream, msvcrt_module, timeout=timeout)
-    except ReadinessStateError as exc:
+    except _ReadinessLockTimeout as exc:
         raise RuntimeError(
             f"Timed out waiting for {label.lower()}: {path}"
         ) from exc
+    except ReadinessStateError as exc:
+        raise RuntimeError(f"{label} could not be acquired: {path}") from exc
 
 
 @contextmanager

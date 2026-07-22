@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -141,7 +142,7 @@ def test_windows_setup_lock_has_bounded_nonblocking_acquisition(tmp_path):
 
         def locking(self, _fd, mode, _nbytes):
             self.modes.append(mode)
-            raise OSError("persistent lock failure")
+            raise PermissionError(errno.EACCES, "persistent lock failure")
 
     msvcrt = Msvcrt()
     lock_path = tmp_path / ".setup.lock"
@@ -156,6 +157,79 @@ def test_windows_setup_lock_has_bounded_nonblocking_acquisition(tmp_path):
         )
 
     assert msvcrt.modes == [msvcrt.LK_NBLCK]
+
+
+def test_windows_setup_lock_fails_fast_for_permanent_errors(tmp_path):
+    class Stream:
+        def seek(self, _offset):
+            return None
+
+        def fileno(self):
+            return 17
+
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.calls = 0
+
+        def locking(self, _fd, _mode, _nbytes):
+            self.calls += 1
+            raise OSError(errno.EBADF, "invalid descriptor")
+
+    msvcrt = Msvcrt()
+    lock_path = tmp_path / ".setup.lock"
+
+    with pytest.raises(RuntimeError, match="Setup lock could not be acquired"):
+        state._acquire_windows_setup_lock(
+            Stream(),
+            msvcrt,
+            label="Setup lock",
+            path=lock_path,
+        )
+
+    assert msvcrt.calls == 1
+
+
+def test_windows_setup_lock_does_not_touch_the_region_before_acquisition(tmp_path):
+    class Stream:
+        def __init__(self):
+            self.offsets: list[int] = []
+
+        def seek(self, offset):
+            self.offsets.append(offset)
+
+        def read(self, _count):
+            raise PermissionError(13, "Permission denied")
+
+        def write(self, _value):
+            raise PermissionError(13, "Permission denied")
+
+        def fileno(self):
+            return 17
+
+    class Msvcrt:
+        LK_NBLCK = 1
+
+        def __init__(self):
+            self.calls: list[tuple[int, int, int]] = []
+
+        def locking(self, descriptor, mode, count):
+            self.calls.append((descriptor, mode, count))
+
+    stream = Stream()
+    msvcrt = Msvcrt()
+
+    state._acquire_windows_setup_lock(
+        stream,
+        msvcrt,
+        label="Setup lock",
+        path=tmp_path / ".setup.lock",
+        timeout=0,
+    )
+
+    assert stream.offsets == [0]
+    assert msvcrt.calls == [(17, msvcrt.LK_NBLCK, 1)]
 
 
 def test_setup_lock_stream_keeps_raw_file_position_aligned(tmp_path, monkeypatch):
