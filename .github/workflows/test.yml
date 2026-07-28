@@ -27,7 +27,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install quality tools
-        run: python -m pip install --upgrade pip uv ruff bandit pip-audit
+        run: python -m pip install --upgrade pip uv ruff==0.15.7 bandit pip-audit
       - name: Lint source, benchmarks, and scripts
         run: ruff check src benchmarks scripts
       - name: Reject medium and high static-security findings

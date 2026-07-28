@@ -486,7 +486,7 @@ results and the baseline protocol are under `benchmarks/results/` and
 ```bash
 uv sync --all-groups
 uv run python -m pytest -q
-uvx ruff check src benchmarks scripts
+uvx --from ruff==0.15.7 ruff check src benchmarks scripts
 uvx bandit -r src scripts -q -ll
 uv run agent-eyes doctor --verbose
 ```

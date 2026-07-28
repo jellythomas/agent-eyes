@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
-from hashlib import file_digest
+import hashlib
 import json
 import math
 import os
@@ -153,8 +153,11 @@ def _browser_name(text: str, target_id: str) -> str:
 def _artifact_sha256(path: Path | None) -> str:
     if path is None:
         return ""
+    digest = hashlib.sha256()
     with path.resolve(strict=True).open("rb") as stream:
-        return file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 async def _timed_observation(
