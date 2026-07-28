@@ -149,7 +149,10 @@ def test_protocol_focus_resists_page_focus_and_active_element_spoof():
 
     chrome = _chrome_binary()
     port = _unused_loopback_port()
-    with tempfile.TemporaryDirectory(prefix="agent-eyes-focus-") as profile:
+    with tempfile.TemporaryDirectory(
+        prefix="agent-eyes-focus-",
+        ignore_cleanup_errors=True,
+    ) as profile:
         process = subprocess.Popen(
             [
                 chrome,
