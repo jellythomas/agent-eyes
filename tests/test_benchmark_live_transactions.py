@@ -124,6 +124,10 @@ def test_inventory_parser_returns_count_and_selected_native_target() -> None:
     )
 
 
+def test_optional_browser_version_accepts_the_cli_default() -> None:
+    assert benchmark_live_transactions._browser_version("") == ""
+
+
 def test_live_mcp_benchmark_separates_reference_latency_from_deterministic_gates(
     monkeypatch,
 ) -> None:

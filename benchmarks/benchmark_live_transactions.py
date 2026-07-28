@@ -44,6 +44,8 @@ def _deadline(value: str) -> int:
 
 
 def _browser_version(value: str) -> str:
+    if not value:
+        return ""
     if not _BROWSER_VERSION_PATTERN.fullmatch(value):
         raise argparse.ArgumentTypeError("must be a compact browser version")
     return value
