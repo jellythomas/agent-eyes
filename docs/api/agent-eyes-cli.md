@@ -1,6 +1,6 @@
 # Agent Eyes CLI reference
 
-**Documented release:** 0.9.0
+**Documented release:** 0.10.0
 
 The `agent-eyes` command installs, configures, verifies, and serves the Agent
 Eyes MCP server. Python 3.10 through 3.14 is supported.
@@ -21,6 +21,9 @@ Setup installs the same Agent Eyes version persistently with the current
 platform provider, configures selected MCP clients, synchronizes supported
 skills, and verifies readiness. Subsequent commands use the persistent
 `agent-eyes` launcher.
+
+Setup is the complete first-run flow. Do not run `agent-eyes install` or `agent-eyes init` afterward;
+they are repair and advanced split-flow commands.
 
 Preview the complete Agent Eyes plan without installing, configuring clients, or
 updating persistent Agent Eyes state:
@@ -235,7 +238,7 @@ Manager selection:
   AT-SPI/PyGObject through `--system-site-packages`. It always selects
   `/usr/bin/python3`, which must be Python 3.10 or newer.
 - The installed requirement is exact-version and platform-qualified, such as
-  `agent-eyes[macos]==0.9.0`.
+  `agent-eyes[macos]==0.10.0`.
 
 JSON status is `already_current`, `planned`, `installed`, `cancelled`, or
 `error`. The complete successful/planned response shape is:

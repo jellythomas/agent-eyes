@@ -240,6 +240,58 @@ def test_macos_activation_fallback_propagates_osascript_failure(monkeypatch):
     assert runner.call_args.kwargs["timeout"] == 3
 
 
+def test_macos_activation_falls_back_to_runtime_selector_when_system_events_fails(
+    monkeypatch,
+):
+    app = MagicMock()
+    app.activateWithOptions_.return_value = True
+    running_application = MagicMock()
+    running_application.runningApplicationWithProcessIdentifier_.return_value = app
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        SimpleNamespace(
+            NSRunningApplication=running_application,
+            NSApplicationActivateIgnoringOtherApps=2,
+        ),
+    )
+    runner = MagicMock(return_value=SimpleNamespace(returncode=1))
+    monkeypatch.setattr(input_sim.subprocess, "run", runner)
+
+    assert input_sim.MacOSInputBackend().activate_window(42) is True
+
+    runner.assert_called_once_with(
+        [
+            "/usr/bin/osascript",
+            "-e",
+            "tell application \"System Events\" to set frontmost of "
+            "(first process whose unix id is 42) to true",
+        ],
+        capture_output=True,
+        timeout=3,
+    )
+    app.activateWithOptions_.assert_called_once_with(2)
+
+
+def test_macos_frontmost_check_uses_frontmost_normal_window_without_appkit():
+    backend = input_sim.MacOSInputBackend()
+    backend._quartz = SimpleNamespace(
+        kCGWindowListOptionOnScreenOnly=1,
+        kCGWindowListExcludeDesktopElements=16,
+        kCGNullWindowID=0,
+        kCGWindowLayer="layer",
+        kCGWindowOwnerPID="pid",
+        CGWindowListCopyWindowInfo=lambda _options, _window: [
+            {"layer": 3, "pid": 99},
+            {"layer": 0, "pid": 42},
+            {"layer": 0, "pid": 73},
+        ],
+    )
+
+    assert backend.is_frontmost(42) is True
+    assert backend.is_frontmost(73) is False
+
+
 def test_macos_type_failure_does_not_log_typed_content(caplog):
     secret = "sentinel-secret-macos"
     quartz = _FakeQuartz()

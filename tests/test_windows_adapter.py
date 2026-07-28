@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,14 @@ class TestWindowsAdapterListApps(unittest.TestCase):
         self.assertEqual(len(apps), 1)
         self.assertEqual(apps[0].pid, 42)
 
+    def test_complete_inventory_propagates_global_uia_failure(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.side_effect = RuntimeError("UIA unavailable")
+
+        self.assertEqual(adapter.list_apps(), [])
+        with self.assertRaisesRegex(RuntimeError, "UIA unavailable"):
+            adapter.list_apps_complete()
+
 
 # ---------------------------------------------------------------------------
 # WindowsAdapter: get_tree
@@ -286,6 +294,57 @@ class TestWindowsAdapterGetTree(unittest.TestCase):
         self.assertIn("Browser tab", names)
         self.assertNotIn("Page tab", names)
         document.FindAll.assert_not_called()
+
+    def test_complete_browser_inventory_propagates_uia_failure(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.side_effect = RuntimeError("browser UIA unavailable")
+
+        self.assertEqual(adapter.get_browser_trees(22), [])
+        with self.assertRaisesRegex(RuntimeError, "browser UIA unavailable"):
+            adapter.get_browser_trees_complete(22)
+
+    def test_complete_browser_inventory_rejects_traversal_cap_truncation(self):
+        first = _make_uia_element(name="First tab", ctrl_type=50019, pid=22)
+        second = _make_uia_element(name="Second tab", ctrl_type=50019, pid=22)
+        window = _make_uia_element(name="Browser", ctrl_type=50031, pid=22)
+        window.FindAll.return_value = _make_element_array([first, second])
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([window])
+        adapter._MAX_ELEMENTS = 2
+
+        self.assertEqual(len(adapter.get_browser_trees(22)[0].children), 1)
+        with self.assertRaisesRegex(RuntimeError, "traversal safety cap"):
+            adapter.get_browser_trees_complete(22)
+
+    def test_complete_browser_inventory_rejects_depth_truncation(self):
+        tab = _make_uia_element(name="Hidden tab", ctrl_type=50019, pid=22)
+        group = _make_uia_element(name="Tab group", ctrl_type=50032, pid=22)
+        group.FindAll.return_value = _make_element_array([tab])
+        window = _make_uia_element(name="Browser", ctrl_type=50031, pid=22)
+        window.FindAll.return_value = _make_element_array([group])
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([window])
+
+        self.assertEqual(
+            adapter.get_browser_trees(22, max_depth=1)[0].children[0].children,
+            [],
+        )
+        with self.assertRaisesRegex(RuntimeError, "traversal depth bound"):
+            adapter.get_browser_trees_complete(22, max_depth=1)
+
+    def test_complete_browser_inventory_propagates_child_read_failure(self):
+        broken = MagicMock()
+        type(broken).CurrentControlType = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("broken UIA child"))
+        )
+        window = _make_uia_element(name="Browser", ctrl_type=50031, pid=22)
+        window.FindAll.return_value = _make_element_array([broken])
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._root.FindAll.return_value = _make_element_array([window])
+
+        self.assertEqual(adapter.get_browser_trees(22)[0].children, [])
+        with self.assertRaisesRegex(RuntimeError, "broken UIA child"):
+            adapter.get_browser_trees_complete(22)
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +568,43 @@ class TestWindowsAdapterFocusAndValue(unittest.TestCase):
         self.assertTrue(adapter.is_same_element(first, same))
         self.assertFalse(adapter.is_same_element(first, different))
 
+    def test_element_at_position_returns_provider_owned_uia_element(self):
+        from agent_eyes.adapters.base import UIElement
+
+        native_element = _make_uia_element(
+            name="Review comment",
+            ctrl_type=50000,
+            pid=73,
+        )
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.ElementFromPoint.return_value = native_element
+        adapter._uia.CompareElements.side_effect = lambda first, second: first is second
+
+        result = adapter.element_at_position(125.9, 240.8)
+
+        self.assertIsNotNone(result)
+        self.assertIs(result.platform_ref, native_element)
+        self.assertTrue(
+            adapter.is_same_element(
+                result,
+                UIElement(id=99, role="button", platform_ref=native_element),
+            )
+        )
+        point = adapter._uia.ElementFromPoint.call_args.args[0]
+        self.assertEqual((point.x, point.y), (125, 240))
+
+    def test_element_at_position_fails_closed_when_uia_has_no_element(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.ElementFromPoint.return_value = None
+
+        self.assertIsNone(adapter.element_at_position(125, 240))
+
+    def test_element_at_position_fails_closed_when_uia_raises(self):
+        adapter = _make_windows_adapter_with_mock_uia()
+        adapter._uia.ElementFromPoint.side_effect = RuntimeError("UIA unavailable")
+
+        self.assertIsNone(adapter.element_at_position(125, 240))
+
     def test_focus_calls_set_focus(self):
         native_el = MagicMock()
         from agent_eyes.adapters.base import UIElement
@@ -712,12 +808,66 @@ class TestWindowsInputBackendDrag(unittest.TestCase):
 
 class TestWindowsInputBackendMoveHelper(unittest.TestCase):
 
+    def test_move_input_maps_negative_origin_across_virtual_desktop(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        metrics = {76: -1920, 77: -120, 78: 3840, 79: 1200}
+        backend._user32 = MagicMock()
+        backend._user32.GetSystemMetrics.side_effect = metrics.__getitem__
+        backend._mouse_input = MagicMock(side_effect=lambda flags, **values: (flags, values))
+
+        top_left = backend._move_input(-1920, -120)
+        bottom_right = backend._move_input(1919, 1079)
+
+        self.assertEqual(top_left, (0xC001, {"dx": 0, "dy": 0}))
+        self.assertEqual(bottom_right, (0xC001, {"dx": 65535, "dy": 65535}))
+
+    def test_move_mouse_dispatches_one_absolute_move(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._load = MagicMock()
+        backend._move_to = MagicMock(return_value=True)
+
+        self.assertTrue(backend.move_mouse(960, 540))
+        backend._load.assert_called_once_with()
+        backend._move_to.assert_called_once_with(960, 540)
+
+    def test_move_mouse_fails_closed_when_send_input_raises(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._load = MagicMock()
+        backend._move_to = MagicMock(side_effect=RuntimeError("SendInput unavailable"))
+
+        self.assertFalse(backend.move_mouse(960, 540))
+
+    def test_click_reuses_the_virtual_desktop_move_path(self):
+        from agent_eyes.input_sim import WindowsInputBackend
+
+        backend = WindowsInputBackend.__new__(WindowsInputBackend)
+        backend._load = MagicMock()
+        backend._move_input = MagicMock(return_value="virtual-move")
+        backend._mouse_input = MagicMock(
+            side_effect=lambda flags: ("mouse", flags)
+        )
+        backend._send_inputs = MagicMock(return_value=True)
+
+        self.assertTrue(backend.click(-960, 540))
+        backend._move_input.assert_called_once_with(-960, 540)
+        self.assertEqual(
+            backend._send_inputs.call_args.args[0][0],
+            "virtual-move",
+        )
+
     def test_move_to_calls_send_input_once(self):
         """_move_to() sends exactly one INPUT event."""
         from agent_eyes.input_sim import WindowsInputBackend
         backend = WindowsInputBackend.__new__(WindowsInputBackend)
         backend._user32 = MagicMock()
-        backend._user32.GetSystemMetrics.side_effect = lambda m: 1920 if m == 0 else 1080
+        metrics = {76: 0, 77: 0, 78: 1920, 79: 1080}
+        backend._user32.GetSystemMetrics.side_effect = metrics.__getitem__
         backend._INPUT = MagicMock()
         backend._MOUSEINPUT = MagicMock()
         backend._send_input = MagicMock()

@@ -4,6 +4,7 @@ Foreground access is cross-platform through macOS AXUIElement, Windows UI
 Automation, and Linux AT-SPI2. Browser-remote protocols are optional explicit
 shadow providers; they are never a prerequisite for visible computer use.
 """
+
 from __future__ import annotations
 
 import sys
@@ -13,15 +14,27 @@ import logging
 import threading
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, Tool, TextContent
 
-from .adapters.base import BaseAdapter, UIElement, INTERACTIVE_ROLES as _BASE_INTERACTIVE_ROLES
-from .cdp import CDPClient, CDPDocumentChangedError
+from .adapters.base import (
+    BaseAdapter,
+    UIElement,
+    INTERACTIVE_ROLES as _BASE_INTERACTIVE_ROLES,
+)
+from .cdp import CDPClient, CDPDocumentChangedError, CDPFocusMismatchError
+from .cdp_runtime import (
+    CLICK_FUNCTION,
+    RuntimeActionStatus,
+    ax_element_has_exact_focus,
+    ax_element_semantics_match,
+    parse_runtime_action_status,
+    require_empty_command_result,
+)
 from .cdp_persistent import CDPConnection as PersistentCDP
 from .tiers import TierManager, ConnectionTier
 from .registry import ElementRegistry
@@ -41,9 +54,20 @@ from .tool_contract import (
     expose_shadow_target_ids,
     harden_tool_schemas,
 )
+from .transaction_contract import (
+    ExecuteRequest,
+    ObserveTargetRequest,
+    TargetIntent,
+    TargetMode,
+    build_execute_input_schema,
+    build_observe_target_input_schema,
+    parse_execute_request,
+    parse_observe_target_request,
+)
 from . import platform_utils as _pu
 from .__init__ import __version__
 from .js_bridge import build_ax_tree_script, merge_pierced_nodes
+
 # AppleScript is macOS-only — import conditionally
 if sys.platform == "darwin":
     from . import applescript as _as
@@ -139,6 +163,13 @@ async def run_native_action_until(*args, **kwargs):
     return await _run_native_action_until(*args, **kwargs)
 
 
+async def run_native_action_until_any(*args, **kwargs):
+    """Observe one action across all current candidate native applications."""
+    from .native_events import run_native_action_until_any as _run_until_any
+
+    return await _run_until_any(*args, **kwargs)
+
+
 async def wait_for_native_element(*args, **kwargs):
     """Wait for native elements without loading event backends at startup."""
     from .native_events import wait_for_native_element as _wait_for_native_element
@@ -146,11 +177,24 @@ async def wait_for_native_element(*args, **kwargs):
     return await _wait_for_native_element(*args, **kwargs)
 
 
-def collect_browser_targets(adapter, *, tree_depth: int = 8):
+def collect_browser_targets(
+    adapter,
+    *,
+    tree_depth: int = 8,
+    require_complete: bool = False,
+    apps=None,
+    browser_names=None,
+):
     """Inventory foreground browser targets without startup-time policy imports."""
     from .browser_inventory import collect_browser_targets as _collect_browser_targets
 
-    return _collect_browser_targets(adapter, tree_depth=tree_depth)
+    return _collect_browser_targets(
+        adapter,
+        tree_depth=tree_depth,
+        require_complete=require_complete,
+        apps=apps,
+        browser_names=browser_names,
+    )
 
 
 def best_browser_target(targets, query: str, *, minimum_score: int = 60):
@@ -158,6 +202,20 @@ def best_browser_target(targets, query: str, *, minimum_score: int = 60):
     from .browser_inventory import best_browser_target as _best_browser_target
 
     return _best_browser_target(targets, query, minimum_score=minimum_score)
+
+
+def classify_browser_query(targets, query: str):
+    """Classify query evidence through the lazy native inventory policy."""
+    from .browser_inventory import classify_browser_query as _classify_browser_query
+
+    return _classify_browser_query(targets, query)
+
+
+def browser_names_for_apps(apps):
+    """Resolve browser processes through one cross-platform identity snapshot."""
+    from .browser_inventory import browser_names_for_apps as _browser_names_for_apps
+
+    return _browser_names_for_apps(apps)
 
 
 def select_browser_target(adapter, target):
@@ -198,6 +256,8 @@ input_worker = ProviderWorker("physical-input")
 apple_worker = ProviderWorker("apple-events")
 system_worker = ProviderWorker("system")
 _result_formatter = BoundedResultFormatter()
+_RESULT_BYTE_LIMITS = {"observe_target": 4 * 1024, "execute": 2 * 1024}
+_transaction_telemetry = None
 native_adapter: BaseAdapter | None = None
 _input_backend: object | None = None
 _runtime_readiness = None
@@ -245,908 +305,911 @@ def _platform_status() -> str:
 
 
 # ── Tool definitions ────────────────────────────────────────────────
-TOOLS = harden_tool_schemas(align_runtime_argument_contracts(expose_shadow_target_ids([
-    Tool(
-        name="status",
-        description=(
-            "Run live local readiness checks for the native accessibility and input providers. "
-            "This never probes a browser or starts installation."
-        ),
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="list_apps",
-        description=(
-            "List all running applications with visible windows. "
-            "Returns PID, name, bundle ID, window titles. "
-            "Use the PID to call tree."
-        ),
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="tree",
-        description=(
-            "Get the accessibility tree of an application by PID. "
-            "Default: returns only interactive elements as flat one-liners (token-efficient). "
-            "Each element has an [id] you can use with click/type. "
-            "This is the PRIMARY way to 'see' an application — no screenshot needed. "
-            "Browsers are inspected through the same foreground OS accessibility provider "
-            "as every other application; no remote browser connection is opened. "
-            "Set full=True for the complete nested tree. "
-            "For large apps, use subtree to drill into specific sections."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID of the application",
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "description": "Max tree depth (default 10, max 20)",
-                    "default": 10,
-                },
-                "interactive_only": {
-                    "type": "boolean",
-                    "description": "Return only interactive elements as flat one-liners (default: true)",
-                    "default": True,
-                },
-                "max_items": {
-                    "type": "integer",
-                    "description": "Maximum interactive rows returned (default 80, max 200)",
-                    "default": 80,
-                    "minimum": 1,
-                    "maximum": 200,
-                },
-                "full": {
-                    "type": "boolean",
-                    "description": "Return full nested tree (overrides interactive_only, default: false)",
-                    "default": False,
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Total operation deadline in seconds (default 5)",
-                    "default": 5.0,
-                    "minimum": 0,
-                    "maximum": 30,
-                },
-            },
-            "required": ["pid"],
-        },
-    ),
-    Tool(
-        name="find",
-        description=(
-            "Search for UI elements by role, name, or value within an app. "
-            "Searches the currently loaded tree (call tree first) "
-            "or specify a PID to load fresh. Returns matching elements with IDs."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID (optional if tree already loaded)",
-                },
-                "role": {
-                    "type": "string",
-                    "description": "Element role to match (e.g. 'button', 'textfield', 'link')",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Element name/title to match (partial, case-insensitive)",
-                },
-                "value": {
-                    "type": "string",
-                    "description": "Element value to match (partial, case-insensitive)",
-                },
-                "match": {
-                    "type": "string",
-                    "description": "Match type: 'contains' (default), 'exact', 'prefix', or 'suffix'",
-                    "default": "contains",
-                    "enum": ["contains", "exact", "prefix", "suffix"],
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="click",
-        description=(
-            "Click/press a UI element by its [id] from the tree. "
-            "Works for buttons, links, checkboxes, menu items, etc. "
-            "Alternatively, click by screen coordinates (x, y); this requires a PID "
-            "so Agent Eyes can focus and verify the target application first."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Element ID from the accessibility tree",
-                },
-                "x": {
-                    "type": "integer",
-                    "description": "Screen X coordinate (use with y and pid)",
-                },
-                "y": {
-                    "type": "integer",
-                    "description": "Screen Y coordinate (use with x and pid)",
-                },
-                "pid": {
-                    "type": "integer",
-                    "description": (
-                        "Target app PID required to focus and verify a coordinate click"
+TOOLS = harden_tool_schemas(
+    align_runtime_argument_contracts(
+        expose_shadow_target_ids(
+            [
+                Tool(
+                    name="status",
+                    description=(
+                        "Run live local readiness checks for the native accessibility and input providers. "
+                        "This never probes a browser or starts installation."
                     ),
-                },
-                "snapshot": {
-                    "type": "string",
-                    "description": "Snapshot token returned by tree/web_tree",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicitly use a shadow snapshot/provider (default: false)",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="type",
-        description=(
-            "Type text into a UI element (text field, search box, etc.) by its [id]. "
-            "Uses human-like keyboard simulation (real key events) when possible, "
-            "which triggers all event listeners. Falls back to programmatic set_value."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Element ID from the accessibility tree",
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Text to type into the element",
-                },
-                "snapshot": {
-                    "type": "string",
-                    "description": "Snapshot token returned by tree/web_tree",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicitly use a shadow snapshot/provider (default: false)",
-                    "default": False,
-                },
-            },
-            "required": ["id", "text"],
-        },
-    ),
-    Tool(
-        name="focused",
-        description=(
-            "Get the currently focused UI element across all apps. "
-            "Useful to see what's active without knowing which app/PID."
-        ),
-        inputSchema={"type": "object", "properties": {}, "required": []},
-    ),
-    Tool(
-        name="list_tabs",
-        description=(
-            "Scan already-open tabs and windows across supported browsers using the "
-            "foreground OS accessibility provider. Pass query to rank likely reusable "
-            "tabs while scanning every target visible to the native provider. This never starts or probes "
-            "remote browser mode by default. Set shadow=true only when background CDP "
-            "tab metadata was explicitly requested."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Optional task, title, domain, or URL terms used to rank reusable tabs",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicitly probe the optional background/CDP provider (default: false)",
-                    "default": False,
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": (
-                        "Maximum targets returned from each foreground or shadow inventory, "
-                        "with or without a query (default: 10, max: 50)"
+                    inputSchema={"type": "object", "properties": {}, "required": []},
+                ),
+                Tool(
+                    name="list_apps",
+                    description=(
+                        "List all running applications with visible windows. "
+                        "Returns PID, name, bundle ID, window titles. "
+                        "Use the PID to call tree."
                     ),
-                    "default": 10,
-                    "minimum": 1,
-                    "maximum": 50,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="web_tree",
-        description=(
-            "Get a DOM-backed accessibility tree through the optional shadow provider. "
-            "This is background/protocol automation and requires explicit shadow=true; "
-            "for normal visible browser work use tree with the browser PID. "
-            "Default: returns only interactive elements as flat one-liners (token-efficient). "
-            "Set full=True for the complete nested tree."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "max_depth": {
-                    "type": "integer",
-                    "description": "Max tree depth (default 5, max 10)",
-                    "default": 5,
-                },
-                "interactive_only": {
-                    "type": "boolean",
-                    "description": "Return only interactive elements as flat one-liners (default: true)",
-                    "default": True,
-                },
-                "full": {
-                    "type": "boolean",
-                    "description": "Return full nested tree (overrides interactive_only, default: false)",
-                    "default": False,
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicit consent to use the optional background browser provider",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    # ── New tools ──────────────────────────────────────────────────
-    Tool(
-        name="navigate",
-        description=(
-            "Reuse a matching visible browser tab or open the URL in the user's default browser. "
-            "Foreground native behavior is the default. Set shadow=true only when navigating an "
-            "explicit background provider tab."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The URL to navigate to",
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Optional intent terms used to reuse a relevant foreground tab",
-                },
-                "reuse_existing": {
-                    "type": "boolean",
-                    "description": "Check existing foreground tabs before opening (default: true)",
-                    "default": True,
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional background provider instead of foreground automation",
-                    "default": False,
-                },
-            },
-            "required": ["url"],
-        },
-    ),
-    Tool(
-        name="js",
-        description=(
-            "Execute JavaScript through the optional background browser provider. "
-            "Protocol-only capability; requires explicit shadow=true."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "JavaScript expression to evaluate",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicit consent to use the optional background browser provider",
-                    "default": False,
-                },
-            },
-            "required": ["expression"],
-        },
-    ),
-    Tool(
-        name="press_key",
-        description=(
-            "Press a keyboard key in any application (native or web). "
-            "For native apps, provide a PID to target that app. "
-            "With no PID it targets the current foreground app. "
-            "Supports special keys (Enter, Tab, Escape, Backspace, Delete, "
-            "ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, F1-F12, Space) "
-            "and modifiers (Ctrl, Alt, Meta/Cmd, Shift). "
-            "For typing text into a field, use type instead."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "Key to press (e.g. 'Enter', 'Tab', 'Escape', 'a')",
-                },
-                "modifiers": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Modifier keys: 'Ctrl', 'Alt', 'Meta', 'Shift'",
-                },
-                "pid": {
-                    "type": "integer",
-                    "description": "Target foreground app or browser PID",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional background provider instead of OS input",
-                    "default": False,
-                },
-            },
-            "required": ["key"],
-        },
-    ),
-    Tool(
-        name="wait",
-        description=(
-            "Wait for an element to appear using accessibility or browser lifecycle events. "
-            "Foreground waiting requires pid; shadow waiting must be explicit."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "role": {
-                    "type": "string",
-                    "description": "Element role to wait for (e.g. 'button', 'heading')",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Element name/label to wait for",
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Max seconds to wait (default 5)",
-                    "default": 5,
-                },
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID for foreground native waiting",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional event-driven CDP provider (default: false)",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="new_tab",
-        description=(
-            "Reuse a suitable already-open foreground browser tab when possible; "
-            "otherwise open the URL in the user's default browser. Pass query to "
-            "describe the desired tab. Existing-tab reuse is on by default. Set "
-            "shadow=true only for an explicitly requested background CDP tab."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "URL to open (default: about:blank)",
-                    "default": "about:blank",
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Task, title, domain, or URL terms used to find a reusable open tab",
-                },
-                "reuse_existing": {
-                    "type": "boolean",
-                    "description": "Reuse a suitable foreground tab before opening a new one (default: true)",
-                    "default": True,
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Open through the optional background CDP provider (default: false)",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="close_tab",
-        description=(
-            "Close a visible tab in any supported browser through native foreground control. "
-            "Always call list_tabs immediately first and prefer title for safe targeting. "
-            "Set shadow=true only for an explicit background-provider tab."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": (
-                        "Substring to match against tab titles (case-insensitive). "
-                        "Must match exactly one fresh target."
+                    inputSchema={"type": "object", "properties": {}, "required": []},
+                ),
+                Tool(
+                    name="tree",
+                    description=(
+                        "Get the accessibility tree of an application by PID. "
+                        "Default: returns only interactive elements as flat one-liners (token-efficient). "
+                        "Each element has an [id] you can use with click/type. "
+                        "This is the PRIMARY way to 'see' an application — no screenshot needed. "
+                        "Browsers are inspected through the same foreground OS accessibility provider "
+                        "as every other application; no remote browser connection is opened. "
+                        "Set full=True for the complete nested tree. "
+                        "For large apps, use subtree to drill into specific sections."
                     ),
-                },
-                "target_id": {
-                    "type": "string",
-                    "description": "Stable native target ID from the latest list_tabs result",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Close through the optional background provider",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="dialog",
-        description=(
-            "Handle a protocol-level JavaScript dialog through the optional shadow provider. "
-            "Requires explicit shadow=true; visible native dialogs use tree and click."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "accept": {
-                    "type": "boolean",
-                    "description": "True to accept/OK, False to dismiss/Cancel (default true)",
-                    "default": True,
-                },
-                "prompt_text": {
-                    "type": "string",
-                    "description": "Text to enter for prompt dialogs",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicit consent to use the optional background provider",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="upload",
-        description=(
-            "Inject file(s) into a DOM file input through the optional shadow provider. "
-            "Requires explicit shadow=true. Paths are canonicalized before the runtime "
-            "requires regular files outside protected locations."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Element ID of the file input from the web tree",
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "File paths to canonicalize, validate, and attach",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicit consent to use the optional background provider",
-                    "default": False,
-                },
-            },
-            "required": ["id", "files"],
-        },
-    ),
-    Tool(
-        name="scroll",
-        description=(
-            "Scroll the current foreground app or a provided PID using OS input. "
-            "Use positive delta_y to scroll down; set shadow=true only for background scrolling."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "delta_y": {
-                    "type": "integer",
-                    "description": "Vertical scroll amount (positive=down, negative=up). Default 300.",
-                    "default": 300,
-                },
-                "delta_x": {
-                    "type": "integer",
-                    "description": "Horizontal scroll amount (positive=right, negative=left). Default 0.",
-                    "default": 0,
-                },
-                "x": {
-                    "type": "integer",
-                    "description": "X coordinate to scroll from (default 400)",
-                    "default": 400,
-                },
-                "y": {
-                    "type": "integer",
-                    "description": "Y coordinate to scroll from (default 400)",
-                    "default": 400,
-                },
-                "pid": {
-                    "type": "integer",
-                    "description": "Optional foreground application or browser PID",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional background provider instead of OS input",
-                    "default": False,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="drag",
-        description=(
-            "Drag between screen coordinates using foreground OS input. "
-            "Set shadow=true only for background browser drag."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "from_x": {"type": "integer", "description": "Start X coordinate"},
-                "from_y": {"type": "integer", "description": "Start Y coordinate"},
-                "to_x": {"type": "integer", "description": "End X coordinate"},
-                "to_y": {"type": "integer", "description": "End Y coordinate"},
-                "pid": {
-                    "type": "integer",
-                    "description": "Optional foreground application or browser PID",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional background provider instead of OS input",
-                    "default": False,
-                },
-            },
-            "required": ["from_x", "from_y", "to_x", "to_y"],
-        },
-    ),
-    Tool(
-        name="fill_form",
-        description=(
-            "Fill multiple foreground form fields by [id] from a native accessibility tree. "
-            "Set shadow=true only for fields returned by an explicit shadow web_tree."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "fields": {
-                    "type": "array",
-                    "items": {
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "pid": {
+                                "type": "integer",
+                                "description": "Process ID of the application",
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max tree depth (default 10, max 20)",
+                                "default": 10,
+                            },
+                            "interactive_only": {
+                                "type": "boolean",
+                                "description": "Return only interactive elements as flat one-liners (default: true)",
+                                "default": True,
+                            },
+                            "max_items": {
+                                "type": "integer",
+                                "description": "Maximum interactive rows returned (default 80, max 200)",
+                                "default": 80,
+                                "minimum": 1,
+                                "maximum": 200,
+                            },
+                            "full": {
+                                "type": "boolean",
+                                "description": "Return full nested tree (overrides interactive_only, default: false)",
+                                "default": False,
+                            },
+                            "timeout": {
+                                "type": "number",
+                                "description": "Total operation deadline in seconds (default 5)",
+                                "default": 5.0,
+                                "minimum": 0,
+                                "maximum": 30,
+                            },
+                        },
+                        "required": ["pid"],
+                    },
+                ),
+                Tool(
+                    name="find",
+                    description=(
+                        "Search for UI elements by role, name, or value within an app. "
+                        "Searches the currently loaded tree (call tree first) "
+                        "or specify a PID to load fresh. Returns matching elements with IDs."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "pid": {
+                                "type": "integer",
+                                "description": "Process ID (optional if tree already loaded)",
+                            },
+                            "role": {
+                                "type": "string",
+                                "description": "Element role to match (e.g. 'button', 'textfield', 'link')",
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Element name/title to match (partial, case-insensitive)",
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "Element value to match (partial, case-insensitive)",
+                            },
+                            "match": {
+                                "type": "string",
+                                "description": "Match type: 'contains' (default), 'exact', 'prefix', or 'suffix'",
+                                "default": "contains",
+                                "enum": ["contains", "exact", "prefix", "suffix"],
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="click",
+                    description=(
+                        "Click/press a UI element by its [id] from the tree. "
+                        "Works for buttons, links, checkboxes, menu items, etc. "
+                        "Alternatively, click by screen coordinates (x, y); this requires a PID "
+                        "so Agent Eyes can focus and verify the target application first."
+                    ),
+                    inputSchema={
                         "type": "object",
                         "properties": {
                             "id": {
                                 "type": "integer",
-                                "description": "Element ID from web tree",
+                                "description": "Element ID from the accessibility tree",
                             },
-                            "value": {
+                            "x": {
+                                "type": "integer",
+                                "description": "Screen X coordinate (use with y and pid)",
+                            },
+                            "y": {
+                                "type": "integer",
+                                "description": "Screen Y coordinate (use with x and pid)",
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": (
+                                    "Target app PID required to focus and verify a coordinate click"
+                                ),
+                            },
+                            "snapshot": {
                                 "type": "string",
-                                "description": "Value to fill",
+                                "description": "Snapshot token returned by tree/web_tree",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicitly use a shadow snapshot/provider (default: false)",
+                                "default": False,
                             },
                         },
-                        "required": ["id", "value"],
+                        "required": [],
                     },
-                    "description": "List of {id, value} pairs to fill",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Use the optional background provider for shadow-tree fields",
-                    "default": False,
-                },
-            },
-            "required": ["fields"],
-        },
-    ),
-    Tool(
-        name="hover",
-        description=(
-            "Hover over a UI element to trigger tooltips, dropdown previews, "
-            "or CSS :hover states. Moves the mouse to the element's center."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Element ID from the accessibility tree",
-                },
-                "x": {
-                    "type": "integer",
-                    "description": "Screen X coordinate (alternative to id)",
-                },
-                "y": {
-                    "type": "integer",
-                    "description": "Screen Y coordinate (alternative to id)",
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="app",
-        description=(
-            "Launch, quit, or switch to an application. "
-            "Actions: 'launch' (by name or bundle ID), 'quit', 'focus' (bring to front)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "Action: 'launch', 'quit', or 'focus'",
-                    "enum": ["launch", "quit", "focus"],
-                },
-                "name": {
-                    "type": "string",
-                    "description": "App name (e.g. 'Safari') or bundle ID (e.g. 'com.apple.Safari')",
-                },
-            },
-            "required": ["action", "name"],
-        },
-    ),
-    Tool(
-        name="subtree",
-        description=(
-            "Get the accessibility subtree rooted at a specific element. "
-            "Use to drill into complex UIs without loading the entire tree. "
-            "Much more efficient than re-fetching the full tree with higher depth."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "id": {
-                    "type": "integer",
-                    "description": "Element ID to expand (from a previous tree call)",
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "description": "How many levels deep to expand (default 5, max 15)",
-                    "default": 5,
-                },
-            },
-            "required": ["id"],
-        },
-    ),
-    Tool(
-        name="window",
-        description=(
-            "Manage application windows. Actions: 'list' (all windows with positions), "
-            "'focus' (bring to front), 'minimize', 'close', 'move' (x,y), 'resize' (w,h)."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "Action: 'list', 'focus', 'minimize', 'close', 'move', 'resize'",
-                    "enum": ["list", "focus", "minimize", "close", "move", "resize"],
-                },
-                "pid": {
-                    "type": "integer",
-                    "description": "Process ID (required for all actions except 'list')",
-                },
-                "snapshot": {
-                    "type": "string",
-                    "description": "Snapshot token returned by window(action='list')",
-                },
-                "id": {
-                    "type": "integer",
-                    "description": "Exact native window ID returned by window(action='list')",
-                },
-                "x": {"type": "integer", "description": "X position for 'move' action"},
-                "y": {"type": "integer", "description": "Y position for 'move' action"},
-                "width": {"type": "integer", "description": "Width for 'resize' action"},
-                "height": {"type": "integer", "description": "Height for 'resize' action"},
-            },
-            "required": ["action"],
-        },
-    ),
-    Tool(
-        name="context",
-        description=(
-            "Get a quick context snapshot: frontmost app, active window, focused element, "
-            "without traversing a full tree. One compact call for initial orientation; "
-            "use tree or subtree only when more detail is needed."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "fast": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, return only app name, window title, and focused element "
-                        "(compact mode is the default; retained for compatibility)."
+                ),
+                Tool(
+                    name="type",
+                    description=(
+                        "Type text into a UI element (text field, search box, etc.) by its [id]. "
+                        "Uses human-like keyboard simulation (real key events) when possible, "
+                        "which triggers all event listeners. Falls back to programmatic set_value."
                     ),
-                    "default": True,
-                },
-            },
-            "required": [],
-        },
-    ),
-    Tool(
-        name="shadow",
-        description=(
-            "Execute browser actions through the optional background Chromium provider. "
-            "Actions: 'click' (by text/selector), 'type' (into focused/selected element), "
-            "'press_key' (Enter/Tab/Escape/etc), 'scroll' (up/down), "
-            "'read' (get all interactive elements), 'js' (raw JavaScript). "
-            "This tool is explicit shadow mode and does not focus the visible browser."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "Action: 'click', 'type', 'press_key', 'scroll', 'read', 'js'",
-                    "enum": ["click", "type", "press_key", "scroll", "read", "js"],
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Text to click (for 'click'), text to type (for 'type'), key name (for 'press_key'), JS code (for 'js')",
-                },
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector (optional, for targeted click/type/scroll)",
-                },
-                "direction": {
-                    "type": "string",
-                    "description": "Scroll direction: 'up' or 'down' (default 'down')",
-                    "default": "down",
-                },
-                "amount": {
-                    "type": "integer",
-                    "description": "Scroll amount in pixels (default 300)",
-                    "default": 300,
-                },
-            },
-            "required": ["action"],
-        },
-    ),
-    Tool(
-        name="pierce",
-        description=(
-            "Inspect shadow DOM elements inside a CSS selector's shadow root. "
-            "Modern web apps (Salesforce, Shopify, GitHub, Google) use shadow DOM to "
-            "encapsulate components — standard accessibility trees miss these elements. "
-            "Use pierce to see what's inside a shadow root: roles, names, and IDs for interaction. "
-            "Returns a flat list from the optional protocol provider and requires explicit shadow=true."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector identifying the element whose shadow root to inspect (e.g. 'custom-nav', '#app-shell')",
-                },
-                "shadow": {
-                    "type": "boolean",
-                    "description": "Explicit consent to use the optional background provider",
-                    "default": False,
-                },
-            },
-            "required": ["selector"],
-        },
-    ),
-    Tool(
-        name="install_check",
-        description=(
-            "Compatibility alias for live Agent Eyes readiness. "
-            "Use status for new integrations; use the agent-eyes setup CLI to repair missing capabilities."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {},
-        },
-    ),
-])))
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                                "description": "Element ID from the accessibility tree",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Text to type into the element",
+                            },
+                            "snapshot": {
+                                "type": "string",
+                                "description": "Snapshot token returned by tree/web_tree",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicitly use a shadow snapshot/provider (default: false)",
+                                "default": False,
+                            },
+                        },
+                        "required": ["id", "text"],
+                    },
+                ),
+                Tool(
+                    name="focused",
+                    description=(
+                        "Get the currently focused UI element across all apps. "
+                        "Useful to see what's active without knowing which app/PID."
+                    ),
+                    inputSchema={"type": "object", "properties": {}, "required": []},
+                ),
+                Tool(
+                    name="list_tabs",
+                    description=(
+                        "Scan already-open tabs and windows across supported browsers using the "
+                        "foreground OS accessibility provider. Pass query to rank likely reusable "
+                        "tabs while scanning every target visible to the native provider. This never starts or probes "
+                        "remote browser mode by default. Set shadow=true only when background CDP "
+                        "tab metadata was explicitly requested."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Optional task, title, domain, or URL terms used to rank reusable tabs",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicitly probe the optional background/CDP provider (default: false)",
+                                "default": False,
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": (
+                                    "Maximum targets returned from each foreground or shadow inventory, "
+                                    "with or without a query (default: 10, max: 50)"
+                                ),
+                                "default": 10,
+                                "minimum": 1,
+                                "maximum": 50,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="web_tree",
+                    description=(
+                        "Get a DOM-backed accessibility tree through the optional shadow provider. "
+                        "This is background/protocol automation and requires explicit shadow=true; "
+                        "for normal visible browser work use tree with the browser PID. "
+                        "Default: returns only interactive elements as flat one-liners (token-efficient). "
+                        "Set full=True for the complete nested tree."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Max tree depth (default 5, max 10)",
+                                "default": 5,
+                            },
+                            "interactive_only": {
+                                "type": "boolean",
+                                "description": "Return only interactive elements as flat one-liners (default: true)",
+                                "default": True,
+                            },
+                            "full": {
+                                "type": "boolean",
+                                "description": "Return full nested tree (overrides interactive_only, default: false)",
+                                "default": False,
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicit consent to use the optional background browser provider",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                # ── New tools ──────────────────────────────────────────────────
+                Tool(
+                    name="navigate",
+                    description=(
+                        "Reuse a matching visible browser tab or open the URL in the user's default browser. "
+                        "Foreground native behavior is the default. Set shadow=true only when navigating an "
+                        "explicit background provider tab."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL to navigate to",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Optional intent terms used to reuse a relevant foreground tab",
+                            },
+                            "reuse_existing": {
+                                "type": "boolean",
+                                "description": "Check existing foreground tabs before opening (default: true)",
+                                "default": True,
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional background provider instead of foreground automation",
+                                "default": False,
+                            },
+                        },
+                        "required": ["url"],
+                    },
+                ),
+                Tool(
+                    name="js",
+                    description=(
+                        "Execute JavaScript through the optional background browser provider. "
+                        "Protocol-only capability; requires explicit shadow=true."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "expression": {
+                                "type": "string",
+                                "description": "JavaScript expression to evaluate",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicit consent to use the optional background browser provider",
+                                "default": False,
+                            },
+                        },
+                        "required": ["expression"],
+                    },
+                ),
+                Tool(
+                    name="press_key",
+                    description=(
+                        "Press a keyboard key in any application (native or web). "
+                        "For native apps, provide a PID to target that app. "
+                        "With no PID it targets the current foreground app. "
+                        "Supports special keys (Enter, Tab, Escape, Backspace, Delete, "
+                        "ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown, F1-F12, Space) "
+                        "and modifiers (Ctrl, Alt, Meta/Cmd, Shift). "
+                        "For typing text into a field, use type instead."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "key": {
+                                "type": "string",
+                                "description": "Key to press (e.g. 'Enter', 'Tab', 'Escape', 'a')",
+                            },
+                            "modifiers": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Modifier keys: 'Ctrl', 'Alt', 'Meta', 'Shift'",
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": "Target foreground app or browser PID",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional background provider instead of OS input",
+                                "default": False,
+                            },
+                        },
+                        "required": ["key"],
+                    },
+                ),
+                Tool(
+                    name="wait",
+                    description=(
+                        "Wait for an element to appear using accessibility or browser lifecycle events. "
+                        "Foreground waiting requires pid; shadow waiting must be explicit."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "description": "Element role to wait for (e.g. 'button', 'heading')",
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Element name/label to wait for",
+                            },
+                            "timeout": {
+                                "type": "number",
+                                "description": "Max seconds to wait (default 5)",
+                                "default": 5,
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": "Process ID for foreground native waiting",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional event-driven CDP provider (default: false)",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="new_tab",
+                    description=(
+                        "Reuse a suitable already-open foreground browser tab when possible; "
+                        "otherwise open the URL in the user's default browser. Pass query to "
+                        "describe the desired tab. Existing-tab reuse is on by default. Set "
+                        "shadow=true only for an explicitly requested background CDP tab."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL to open (default: about:blank)",
+                                "default": "about:blank",
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Task, title, domain, or URL terms used to find a reusable open tab",
+                            },
+                            "reuse_existing": {
+                                "type": "boolean",
+                                "description": "Reuse a suitable foreground tab before opening a new one (default: true)",
+                                "default": True,
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Open through the optional background CDP provider (default: false)",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="close_tab",
+                    description=(
+                        "Close a visible tab in any supported browser through native foreground control. "
+                        "Always call list_tabs immediately first and prefer title for safe targeting. "
+                        "Set shadow=true only for an explicit background-provider tab."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": (
+                                    "Substring to match against tab titles (case-insensitive). "
+                                    "Must match exactly one fresh target."
+                                ),
+                            },
+                            "target_id": {
+                                "type": "string",
+                                "description": "Stable native target ID from the latest list_tabs result",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Close through the optional background provider",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="dialog",
+                    description=(
+                        "Handle a protocol-level JavaScript dialog through the optional shadow provider. "
+                        "Requires explicit shadow=true; visible native dialogs use tree and click."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "accept": {
+                                "type": "boolean",
+                                "description": "True to accept/OK, False to dismiss/Cancel (default true)",
+                                "default": True,
+                            },
+                            "prompt_text": {
+                                "type": "string",
+                                "description": "Text to enter for prompt dialogs",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicit consent to use the optional background provider",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="upload",
+                    description=(
+                        "Inject file(s) into a DOM file input through the optional shadow provider. "
+                        "Requires explicit shadow=true. Paths are canonicalized before the runtime "
+                        "requires regular files outside protected locations."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                                "description": "Element ID of the file input from the web tree",
+                            },
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "File paths to canonicalize, validate, and attach",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicit consent to use the optional background provider",
+                                "default": False,
+                            },
+                        },
+                        "required": ["id", "files"],
+                    },
+                ),
+                Tool(
+                    name="scroll",
+                    description=(
+                        "Scroll the current foreground app or a provided PID using OS input. "
+                        "Use positive delta_y to scroll down; set shadow=true only for background scrolling."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "delta_y": {
+                                "type": "integer",
+                                "description": "Vertical scroll amount (positive=down, negative=up). Default 300.",
+                                "default": 300,
+                            },
+                            "delta_x": {
+                                "type": "integer",
+                                "description": "Horizontal scroll amount (positive=right, negative=left). Default 0.",
+                                "default": 0,
+                            },
+                            "x": {
+                                "type": "integer",
+                                "description": "X coordinate to scroll from (default 400)",
+                                "default": 400,
+                            },
+                            "y": {
+                                "type": "integer",
+                                "description": "Y coordinate to scroll from (default 400)",
+                                "default": 400,
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": "Optional foreground application or browser PID",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional background provider instead of OS input",
+                                "default": False,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="drag",
+                    description=(
+                        "Drag between screen coordinates using foreground OS input. "
+                        "Set shadow=true only for background browser drag."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "from_x": {
+                                "type": "integer",
+                                "description": "Start X coordinate",
+                            },
+                            "from_y": {
+                                "type": "integer",
+                                "description": "Start Y coordinate",
+                            },
+                            "to_x": {
+                                "type": "integer",
+                                "description": "End X coordinate",
+                            },
+                            "to_y": {
+                                "type": "integer",
+                                "description": "End Y coordinate",
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": "Optional foreground application or browser PID",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional background provider instead of OS input",
+                                "default": False,
+                            },
+                        },
+                        "required": ["from_x", "from_y", "to_x", "to_y"],
+                    },
+                ),
+                Tool(
+                    name="fill_form",
+                    description=(
+                        "Fill multiple foreground form fields by [id] from a native accessibility tree. "
+                        "Set shadow=true only for fields returned by an explicit shadow web_tree."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "fields": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {
+                                            "type": "integer",
+                                            "description": "Element ID from web tree",
+                                        },
+                                        "value": {
+                                            "type": "string",
+                                            "description": "Value to fill",
+                                        },
+                                    },
+                                    "required": ["id", "value"],
+                                },
+                                "description": "List of {id, value} pairs to fill",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Use the optional background provider for shadow-tree fields",
+                                "default": False,
+                            },
+                        },
+                        "required": ["fields"],
+                    },
+                ),
+                Tool(
+                    name="hover",
+                    description=(
+                        "Hover over a UI element to trigger tooltips, dropdown previews, "
+                        "or CSS :hover states. Moves the mouse to the element's center."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                                "description": "Element ID from the accessibility tree",
+                            },
+                            "x": {
+                                "type": "integer",
+                                "description": "Screen X coordinate (alternative to id)",
+                            },
+                            "y": {
+                                "type": "integer",
+                                "description": "Screen Y coordinate (alternative to id)",
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="app",
+                    description=(
+                        "Launch, quit, or switch to an application. "
+                        "Actions: 'launch' (by name or bundle ID), 'quit', 'focus' (bring to front)."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": "Action: 'launch', 'quit', or 'focus'",
+                                "enum": ["launch", "quit", "focus"],
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "App name (e.g. 'Safari') or bundle ID (e.g. 'com.apple.Safari')",
+                            },
+                        },
+                        "required": ["action", "name"],
+                    },
+                ),
+                Tool(
+                    name="subtree",
+                    description=(
+                        "Get the accessibility subtree rooted at a specific element. "
+                        "Use to drill into complex UIs without loading the entire tree. "
+                        "Much more efficient than re-fetching the full tree with higher depth."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "integer",
+                                "description": "Element ID to expand (from a previous tree call)",
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "How many levels deep to expand (default 5, max 15)",
+                                "default": 5,
+                            },
+                        },
+                        "required": ["id"],
+                    },
+                ),
+                Tool(
+                    name="window",
+                    description=(
+                        "Manage application windows. Actions: 'list' (all windows with positions), "
+                        "'focus' (bring to front), 'minimize', 'close', 'move' (x,y), 'resize' (w,h)."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": "Action: 'list', 'focus', 'minimize', 'close', 'move', 'resize'",
+                                "enum": [
+                                    "list",
+                                    "focus",
+                                    "minimize",
+                                    "close",
+                                    "move",
+                                    "resize",
+                                ],
+                            },
+                            "pid": {
+                                "type": "integer",
+                                "description": "Process ID (required for all actions except 'list')",
+                            },
+                            "snapshot": {
+                                "type": "string",
+                                "description": "Snapshot token returned by window(action='list')",
+                            },
+                            "id": {
+                                "type": "integer",
+                                "description": "Exact native window ID returned by window(action='list')",
+                            },
+                            "x": {
+                                "type": "integer",
+                                "description": "X position for 'move' action",
+                            },
+                            "y": {
+                                "type": "integer",
+                                "description": "Y position for 'move' action",
+                            },
+                            "width": {
+                                "type": "integer",
+                                "description": "Width for 'resize' action",
+                            },
+                            "height": {
+                                "type": "integer",
+                                "description": "Height for 'resize' action",
+                            },
+                        },
+                        "required": ["action"],
+                    },
+                ),
+                Tool(
+                    name="context",
+                    description=(
+                        "Get a quick context snapshot: frontmost app, active window, focused element, "
+                        "without traversing a full tree. One compact call for initial orientation; "
+                        "use tree or subtree only when more detail is needed."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "fast": {
+                                "type": "boolean",
+                                "description": (
+                                    "If true, return only app name, window title, and focused element "
+                                    "(compact mode is the default; retained for compatibility)."
+                                ),
+                                "default": True,
+                            },
+                        },
+                        "required": [],
+                    },
+                ),
+                Tool(
+                    name="shadow",
+                    description=(
+                        "Execute browser actions through the optional background Chromium provider. "
+                        "Actions: 'click' (by text/selector), 'type' (into focused/selected element), "
+                        "'press_key' (Enter/Tab/Escape/etc), 'scroll' (up/down), "
+                        "'read' (get all interactive elements), 'js' (raw JavaScript). "
+                        "This tool is explicit shadow mode and does not focus the visible browser."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "description": "Action: 'click', 'type', 'press_key', 'scroll', 'read', 'js'",
+                                "enum": [
+                                    "click",
+                                    "type",
+                                    "press_key",
+                                    "scroll",
+                                    "read",
+                                    "js",
+                                ],
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Text to click (for 'click'), text to type (for 'type'), key name (for 'press_key'), JS code (for 'js')",
+                            },
+                            "selector": {
+                                "type": "string",
+                                "description": "CSS selector (optional, for targeted click/type/scroll)",
+                            },
+                            "direction": {
+                                "type": "string",
+                                "description": "Scroll direction: 'up' or 'down' (default 'down')",
+                                "default": "down",
+                            },
+                            "amount": {
+                                "type": "integer",
+                                "description": "Scroll amount in pixels (default 300)",
+                                "default": 300,
+                            },
+                        },
+                        "required": ["action"],
+                    },
+                ),
+                Tool(
+                    name="pierce",
+                    description=(
+                        "Inspect shadow DOM elements inside a CSS selector's shadow root. "
+                        "Modern web apps (Salesforce, Shopify, GitHub, Google) use shadow DOM to "
+                        "encapsulate components — standard accessibility trees miss these elements. "
+                        "Use pierce to see what's inside a shadow root: roles, names, and IDs for interaction. "
+                        "Returns a flat list from the optional protocol provider and requires explicit shadow=true."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "selector": {
+                                "type": "string",
+                                "description": "CSS selector identifying the element whose shadow root to inspect (e.g. 'custom-nav', '#app-shell')",
+                            },
+                            "shadow": {
+                                "type": "boolean",
+                                "description": "Explicit consent to use the optional background provider",
+                                "default": False,
+                            },
+                        },
+                        "required": ["selector"],
+                    },
+                ),
+                Tool(
+                    name="observe_target",
+                    description=(
+                        "Resolve one foreground target and return compact selector matches."
+                    ),
+                    inputSchema=build_observe_target_input_schema(),
+                ),
+                Tool(
+                    name="execute",
+                    description=(
+                        "Run one bounded transaction; shadow mode must be explicit."
+                    ),
+                    inputSchema=build_execute_input_schema(),
+                ),
+                Tool(
+                    name="install_check",
+                    description=(
+                        "Compatibility alias for live Agent Eyes readiness. "
+                        "Use status for new integrations; use the agent-eyes setup CLI to repair missing capabilities."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            ]
+        )
+    )
+)
 
 if sys.platform != "darwin":
-    TOOLS[:] = [
-        tool for tool in TOOLS if tool.name not in {"app", "window", "shadow"}
-    ]
+    TOOLS[:] = [tool for tool in TOOLS if tool.name not in {"app", "window", "shadow"}]
 
 
 # Keep tools/list small: property names, enums, defaults, and enforced bounds carry
 # the leaf-level contract. Consent and routing guidance stays once at tool level.
 _COMPACT_TOOL_DESCRIPTIONS = {
-    "status": "Check native accessibility/input readiness; never opens a browser or installs.",
-    "list_apps": "List visible apps/windows; use a PID with tree.",
-    "tree": (
-        "Inspect a PID through foreground native accessibility and return actionable [id]s. "
-        "For browsers prefer this; use web_tree with explicit shadow=true only if requested."
-    ),
-    "find": "Find loaded native-tree elements by role/name/value; optional pid refreshes the tree.",
-    "click": (
-        "Click a tree/web_tree [id] (qualify with snapshot), or native x/y (requires pid). "
-        "Set shadow=true only for an explicit background snapshot."
-    ),
-    "type": (
-        "Type text into a tree/web_tree [id] qualified by snapshot. Native input is the "
-        "foreground default; shadow=true is an explicit background opt-in."
-    ),
-    "focused": "Return the focused UI element.",
-    "list_tabs": (
-        "Scan and rank open browser tabs via foreground native accessibility; max_results "
-        "limits returned targets with or without a query. shadow=true explicitly opts into "
-        "background protocol metadata."
-    ),
-    "web_tree": (
-        "Get a background protocol DOM tree; requires explicit shadow=true and target_id from "
-        "list_tabs. Prefer tree(pid) for foreground browser work."
-    ),
-    "navigate": (
-        "Reuse a matching foreground tab before opening URL in the default browser. "
-        "shadow=true explicitly opts into a background target_id from list_tabs."
-    ),
-    "js": (
-        "Run JavaScript in a background protocol target_id from list_tabs; requires explicit "
-        "shadow=true."
-    ),
-    "press_key": (
-        "Press key/modifiers in the foreground app (optional pid). shadow=true explicitly uses "
-        "a background target_id from list_tabs."
-    ),
-    "wait": (
-        "Wait event-first for a foreground native element (pid). shadow=true explicitly waits "
-        "on a background target_id from list_tabs."
-    ),
-    "new_tab": (
-        "Reuse a matching foreground open tab, else open URL in the default browser. "
-        "shadow=true explicitly opens a background protocol tab."
-    ),
-    "close_tab": (
-        "Close a foreground tab; first list_tabs and prefer title/target_id. shadow=true "
-        "explicitly closes a background target_id."
-    ),
-    "dialog": (
-        "Handle a background JavaScript dialog by target_id; requires explicit shadow=true. "
-        "Use tree/click for a visible native dialog."
-    ),
-    "upload": (
-        "Set a DOM file input; requires explicit shadow=true and a web_tree snapshot. File paths "
-        "are canonicalized and must resolve to regular files outside protected locations."
-    ),
-    "scroll": (
-        "Scroll the foreground app (optional pid) via OS input. shadow=true explicitly scrolls "
-        "a background target_id."
-    ),
-    "drag": (
-        "Drag between screen points via foreground OS input. shadow=true explicitly drags in a "
-        "background target_id."
-    ),
-    "fill_form": (
-        "Fill tree [id]/value pairs in the foreground. shadow=true explicitly uses web_tree "
-        "snapshot fields."
-    ),
-    "hover": "Hover a tree [id] or screen x/y via foreground OS input.",
-    "app": "Launch, quit, or focus an app by name or bundle ID.",
-    "subtree": "Expand a prior tree [id] without fetching the whole app tree.",
-    "window": "List, focus, minimize, close, move, or resize native app windows.",
-    "context": "Return compact frontmost app, window, and focus context without a full tree.",
-    "shadow": (
-        "Explicit background Chromium legacy click/type/key/scroll/read/JS; never focuses the "
-        "visible browser."
-    ),
-    "pierce": (
-        "Inspect shadow-DOM elements in a background target_id from list_tabs; requires explicit "
-        "shadow=true."
-    ),
-    "install_check": "Compatibility readiness alias; prefer status and agent-eyes setup to repair.",
+    "status": "Readiness.",
+    "list_apps": "Apps/PIDs.",
+    "tree": "Foreground tree; explicit shadow=true.",
+    "find": "Find elements.",
+    "click": "Foreground click; coordinate click requires pid; explicit shadow=true.",
+    "type": "Foreground type; explicit shadow=true.",
+    "focused": "Focus.",
+    "list_tabs": "Foreground tabs, with or without query; explicit shadow=true.",
+    "web_tree": "DOM; explicit shadow=true.",
+    "navigate": "Foreground navigate; explicit shadow=true.",
+    "js": "JavaScript; explicit shadow=true.",
+    "press_key": "Foreground key; explicit shadow=true.",
+    "wait": "Foreground wait; explicit shadow=true.",
+    "new_tab": "Foreground tab; explicit shadow=true.",
+    "close_tab": "Foreground close; explicit shadow=true.",
+    "dialog": "Dialog; explicit shadow=true.",
+    "upload": "Canonical upload; explicit shadow=true.",
+    "scroll": "Foreground scroll; explicit shadow=true.",
+    "drag": "Foreground drag; explicit shadow=true.",
+    "fill_form": "Foreground fill; explicit shadow=true.",
+    "hover": "Foreground hover.",
+    "app": "App control.",
+    "subtree": "Subtree.",
+    "window": "Window control.",
+    "context": "Foreground context.",
+    "shadow": "Background Chromium.",
+    "pierce": "Shadow DOM; explicit shadow=true.",
+    "observe_target": "Foreground target + compact matches.",
+    "execute": "Bounded <=8-step transaction; explicit shadow=true.",
+    "install_check": "Readiness alias.",
 }
 
 if sys.platform != "darwin":
@@ -1158,6 +1221,8 @@ if sys.platform != "darwin":
 def _drop_schema_descriptions(value: object) -> None:
     if isinstance(value, dict):
         value.pop("description", None)
+        if value.get("required") == []:
+            value.pop("required")
         for child in value.values():
             _drop_schema_descriptions(child)
     elif isinstance(value, list):
@@ -1228,26 +1293,42 @@ def _required_runtime_capabilities(name: str, arguments: dict) -> frozenset[str]
     return frozenset()
 
 
+def _required_prepared_capabilities(
+    request: ExecuteRequest | ObserveTargetRequest,
+) -> frozenset[str]:
+    """Return capabilities from an already validated transaction request."""
+    if request.target.mode is TargetMode.SHADOW:
+        return frozenset()
+    if isinstance(request, ObserveTargetRequest):
+        required = {_NATIVE_CAPABILITY}
+        if request.intent is TargetIntent.INTERACT:
+            required.add(_INPUT_CAPABILITY)
+        return frozenset(required)
+    # Every foreground transaction activates or verifies its exact target before
+    # executing, including read-only transactions and native AX clicks.
+    return frozenset({_NATIVE_CAPABILITY, _INPUT_CAPABILITY})
+
+
 def _unavailable_runtime_capabilities(report, required: frozenset[str]) -> list:
     """Resolve unavailable required probes, tolerating narrow test doubles."""
     if not required:
         return []
     capability = getattr(report, "capability", None)
     if callable(capability):
-        return [probe for name in sorted(required) if not (probe := capability(name)).available]
+        return [
+            probe
+            for name in sorted(required)
+            if not (probe := capability(name)).available
+        ]
     return [] if bool(getattr(report, "core_ready", False)) else sorted(required)
 
 
 def _runtime_capability_error(unavailable: list) -> str:
     permission_required = any(
-        getattr(probe, "status", "") == "permission_required"
-        for probe in unavailable
+        getattr(probe, "status", "") == "permission_required" for probe in unavailable
     )
     status = "permission_required" if permission_required else "setup_required"
-    names = ", ".join(
-        getattr(probe, "name", str(probe))
-        for probe in unavailable
-    )
+    names = ", ".join(getattr(probe, "name", str(probe)) for probe in unavailable)
     return (
         f"ERROR: {status}: Required runtime capability unavailable: {names}.\n"
         "Recovery: agent-eyes setup"
@@ -1259,8 +1340,10 @@ async def list_tools() -> list[Tool]:
     return TOOLS
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
+async def _call_tool_core(
+    name: str,
+    arguments: dict,
+) -> list[TextContent] | CallToolResult:
     try:
         schema = _TOOL_SCHEMAS.get(name)
         if schema is None:
@@ -1269,8 +1352,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 content=[TextContent(type="text", text=bounded.text)],
                 isError=True,
             )
-        validate_tool_arguments(schema, arguments)
-        required_capabilities = _required_runtime_capabilities(name, arguments)
+        prepared: ExecuteRequest | ObserveTargetRequest | None = None
+        if name == "execute":
+            prepared = parse_execute_request(arguments)
+        elif name == "observe_target":
+            prepared = parse_observe_target_request(arguments)
+        else:
+            validate_tool_arguments(schema, arguments)
+        required_capabilities = (
+            _required_prepared_capabilities(prepared)
+            if prepared is not None
+            else _required_runtime_capabilities(name, arguments)
+        )
         if required_capabilities:
             runtime_readiness = await _ensure_runtime_readiness()
             unavailable = _unavailable_runtime_capabilities(
@@ -1278,7 +1371,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 required_capabilities,
             )
             if unavailable:
-                bounded = _result_formatter.format(_runtime_capability_error(unavailable))
+                bounded = _result_formatter.format(
+                    _runtime_capability_error(unavailable)
+                )
                 return CallToolResult(
                     content=[
                         TextContent(
@@ -1288,8 +1383,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     ],
                     isError=True,
                 )
-        result = await _dispatch(name, arguments)
-        bounded = _result_formatter.format(result)
+        result = (
+            await _dispatch_prepared(name, prepared)
+            if prepared is not None
+            else await _dispatch(name, arguments)
+        )
+        bounded = _result_formatter.format(
+            result,
+            byte_limit=_RESULT_BYTE_LIMITS.get(name),
+        )
         if result.startswith("ERROR:"):
             return CallToolResult(
                 content=[TextContent(type="text", text=bounded.text)],
@@ -1331,6 +1433,211 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             ],
             isError=True,
         )
+
+
+def _emit_transaction_call_trace(
+    *,
+    started_at: float,
+    response: list[TextContent] | CallToolResult | None,
+    cancelled: bool,
+    recorder,
+) -> None:
+    """Emit exactly one content-free trace for a transaction tool call."""
+    global _transaction_telemetry
+
+    try:
+        import json
+        import re
+
+        from .telemetry import (
+            TelemetryEmitter,
+            TelemetryResultCode,
+        )
+
+        if _transaction_telemetry is None:
+            _transaction_telemetry = TelemetryEmitter()
+        contents = (
+            []
+            if response is None
+            else list(
+                response.content if isinstance(response, CallToolResult) else response
+            )
+        )
+        rendered = "".join(
+            item.text for item in contents if isinstance(item, TextContent)
+        )
+        returned_bytes = len(rendered.encode("utf-8", errors="replace"))
+        truncation = re.search(r"\[truncated (\d+)B to \d+B\]\Z", rendered)
+        original_bytes = (
+            int(truncation.group(1)) if truncation is not None else returned_bytes
+        )
+        is_error = bool(
+            cancelled or (isinstance(response, CallToolResult) and response.isError)
+        )
+        if cancelled:
+            result_code = TelemetryResultCode.CANCELLED
+        elif not is_error:
+            result_code = TelemetryResultCode.SUCCESS
+        elif "permission_required" in rendered:
+            result_code = TelemetryResultCode.PERMISSION_REQUIRED
+        elif "setup_required" in rendered:
+            result_code = TelemetryResultCode.SETUP_REQUIRED
+        else:
+            result_code = next(
+                (code for code in OperationErrorCode if code.value in rendered),
+                TelemetryResultCode.UNEXPECTED_ERROR,
+            )
+
+        completed_steps = 0
+        candidate = rendered.removeprefix("ERROR: ")
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            value = payload.get("completed_steps", 0)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                completed_steps = value
+
+        _transaction_telemetry.emit(
+            recorder.finish_trace(
+                result_code=result_code,
+                total_ms=max(0.0, (time.monotonic() - started_at) * 1_000),
+                completed_steps=completed_steps,
+                original_output_bytes=original_bytes,
+                returned_output_bytes=returned_bytes,
+                truncated=truncation is not None,
+            )
+        )
+    except Exception:
+        # Tracing must never alter an MCP result or write to protocol stdout.
+        return
+
+
+def _current_transaction_recorder():
+    """Return request-local telemetry without making tracing a tool dependency."""
+    try:
+        from .telemetry import current_transaction_telemetry
+
+        return current_transaction_telemetry()
+    except Exception:
+        return None
+
+
+def _start_transaction_phase():
+    recorder = _current_transaction_recorder()
+    if recorder is None:
+        return None
+    try:
+        return recorder, recorder.start_phase()
+    except Exception:
+        return None
+
+
+def _finish_transaction_phase(handle, phase, *, exclude_ms: float = 0.0) -> None:
+    if handle is None:
+        return
+    recorder, started_at = handle
+    try:
+        recorder.finish_phase(phase, started_at, exclude_ms=exclude_ms)
+    except Exception:
+        return
+
+
+async def _measure_transaction_phase(phase, operation, *, exclude_phases=()):
+    """Await one operation and record a cancellation-safe exclusive duration."""
+    handle = _start_transaction_phase()
+    recorder = handle[0] if handle is not None else None
+    excluded_before = 0.0
+    if recorder is not None:
+        try:
+            excluded_before = sum(
+                float(recorder.phase_ms(excluded_phase))
+                for excluded_phase in exclude_phases
+            )
+        except Exception:
+            excluded_before = 0.0
+    try:
+        return await operation
+    finally:
+        excluded_after = excluded_before
+        if recorder is not None:
+            try:
+                excluded_after = sum(
+                    float(recorder.phase_ms(excluded_phase))
+                    for excluded_phase in exclude_phases
+                )
+            except Exception:
+                excluded_after = excluded_before
+        _finish_transaction_phase(
+            handle,
+            phase,
+            exclude_ms=max(0.0, excluded_after - excluded_before),
+        )
+
+
+def _record_transaction_cache_status(cache_status) -> None:
+    """Map only the resolver's closed cache enum into the trace allowlist."""
+    try:
+        from .target_resolver import InventoryCacheStatus
+        from .telemetry import TelemetryCacheState
+
+        mapping = {
+            InventoryCacheStatus.BYPASS: TelemetryCacheState.BYPASS,
+            InventoryCacheStatus.MISS: TelemetryCacheState.MISS,
+            InventoryCacheStatus.SHARED: TelemetryCacheState.SHARED,
+            InventoryCacheStatus.HIT: TelemetryCacheState.HIT,
+        }
+        recorder = _current_transaction_recorder()
+        mapped = mapping.get(cache_status)
+        if recorder is not None and mapped is not None:
+            recorder.record_cache_state(mapped)
+    except Exception:
+        return
+
+
+def _record_transaction_scan(nodes: int) -> None:
+    """Record a provider observation count without retaining observed content."""
+    recorder = _current_transaction_recorder()
+    if recorder is None:
+        return
+    try:
+        recorder.record_provider_scan(nodes)
+    except Exception:
+        return
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
+    if name not in {"observe_target", "execute"}:
+        return await _call_tool_core(name, arguments)
+
+    from .telemetry import (
+        TelemetryTool,
+        begin_transaction_telemetry,
+        reset_transaction_telemetry,
+    )
+
+    recorder, telemetry_token = begin_transaction_telemetry(TelemetryTool(name))
+    started_at = time.monotonic()
+    response: list[TextContent] | CallToolResult | None = None
+    cancelled = False
+    try:
+        response = await _call_tool_core(name, arguments)
+        return response
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        try:
+            _emit_transaction_call_trace(
+                started_at=started_at,
+                response=response,
+                cancelled=cancelled,
+                recorder=recorder,
+            )
+        finally:
+            reset_transaction_telemetry(telemetry_token)
 
 
 # Dispatch table — built lazily on first call so all handlers are defined.
@@ -1384,6 +1691,18 @@ async def _dispatch(name: str, args: dict) -> str:
     return result
 
 
+async def _dispatch_prepared(
+    name: str,
+    request: ExecuteRequest | ObserveTargetRequest,
+) -> str:
+    """Dispatch a transaction contract that was parsed exactly once by call_tool."""
+    if name == "observe_target" and isinstance(request, ObserveTargetRequest):
+        return await _handle_observe_target_request(request)
+    if name == "execute" and isinstance(request, ExecuteRequest):
+        return await _handle_execute_request(request)
+    return f"ERROR: {name} is not available in this build"
+
+
 # ── Native handlers ─────────────────────────────────────────────────
 async def _ensure_runtime_readiness(*, refresh: bool = False):
     """Await real provider readiness without blocking the MCP event loop."""
@@ -1410,19 +1729,25 @@ async def _ensure_runtime_readiness(*, refresh: bool = False):
         provider_loads = []
         if native_adapter is None:
             provider_loads.append(
-                ("native", native_worker.run(
-                    _get_native_adapter,
-                    budget=budget,
-                    operation="native provider construction",
-                ))
+                (
+                    "native",
+                    native_worker.run(
+                        _get_native_adapter,
+                        budget=budget,
+                        operation="native provider construction",
+                    ),
+                )
             )
         if _input_backend is None:
             provider_loads.append(
-                ("input", input_worker.run(
-                    load_input_provider,
-                    budget=budget,
-                    operation="input provider construction",
-                ))
+                (
+                    "input",
+                    input_worker.run(
+                        load_input_provider,
+                        budget=budget,
+                        operation="input provider construction",
+                    ),
+                )
             )
         if provider_loads:
             loaded = await asyncio.gather(*(item[1] for item in provider_loads))
@@ -1516,8 +1841,14 @@ def _snapshot_native_tree(
         generation=0,
         revision=time.monotonic_ns(),
         elements=records,
+        detach_ui_trees=True,
+        truncated=bool(pending),
     )
-    return snapshot.token, len(records), frozenset(record.local_id for record in records)
+    return (
+        snapshot.token,
+        len(records),
+        frozenset(record.local_id for record in records),
+    )
 
 
 def _resolve_action_element(
@@ -1531,7 +1862,9 @@ def _resolve_action_element(
     str,
 ]:
     element_id = args.get("id")
-    mode = OperationMode.SHADOW if args.get("shadow", False) else OperationMode.FOREGROUND
+    mode = (
+        OperationMode.SHADOW if args.get("shadow", False) else OperationMode.FOREGROUND
+    )
     if element_id is None:
         return None, None, mode, "", f"ERROR: {action}: id is required."
 
@@ -1750,11 +2083,24 @@ def _render_snapshot_tree(
     return "\n".join(lines)
 
 
-_INTERACTIVE_ROLES = frozenset({
-    "button", "link", "textfield", "textarea", "combobox",
-    "checkbox", "radiobutton", "slider", "menuitem", "tab",
-    "searchfield", "popupbutton", "switch", "togglebutton",
-})
+_INTERACTIVE_ROLES = frozenset(
+    {
+        "button",
+        "link",
+        "textfield",
+        "textarea",
+        "combobox",
+        "checkbox",
+        "radiobutton",
+        "slider",
+        "menuitem",
+        "tab",
+        "searchfield",
+        "popupbutton",
+        "switch",
+        "togglebutton",
+    }
+)
 
 _WEB_ROLES = frozenset({"webarea", "web area", "document"})
 
@@ -1811,7 +2157,8 @@ def _handle_find(args: dict) -> str:
         # Apply match-type filtering consistently on role, name, and value
         if match_type != "contains":
             elements = [
-                el for el in elements
+                el
+                for el in elements
                 if (not role or _match_text(role, el.role, match_type))
                 and (not name or _match_text(name, el.name, match_type))
                 and (not value or _match_text(value, el.value, match_type))
@@ -1938,7 +2285,9 @@ async def _verify_focus(
     compatibility; activation itself is intentionally attempted only once.
     """
     input_backend = _input_backend
-    operation_budget = budget or OperationBudget.start(timeout)
+    operation_budget = (
+        budget.child(timeout) if budget is not None else OperationBudget.start(timeout)
+    )
     if input_backend is None:
         return False, "Foreground input provider is unavailable"
     available = await input_worker.run(
@@ -2017,9 +2366,22 @@ async def _activate_browser_target_and_wait(
     budget: OperationBudget | None = None,
 ) -> bool:
     """Focus the exact native window, then select its provider-owned tab."""
-    operation_budget = budget or OperationBudget.start(timeout)
+    operation_budget = (
+        budget.child(timeout) if budget is not None else OperationBudget.start(timeout)
+    )
     if target.window_element is None:
         return False
+    already_active = await native_worker.run(
+        lambda: (
+            _browser_target_window_is_focused(target)
+            if target.source == "native-window"
+            else _browser_target_is_exactly_active(target)
+        ),
+        budget=operation_budget,
+        operation="exact browser target active-state check",
+    )
+    if already_active:
+        return True
     focus_ok, focus_error = await _verify_focus(
         target.pid,
         timeout=timeout,
@@ -2096,18 +2458,54 @@ def _persistent_runtime_exception(result: object) -> dict | None:
     return details if isinstance(details, dict) else None
 
 
-def _persistent_runtime_exception_is_stale(result: object) -> bool:
-    """Recognize only Agent Eyes' own pre-mutation stale-element marker."""
-    details = _persistent_runtime_exception(result)
-    if details is None:
-        return False
-    exception = details.get("exception")
-    candidates = [details.get("text")]
-    if isinstance(exception, dict):
-        candidates.extend((exception.get("description"), exception.get("value")))
-    return any(
-        isinstance(candidate, str) and "STALE_ELEMENT" in candidate
-        for candidate in candidates
+async def _assert_persistent_element_semantics(
+    session,
+    element: UIElement,
+    *,
+    budget: OperationBudget,
+) -> None:
+    """Fail before dispatch unless the exact AX node keeps its role and name."""
+    backend_id = element.platform_ref
+    result = await budget.wait_for(
+        session.send(
+            "Accessibility.getPartialAXTree",
+            {"backendNodeId": backend_id, "fetchRelatives": False},
+            idempotent=True,
+        ),
+        operation="shadow element AX identity validation",
+    )
+    if not ax_element_semantics_match(
+        result,
+        backend_node_id=backend_id,
+        expected_role=element.role,
+        expected_name=element.name,
+    ):
+        raise OperationError(
+            OperationErrorCode.STALE_SNAPSHOT,
+            "shadow element accessibility semantics changed",
+        )
+
+
+async def _persistent_element_has_exact_focus(
+    session,
+    element: UIElement,
+    *,
+    budget: OperationBudget,
+) -> bool:
+    backend_id = element.platform_ref
+    result = await budget.wait_for(
+        session.send(
+            "Accessibility.getPartialAXTree",
+            {"backendNodeId": backend_id, "fetchRelatives": False},
+            idempotent=True,
+        ),
+        operation="shadow element AX focus verification",
+    )
+    return ax_element_has_exact_focus(
+        result,
+        backend_node_id=backend_id,
+        expected_role=element.role,
+        expected_name=element.name,
     )
 
 
@@ -2134,6 +2532,7 @@ async def _handle_click(args: dict) -> str:
     element, snapshot, mode, action_key, error = _resolve_action_element(args, "click")
     if error:
         return error
+
     async def operation():
         return await _handle_click_resolved(
             args,
@@ -2141,6 +2540,7 @@ async def _handle_click(args: dict) -> str:
             snapshot=snapshot,
             budget=budget,
         )
+
     if mode is OperationMode.SHADOW:
         return await coordinator.execute_shadow(
             action_key,
@@ -2209,7 +2609,7 @@ async def _handle_click_resolved(
         return f"ERROR: click [{element_id}]: element not found in observation"
 
     # Validate element reference is still alive (app may have navigated, window closed)
-    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+    if hasattr(native_adapter, "is_element_valid") and element.source == "native":
         if not await native_worker.run(
             lambda: native_adapter.is_element_valid(element),
             budget=operation_budget,
@@ -2252,34 +2652,30 @@ async def _handle_click_resolved(
                     snapshot,
                     budget=operation_budget,
                 )
+                await _assert_persistent_element_semantics(
+                    session,
+                    element,
+                    budget=operation_budget,
+                )
                 dispatched = True
                 click_result = await operation_budget.wait_for(
                     session.send(
                         "Runtime.callFunctionOn",
                         {
-                            "functionDeclaration": (
-                                "function() { if (!this.isConnected) "
-                                "throw new Error('STALE_ELEMENT'); this.click(); }"
-                            ),
+                            "functionDeclaration": CLICK_FUNCTION,
                             "objectId": object_id,
+                            "awaitPromise": True,
+                            "returnByValue": True,
                         },
                     ),
                     operation="shadow click",
                 )
-                if _persistent_runtime_exception(click_result) is not None:
-                    _invalidate_shadow_observation(
-                        snapshot.provider,
-                        snapshot.target_id,
-                    )
-                    if _persistent_runtime_exception_is_stale(click_result):
-                        return (
-                            f"ERROR: click [{element_id}]: STALE_SNAPSHOT: "
-                            "shadow element disconnected before click"
-                        )
-                    return (
-                        f"ERROR: click [{element_id}]: OUTCOME_UNKNOWN: "
-                        "shadow click ended with a runtime exception"
-                    )
+                click_status = parse_runtime_action_status(
+                    click_result,
+                    allowed=frozenset({RuntimeActionStatus.CLICK_APPLIED}),
+                )
+                if click_status is not RuntimeActionStatus.CLICK_APPLIED:
+                    raise AssertionError("unreachable click action status")
                 _invalidate_shadow_observation(
                     snapshot.provider,
                     snapshot.target_id,
@@ -2331,6 +2727,7 @@ async def _handle_click_resolved(
                     cdp_client.click_element(
                         tab,
                         element.platform_ref,
+                        expected_element=element,
                         expected_revision=snapshot.revision,
                     ),
                     operation="legacy shadow click",
@@ -2426,7 +2823,9 @@ async def _handle_click_resolved(
             if clicked:
                 return f'clicked [{element_id}] {element.role} "{element.name}"'
 
-    return f"ERROR: Could not click [{element_id}]. Available actions: {element.actions}"
+    return (
+        f"ERROR: Could not click [{element_id}]. Available actions: {element.actions}"
+    )
 
 
 async def _handle_type(args: dict) -> str:
@@ -2436,6 +2835,7 @@ async def _handle_type(args: dict) -> str:
     element, snapshot, mode, action_key, error = _resolve_action_element(args, "type")
     if error:
         return error
+
     async def operation():
         return await _handle_type_resolved(
             element_id,
@@ -2444,6 +2844,7 @@ async def _handle_type(args: dict) -> str:
             snapshot=snapshot,
             budget=budget,
         )
+
     if mode is OperationMode.SHADOW:
         return await coordinator.execute_shadow(
             action_key,
@@ -2492,7 +2893,7 @@ async def _handle_type_resolved(
         )
 
     # Validate element reference is still alive (app may have navigated, window closed)
-    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+    if hasattr(native_adapter, "is_element_valid") and element.source == "native":
         if not await native_worker.run(
             lambda: native_adapter.is_element_valid(element),
             budget=operation_budget,
@@ -2538,35 +2939,34 @@ async def _handle_type_resolved(
                     snapshot,
                     budget=operation_budget,
                 )
+                await _assert_persistent_element_semantics(
+                    session,
+                    element,
+                    budget=operation_budget,
+                )
                 focus_dispatched = True
                 focus_result = await operation_budget.wait_for(
                     session.send(
-                        "Runtime.callFunctionOn",
-                        {
-                            "functionDeclaration": (
-                                "function() { if (!this.isConnected) "
-                                "throw new Error('STALE_ELEMENT'); this.focus(); }"
-                            ),
-                            "objectId": object_id,
-                        },
+                        "DOM.focus",
+                        {"backendNodeId": element.platform_ref},
                     ),
-                    operation="shadow element focus",
+                    operation="shadow element protocol focus",
                 )
-                focus_acknowledged = True
-                if _persistent_runtime_exception(focus_result) is not None:
+                require_empty_command_result(focus_result)
+                if not await _persistent_element_has_exact_focus(
+                    session,
+                    element,
+                    budget=operation_budget,
+                ):
                     _invalidate_shadow_observation(
                         snapshot.provider,
                         snapshot.target_id,
                     )
-                    if _persistent_runtime_exception_is_stale(focus_result):
-                        return (
-                            f"ERROR: type [{element_id}]: STALE_SNAPSHOT: "
-                            "shadow element disconnected; text was not sent"
-                        )
                     return (
-                        f"ERROR: type [{element_id}]: shadow focus failed; "
-                        "text was not sent"
+                        f"ERROR: type [{element_id}]: FOCUS_MISMATCH: exact shadow "
+                        "element focus was not proven; text was not sent"
                     )
+                focus_acknowledged = True
                 await _assert_persistent_snapshot_current(
                     session,
                     snapshot,
@@ -2674,9 +3074,19 @@ async def _handle_type_resolved(
                         tab,
                         element.platform_ref,
                         text,
+                        expected_element=element,
                         expected_revision=snapshot.revision,
                     ),
                     operation="legacy shadow text input",
+                )
+            except CDPFocusMismatchError:
+                _invalidate_shadow_observation(
+                    snapshot.provider,
+                    snapshot.target_id,
+                )
+                return (
+                    f"ERROR: type [{element_id}]: FOCUS_MISMATCH: exact shadow "
+                    "element focus was not proven; text was not sent"
                 )
             except CDPDocumentChangedError:
                 _invalidate_shadow_observation(
@@ -2761,7 +3171,7 @@ async def _handle_type_resolved(
     # keyDown, keyUp, textDidChange, input, change — works for both native and web.
     # SKIP for secure text fields — CGEvent will always fail, wastes 0.25s.
     keyboard_injected = False
-    if not is_secure and hasattr(native_adapter, 'focus_element') and input_available:
+    if not is_secure and hasattr(native_adapter, "focus_element") and input_available:
         focus_state = ProviderCallState()
         try:
             focus_result = await run_native_action_until(
@@ -2815,7 +3225,7 @@ async def _handle_type_resolved(
                 # Some apps (e.g. Jamf, secure input) silently ignore CGEvent
                 # keystrokes while AX set_value works.
                 verified = False
-                if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+                if element.platform_ref and hasattr(native_adapter, "_read_attr"):
                     current_val = await native_worker.run(
                         lambda: native_adapter._read_attr(
                             element.platform_ref,
@@ -2892,7 +3302,7 @@ async def _handle_type_resolved(
         if type_ok:
             # Verify text landed
             verified = False
-            if element.platform_ref and hasattr(native_adapter, '_read_attr'):
+            if element.platform_ref and hasattr(native_adapter, "_read_attr"):
                 current_val = await native_worker.run(
                     lambda: native_adapter._read_attr(
                         element.platform_ref,
@@ -2972,7 +3382,9 @@ async def _handle_get_focused_async() -> str:
         revision=time.monotonic_ns(),
         elements=[ElementRecord(local_id=element.id, value=element)],
     )
-    return f"snapshot={snapshot.token}\nFocused element:\n{element.to_text(max_depth=0)}"
+    return (
+        f"snapshot={snapshot.token}\nFocused element:\n{element.to_text(max_depth=0)}"
+    )
 
 
 # ── CDP handlers ────────────────────────────────────────────────────
@@ -2982,6 +3394,7 @@ _cached_tabs: list = []
 _tabs_lock = asyncio.Lock()  # Protects _cached_tabs from concurrent mutation
 _native_target_cache: dict[str, object] = {}
 _NATIVE_BROWSER_INVENTORY_FLIGHT = "native-browser-inventory"
+_transaction_target_resolver = None
 
 
 async def _collect_native_browser_targets(
@@ -2993,7 +3406,7 @@ async def _collect_native_browser_targets(
     async def collect() -> list:
         return await native_worker.run(
             lambda: collect_browser_targets(native_adapter),
-            budget=OperationBudget.start(5.0),
+            budget=budget.child(5.0),
             operation="foreground browser inventory",
         )
 
@@ -3004,20 +3417,1552 @@ async def _collect_native_browser_targets(
     )
 
 
+async def _transaction_target_inventory(provider, adapter, mode):
+    """Produce one provider-owned inventory for the transaction resolver."""
+    from .target_resolver import ProviderTarget
+
+    # The producer is shared across callers by TargetResolver. Its provider cap
+    # must not inherit the first waiter's shorter request deadline; each waiter
+    # independently applies its own budget while awaiting the shared task.
+    budget = OperationBudget.start(5.0)
+    if mode is TargetMode.FOREGROUND:
+        targets = await native_worker.run(
+            lambda: collect_browser_targets(adapter),
+            budget=budget.child(5.0),
+            operation="transaction browser inventory",
+        )
+        _record_transaction_scan(0)
+        return targets
+
+    tabs, provider_name = await _collect_explicit_shadow_tabs()
+    return [
+        ProviderTarget(
+            target_id=str(
+                tab.identifier if provider_name == "apple-events" else tab.id
+            ),
+            value=(provider_name, tab),
+        )
+        for tab in tabs
+    ]
+
+
+async def _activate_transaction_target(provider, adapter, target) -> bool:
+    """Activate one already resolved foreground target exactly once."""
+    from .telemetry import TelemetryPhase
+
+    phase = _start_transaction_phase()
+    try:
+        if target.browser_target is not None:
+            return await _activate_browser_target_and_wait(target.browser_target)
+        if target.pid is None:
+            return False
+        focused, _error = await _verify_focus(target.pid, timeout=0.75)
+        return focused
+    finally:
+        _finish_transaction_phase(phase, TelemetryPhase.ACTIVATION)
+
+
+def _get_transaction_target_resolver():
+    """Construct the resolver lazily to preserve fast tools/list startup."""
+    global _transaction_target_resolver
+
+    if _transaction_target_resolver is None:
+        from .target_resolver import TargetResolver
+
+        _transaction_target_resolver = TargetResolver(
+            _transaction_target_inventory,
+            _activate_transaction_target,
+        )
+    return _transaction_target_resolver
+
+
+@dataclass(frozen=True, slots=True)
+class _TransactionOpenResult:
+    """Outcome of one pre-armed browser open safety gate."""
+
+    action_dispatched: bool
+    opened: bool
+    observed_targets: tuple[object, ...] = ()
+    resolution_query: str = ""
+
+
+def _browser_pids_from_apps(apps) -> tuple[int, ...]:
+    """Return stable unique PIDs for every browser in an app inventory."""
+    return tuple(sorted(browser_names_for_apps(apps)))
+
+
+def _list_apps_complete():
+    """Read a complete app inventory without assuming every adapter override."""
+    list_complete = getattr(native_adapter, "list_apps_complete", None)
+    if callable(list_complete):
+        return list_complete()
+    return native_adapter.list_apps()
+
+
+def _list_browser_apps_complete():
+    """Return one complete app census and its browser observer cohort."""
+    apps = _list_apps_complete()
+    names = browser_names_for_apps(apps)
+    return apps, tuple(sorted(names)), names
+
+
+def _transaction_matching_targets(target) -> tuple[tuple[object, ...], str]:
+    """Return positive post-dispatch target evidence and its matching selector."""
+    targets = collect_browser_targets(native_adapter)
+    if best_browser_target(targets, target.query) is not None:
+        return tuple(targets), target.query
+    if best_browser_target(targets, target.url) is not None:
+        return tuple(targets), target.url
+    return (), ""
+
+
+async def _open_transaction_target_until_present(
+    target,
+    *,
+    budget: OperationBudget,
+) -> _TransactionOpenResult:
+    """Use one strict, pre-armed inventory before any browser-open dispatch."""
+    from .browser_inventory import BrowserQueryState
+
+    preliminary_apps, preliminary_pids, _preliminary_names = await native_worker.run(
+        _list_browser_apps_complete,
+        budget=budget,
+        operation="transaction browser process inventory",
+    )
+    action_state = ProviderCallState()
+    action_outcomes: list[tuple[bool, str]] = []
+    observed_targets: tuple[object, ...] = ()
+    resolution_query = ""
+    action_dispatched = False
+
+    def open_once() -> tuple[bool, str]:
+        nonlocal action_dispatched
+        action_dispatched = True
+        outcome = _pu.open_url_in_browser(target.url)
+        action_outcomes.append(outcome)
+        return outcome
+
+    def target_is_present() -> bool:
+        nonlocal observed_targets, resolution_query
+        if action_dispatched:
+            observed_targets, resolution_query = _transaction_matching_targets(target)
+            return bool(observed_targets)
+
+        current_apps, current_pids, current_names = _list_browser_apps_complete()
+        if current_pids != preliminary_pids:
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "browser processes changed during pre-dispatch verification",
+            )
+        targets = tuple(
+            collect_browser_targets(
+                native_adapter,
+                tree_depth=10,
+                require_complete=True,
+                apps=current_apps,
+                browser_names=current_names,
+            )
+        )
+        _final_apps, final_pids, _final_names = _list_browser_apps_complete()
+        if final_pids != preliminary_pids:
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "browser processes changed during pre-dispatch verification",
+            )
+        query_state = classify_browser_query(targets, target.query)
+        url_state = classify_browser_query(targets, target.url)
+        if query_state is BrowserQueryState.PRESENT:
+            observed_targets = targets
+            resolution_query = target.query
+            return True
+        if url_state is BrowserQueryState.PRESENT:
+            observed_targets = targets
+            resolution_query = target.url
+            return True
+        if (
+            query_state is BrowserQueryState.UNKNOWN
+            or url_state is BrowserQueryState.UNKNOWN
+        ):
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "native accessibility cannot prove the browser target is absent",
+            )
+        return False
+
+    def verify_browser_cohort_at_dispatch() -> None:
+        _apps, current_pids, _names = _list_browser_apps_complete()
+        if current_pids != preliminary_pids:
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "browser processes changed before action dispatch",
+            )
+
+    def opener_reported_failure() -> bool:
+        if not action_outcomes:
+            return False
+        outcome = action_outcomes[-1]
+        return bool(
+            isinstance(outcome, tuple)
+            and len(outcome) == 2
+            and isinstance(outcome[0], bool)
+            and not outcome[0]
+        )
+
+    try:
+        result = await run_native_action_until_any(
+            preliminary_pids,
+            open_once,
+            target_is_present,
+            timeout=min(1.5, budget.remaining()),
+            budget=budget,
+            action_worker=native_worker,
+            condition_worker=native_worker,
+            action_state=action_state,
+            skip_action_if_condition=True,
+            require_all_subscriptions=True,
+            abort_dispatch_on_change=True,
+            pre_dispatch_check=verify_browser_cohort_at_dispatch,
+        )
+    except (OperationError, asyncio.CancelledError) as exc:
+        if opener_reported_failure():
+            return _TransactionOpenResult(action_dispatched=True, opened=False)
+        if action_dispatched or action_state.may_have_run:
+            coordinator.poison_foreground_until(native_worker.wait_until_idle())
+            _invalidate_native_mutation_state()
+            raise _NativeMutationOutcomeUnknown(
+                "transaction default-browser open"
+            ) from exc
+        raise
+    except Exception as exc:
+        if opener_reported_failure():
+            return _TransactionOpenResult(action_dispatched=True, opened=False)
+        if action_dispatched or action_state.may_have_run:
+            _invalidate_native_mutation_state()
+            raise _NativeMutationOutcomeUnknown(
+                "transaction default-browser open"
+            ) from exc
+        raise
+
+    reported_dispatched = getattr(result, "action_dispatched", None)
+    reported_condition = getattr(result, "condition_met", None)
+    if (
+        not isinstance(reported_dispatched, bool)
+        or not isinstance(reported_condition, bool)
+        or not hasattr(result, "action_result")
+        or reported_dispatched != action_dispatched
+    ):
+        if action_dispatched or action_state.may_have_run:
+            _invalidate_native_mutation_state()
+            raise _NativeMutationOutcomeUnknown(
+                "transaction browser open observation validation"
+            )
+        raise OperationError(
+            OperationErrorCode.PROVIDER_BUSY,
+            "the native action observer returned an invalid result",
+        )
+
+    if not reported_dispatched:
+        return _TransactionOpenResult(
+            action_dispatched=False,
+            opened=False,
+            observed_targets=observed_targets,
+            resolution_query=resolution_query,
+        )
+
+    opened = result.action_result
+    if (
+        not isinstance(opened, tuple)
+        or len(opened) != 2
+        or not isinstance(opened[0], bool)
+    ):
+        _invalidate_native_mutation_state()
+        raise _NativeMutationOutcomeUnknown(
+            "transaction browser open result validation"
+        )
+    if not opened[0]:
+        return _TransactionOpenResult(
+            action_dispatched=True,
+            opened=False,
+            observed_targets=observed_targets,
+            resolution_query=resolution_query,
+        )
+    if not reported_condition:
+        _invalidate_native_mutation_state()
+        raise _NativeMutationOutcomeUnknown("transaction browser target visibility")
+    return _TransactionOpenResult(
+        action_dispatched=True,
+        opened=True,
+        observed_targets=observed_targets,
+        resolution_query=resolution_query,
+    )
+
+
+async def _resolve_transaction_target(
+    target,
+    *,
+    activate: bool,
+    budget: OperationBudget,
+):
+    """Resolve a typed transaction target under the shared call deadline."""
+    if target.mode is TargetMode.FOREGROUND:
+        provider_identity = native_worker
+        adapter_identity = native_adapter
+    else:
+        provider_identity = cdp_pool
+        adapter_identity = cdp_client
+    return await _get_transaction_target_resolver().resolve(
+        target,
+        provider_identity=provider_identity,
+        adapter_identity=adapter_identity,
+        activate=activate,
+        budget=budget,
+    )
+
+
+async def _resolve_persistent_transaction_target(
+    target,
+    *,
+    activate: bool,
+    budget: OperationBudget,
+):
+    """Resolve one explicit persistent-CDP target without probing other bridges."""
+    from .target_resolver import (
+        InventoryCacheStatus,
+        ProviderTarget,
+        ResolvedTarget,
+        ResolutionSource,
+        TargetResolution,
+    )
+
+    if activate or target.mode is not TargetMode.SHADOW or not target.target_id:
+        raise OperationError(
+            OperationErrorCode.MODE_MISMATCH,
+            "persistent CDP transactions require one exact shadow target",
+        )
+    try:
+        await budget.wait_for(
+            cdp_pool.ensure_connected(),
+            operation="persistent shadow transaction discovery",
+        )
+    except Exception as exc:
+        raise OperationError(
+            OperationErrorCode.UNSUPPORTED_CAPABILITY,
+            "the persistent CDP provider is unavailable",
+        ) from exc
+    matches = [tab for tab in cdp_pool.list_tabs() if tab.id == target.target_id]
+    if not matches:
+        raise OperationError(
+            OperationErrorCode.ELEMENT_NOT_FOUND,
+            "the exact persistent CDP target is unavailable",
+        )
+    if len(matches) > 1:
+        raise OperationError(
+            OperationErrorCode.AMBIGUOUS_TARGET,
+            "the persistent CDP target ID is not unique",
+        )
+    provider_target = ProviderTarget(
+        target_id=target.target_id,
+        value=("persistent", matches[0]),
+    )
+    return TargetResolution(
+        target=ResolvedTarget(
+            mode=TargetMode.SHADOW,
+            target_id=target.target_id,
+            pid=None,
+            source=ResolutionSource.EXACT,
+            provider_target=provider_target,
+        ),
+        cache_status=InventoryCacheStatus.BYPASS,
+        activated=False,
+    )
+
+
+async def _load_transaction_tree(adapter, pid, max_depth, budget):
+    return await native_worker.run(
+        lambda: adapter.get_tree(pid, max_depth=max_depth),
+        budget=budget.child(2.0),
+        operation="transaction accessibility tree",
+    )
+
+
+async def _load_transaction_subtree(adapter, window, max_depth, budget):
+    return await native_worker.run(
+        lambda: adapter.get_subtree(window, max_depth=max_depth),
+        budget=budget.child(2.0),
+        operation="transaction accessibility subtree",
+    )
+
+
+async def _validate_transaction_observation_target(
+    _adapter,
+    resolution,
+    budget: OperationBudget,
+) -> bool:
+    target = resolution.target.browser_target
+    if target is None:
+        return True
+    return bool(
+        await native_worker.run(
+            lambda: _browser_target_is_exactly_active(target),
+            budget=budget.child(0.2),
+            operation="transaction browser identity validation",
+        )
+    )
+
+
+class _TransactionTelemetryResolver:
+    """Time one resolver call without exposing its target specification."""
+
+    def __init__(self, resolver) -> None:
+        self._resolver = resolver
+
+    async def resolve(
+        self,
+        spec,
+        *,
+        provider_identity,
+        adapter_identity,
+        activate: bool = False,
+        budget: OperationBudget | None = None,
+    ):
+        from .telemetry import TelemetryPhase
+
+        resolution = await _measure_transaction_phase(
+            TelemetryPhase.RESOLUTION,
+            self._resolver.resolve(
+                spec,
+                provider_identity=provider_identity,
+                adapter_identity=adapter_identity,
+                activate=activate,
+                budget=budget,
+            ),
+            exclude_phases=(TelemetryPhase.ACTIVATION,),
+        )
+        _record_transaction_cache_status(resolution.cache_status)
+        return resolution
+
+
+def _instrument_transaction_ports(ports):
+    """Wrap provider-neutral ports with request-local content-free measurements."""
+    from .action_kernel import ActionPorts
+    from .target_resolver import TargetResolution
+    from .telemetry import TelemetryPhase
+    from .transactions import TransactionPorts, TransactionTarget, TransactionView
+
+    async def resolve(target, activate: bool, budget: OperationBudget, /):
+        resolved = await _measure_transaction_phase(
+            TelemetryPhase.RESOLUTION,
+            ports.resolve(target, activate, budget),
+            exclude_phases=(TelemetryPhase.ACTIVATION,),
+        )
+        if isinstance(resolved, TransactionTarget) and isinstance(
+            resolved.value, TargetResolution
+        ):
+            _record_transaction_cache_status(resolved.value.cache_status)
+        return resolved
+
+    async def observe(target, budget: OperationBudget, /):
+        view = await _measure_transaction_phase(
+            TelemetryPhase.OBSERVATION,
+            ports.observe(target, budget),
+        )
+        if isinstance(view, TransactionView):
+            _record_transaction_scan(len(view.index.elements))
+        return view
+
+    async def refresh(target, current, locator, budget: OperationBudget, /):
+        view = await _measure_transaction_phase(
+            TelemetryPhase.OBSERVATION,
+            ports.refresh(target, current, locator, budget),
+        )
+        if isinstance(view, TransactionView):
+            _record_transaction_scan(len(view.index.elements))
+        return view
+
+    def action_ports(step, element, target, /):
+        selected = ports.action_ports(step, element, target)
+        if not isinstance(selected, ActionPorts):
+            return selected
+
+        async def capability(budget: OperationBudget):
+            return await _measure_transaction_phase(
+                TelemetryPhase.WAIT,
+                selected.capability(budget),
+            )
+
+        focus = None
+        if selected.focus is not None:
+
+            async def focus(budget: OperationBudget):
+                return await _measure_transaction_phase(
+                    TelemetryPhase.WAIT,
+                    selected.focus(budget),
+                )
+
+        async def dispatch(budget: OperationBudget):
+            return await _measure_transaction_phase(
+                TelemetryPhase.ACTION,
+                selected.dispatch(budget),
+            )
+
+        return ActionPorts(
+            provider_code=selected.provider_code,
+            capability=capability,
+            focus=focus,
+            dispatch=dispatch,
+        )
+
+    return TransactionPorts(
+        resolve=resolve,
+        observe=observe,
+        refresh=refresh,
+        action_ports=action_ports,
+    )
+
+
+async def _handle_observe_target_request(request: ObserveTargetRequest) -> str:
+    """Run one exact foreground observation and return compact valid JSON."""
+    from .target_observation import TargetObservationService
+    from .telemetry import TelemetryPhase
+
+    budget = OperationBudget.start(request.deadline_ms / 1_000)
+    service = TargetObservationService(
+        _TransactionTelemetryResolver(_get_transaction_target_resolver()),
+        coordinator.observations,
+        tree_loader=_load_transaction_tree,
+        subtree_loader=_load_transaction_subtree,
+        provider="native",
+        target_validator=_validate_transaction_observation_target,
+    )
+    queue_phase = (
+        _start_transaction_phase() if request.intent is TargetIntent.INTERACT else None
+    )
+    queue_recorded = False
+
+    def finish_queue_phase() -> None:
+        nonlocal queue_recorded
+        if queue_recorded:
+            return
+        queue_recorded = True
+        _finish_transaction_phase(queue_phase, TelemetryPhase.QUEUE)
+
+    async def observe():
+        finish_queue_phase()
+        result = await _measure_transaction_phase(
+            TelemetryPhase.OBSERVATION,
+            service.observe(
+                request,
+                provider_identity=native_worker,
+                adapter_identity=native_adapter,
+                budget=budget,
+            ),
+            exclude_phases=(
+                TelemetryPhase.RESOLUTION,
+                TelemetryPhase.ACTIVATION,
+            ),
+        )
+        _record_transaction_scan(result.scan.available_nodes)
+        return result
+
+    if request.intent is TargetIntent.INTERACT:
+        try:
+            result = await coordinator.execute_foreground(
+                observe,
+                budget=budget,
+                operation_manages_deadline=True,
+            )
+        finally:
+            finish_queue_phase()
+    else:
+        result = await observe()
+    return result.to_json()
+
+
+async def _handle_execute_request(request: ExecuteRequest) -> str:
+    """Run one validated transaction under one target-scoped coordinator slot."""
+    from .telemetry import TelemetryPhase
+    from .transactions import TransactionEngine, TransactionStatus
+
+    budget = OperationBudget.start(request.deadline_ms / 1_000)
+    if request.target.mode is TargetMode.SHADOW:
+        from .shadow_transactions import PersistentCDPTransactionRuntime
+
+        runtime = PersistentCDPTransactionRuntime(
+            request,
+            resolver=_resolve_persistent_transaction_target,
+            session_for_target=cdp_pool.get_session_for_target,
+            observation_store=coordinator.observations,
+            cdp_client=cdp_client,
+        )
+    else:
+        runtime = _ForegroundTransactionRuntime(request)
+    ports = _instrument_transaction_ports(runtime.ports())
+    queue_phase = _start_transaction_phase()
+    queue_recorded = False
+
+    def finish_queue_phase() -> None:
+        nonlocal queue_recorded
+        if queue_recorded:
+            return
+        queue_recorded = True
+        _finish_transaction_phase(queue_phase, TelemetryPhase.QUEUE)
+
+    async def execute():
+        finish_queue_phase()
+        result = await TransactionEngine().run(
+            request,
+            ports=ports,
+            budget=budget,
+        )
+        if (
+            request.target.mode is TargetMode.SHADOW
+            and result.status is TransactionStatus.OUTCOME_UNKNOWN
+        ):
+            recovery = runtime.pending_dispatch_recovery()
+            if recovery is not None:
+                coordinator.poison_shadow_until(request.target.target_id, recovery)
+        return result
+
+    try:
+        if request.target.mode is TargetMode.SHADOW:
+            result = await coordinator.execute_shadow(
+                request.target.target_id,
+                execute,
+                budget=budget,
+                operation_manages_deadline=True,
+            )
+        else:
+            result = await coordinator.execute_foreground(
+                execute,
+                budget=budget,
+                operation_manages_deadline=True,
+            )
+    finally:
+        finish_queue_phase()
+    return _format_transaction_result(result)
+
+
+def _format_transaction_result(result) -> str:
+    """Render only the stable, content-free transaction result fields."""
+    import json
+
+    payload = {
+        "status": result.status.value,
+        "target_id": result.target_id,
+        "completed_steps": result.completed_steps,
+        "elapsed_ms": result.elapsed_ms,
+        "retry_safe": result.retry_safe,
+        "final_expectation": result.final_expectation,
+        "snapshot": result.snapshot,
+    }
+    if result.code is not None:
+        payload["code"] = result.code.value
+    if result.failed_step is not None:
+        payload["failed_step"] = result.failed_step
+    rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return rendered if result.status.value == "succeeded" else f"ERROR: {rendered}"
+
+
+class _ForegroundTransactionRuntime:
+    """Bind one transaction to exact native provider references and snapshots."""
+
+    _MAX_DEPTH = 10
+    _MAX_SNAPSHOT_ELEMENTS = 500
+
+    def __init__(self, request: ExecuteRequest) -> None:
+        self._request = request
+        self._resolution = None
+        self._root: UIElement | None = None
+        self._scope_anchor: UIElement | None = None
+        self._pending_root: UIElement | None = None
+        self._pending_error: OperationError | None = None
+        self._alias_locators = {
+            step.alias: step.locator
+            for step in request.steps
+            if step.alias and step.locator is not None
+        }
+        self._completion_locators = {
+            step.index: self._completion_locator(step.index) for step in request.steps
+        }
+
+    def ports(self):
+        from .transactions import TransactionPorts
+
+        return TransactionPorts(
+            resolve=self.resolve,
+            observe=self.observe,
+            refresh=self.refresh,
+            action_ports=self.action_ports,
+        )
+
+    def _completion_locator(self, step_index: int):
+        step = self._request.steps[step_index]
+        if step.expect is not None:
+            return step.expect
+        for later in self._request.steps[step_index + 1 :]:
+            if later.locator is not None:
+                return later.locator
+        return self._request.final_expect
+
+    async def resolve(
+        self,
+        target,
+        activate: bool,
+        budget: OperationBudget,
+        /,
+    ):
+        from .transactions import TransactionTarget
+
+        if target.mode is TargetMode.SHADOW:
+            raise OperationError(
+                OperationErrorCode.UNSUPPORTED_CAPABILITY,
+                "explicit shadow transactions are unavailable for this provider",
+            )
+        opened_target = False
+        if not target.open_if_missing:
+            resolution = await _resolve_transaction_target(
+                target,
+                activate=activate,
+                budget=budget,
+            )
+        else:
+            try:
+                open_result = await _open_transaction_target_until_present(
+                    target,
+                    budget=budget,
+                )
+            except _NativeMutationOutcomeUnknown as unknown:
+                _invalidate_native_mutation_state()
+                raise OperationError(
+                    OperationErrorCode.OUTCOME_UNKNOWN,
+                    "the requested browser target may have opened",
+                ) from unknown
+
+            if open_result.observed_targets:
+                if open_result.action_dispatched:
+                    opened_target = True
+                    _invalidate_native_mutation_state()
+                resolver = _get_transaction_target_resolver()
+                resolver.prime_inventory(
+                    provider_identity=native_worker,
+                    adapter_identity=native_adapter,
+                    mode=TargetMode.FOREGROUND,
+                    targets=open_result.observed_targets,
+                )
+                resolution_target = replace(
+                    target,
+                    query=open_result.resolution_query or target.query,
+                    url="",
+                    open_if_missing=False,
+                )
+                try:
+                    resolution = await _resolve_transaction_target(
+                        resolution_target,
+                        activate=activate,
+                        budget=budget,
+                    )
+                except (OperationError, asyncio.CancelledError) as retry_error:
+                    if not open_result.action_dispatched:
+                        raise
+                    raise OperationError(
+                        OperationErrorCode.OUTCOME_UNKNOWN,
+                        "the requested browser target opened but is not safely reusable yet",
+                    ) from retry_error
+                except Exception as retry_error:
+                    if not open_result.action_dispatched:
+                        raise
+                    raise OperationError(
+                        OperationErrorCode.OUTCOME_UNKNOWN,
+                        "the requested browser target opened but its state is unknown",
+                    ) from retry_error
+            elif not open_result.opened:
+                raise OperationError(
+                    OperationErrorCode.UNSUPPORTED_CAPABILITY,
+                    "the operating system could not open the requested browser target",
+                )
+            else:
+                opened_target = True
+                _invalidate_native_mutation_state()
+                try:
+                    resolution = await _resolve_transaction_target(
+                        target,
+                        activate=activate,
+                        budget=budget,
+                    )
+                except (OperationError, asyncio.CancelledError) as retry_error:
+                    raise OperationError(
+                        OperationErrorCode.OUTCOME_UNKNOWN,
+                        "the requested browser target opened but is not safely reusable yet",
+                    ) from retry_error
+                except Exception as retry_error:
+                    raise OperationError(
+                        OperationErrorCode.OUTCOME_UNKNOWN,
+                        "the requested browser target opened but its state is unknown",
+                    ) from retry_error
+        self._resolution = resolution
+        return TransactionTarget(
+            target_id=resolution.target.target_id,
+            replay_unsafe=opened_target,
+            value=resolution,
+        )
+
+    async def observe(self, _target, budget: OperationBudget, /):
+        snapshot_token = self._request.target.snapshot
+        if snapshot_token:
+            try:
+                scoped_refresh = self._bind_snapshot_scope(snapshot_token)
+            except OperationError as exc:
+                if exc.code is not OperationErrorCode.STALE_SNAPSHOT:
+                    raise
+            else:
+                root = await self._load_root(
+                    initial=not scoped_refresh,
+                    budget=budget,
+                )
+                return self._view_from_root(root)
+        root = await self._load_root(initial=True, budget=budget)
+        return self._view_from_root(root)
+
+    async def refresh(self, _target, _current, _locator, budget, /):
+        pending_error = self._pending_error
+        self._pending_error = None
+        if pending_error is not None:
+            self._pending_root = None
+            raise pending_error
+        root = self._pending_root
+        self._pending_root = None
+        if root is None:
+            root = await self._load_root(initial=False, budget=budget)
+        return self._view_from_root(root)
+
+    def action_ports(self, step, element, _target, /):
+        resolution = self._require_resolution()
+        locator = self._completion_locators.get(step.index)
+        condition = (
+            (lambda: self._capture_completion(locator))
+            if locator is not None
+            else (lambda: True)
+        )
+        return _transaction_action_ports(
+            step,
+            element,
+            resolution.target,
+            completion_condition=condition,
+        )
+
+    async def _load_root(
+        self,
+        *,
+        initial: bool,
+        budget: OperationBudget,
+    ) -> UIElement:
+        resolution = self._require_resolution()
+        target = resolution.target
+        if initial:
+            if target.browser_target is not None:
+                anchor = target.browser_target.window_element
+                if anchor is None or anchor.platform_ref is None:
+                    raise OperationError(
+                        OperationErrorCode.STALE_SNAPSHOT,
+                        "the resolved browser window reference is unavailable",
+                    )
+                self._scope_anchor = anchor
+                root = await _load_transaction_subtree(
+                    native_adapter,
+                    anchor,
+                    self._MAX_DEPTH,
+                    budget,
+                )
+            elif target.pid is not None:
+                root = await _load_transaction_tree(
+                    native_adapter,
+                    target.pid,
+                    self._MAX_DEPTH,
+                    budget,
+                )
+                self._scope_anchor = root
+            else:
+                root = None
+        else:
+            anchor = self._scope_anchor
+            if anchor is None or anchor.platform_ref is None:
+                raise OperationError(
+                    OperationErrorCode.STALE_SNAPSHOT,
+                    "the transaction scope is no longer available",
+                )
+            root = await _load_transaction_subtree(
+                native_adapter,
+                anchor,
+                self._MAX_DEPTH,
+                budget,
+            )
+        if root is None:
+            raise OperationError(
+                OperationErrorCode.ELEMENT_NOT_FOUND,
+                "the transaction target did not expose an accessibility scope",
+            )
+        return root
+
+    def _capture_completion(self, locator) -> tuple[bool, int]:
+        from .locators import LocatorIndex
+
+        anchor = self._scope_anchor
+        resolution = self._require_resolution()
+        if anchor is None or anchor.platform_ref is None or native_adapter is None:
+            return False, 0
+        root = native_adapter.get_subtree(anchor, max_depth=self._MAX_DEPTH)
+        if root is None:
+            return False, 0
+        self._assign_pid(root, resolution.target.pid)
+        index = LocatorIndex.from_roots(root)
+        nodes_scanned = len(index.elements)
+        scoped_aliases: dict[str, UIElement] = {}
+        resolving: set[str] = set()
+
+        def resolve_scope(alias: str) -> None:
+            if alias in scoped_aliases:
+                return
+            definition = self._alias_locators.get(alias)
+            if definition is None or alias in resolving:
+                raise OperationError(
+                    OperationErrorCode.ELEMENT_NOT_FOUND,
+                    "completion scope is unavailable in the current revision",
+                )
+            resolving.add(alias)
+            try:
+                if definition.within:
+                    resolve_scope(definition.within)
+                scoped_aliases[alias] = index.resolve_unique(
+                    definition,
+                    aliases=scoped_aliases,
+                )
+            finally:
+                resolving.remove(alias)
+
+        try:
+            if locator.within:
+                resolve_scope(locator.within)
+            matches = index.find(locator, aliases=scoped_aliases)
+        except OperationError as exc:
+            if exc.code is OperationErrorCode.ELEMENT_NOT_FOUND:
+                return False, nodes_scanned
+            self._pending_error = exc
+            self._pending_root = root
+            return True, nodes_scanned
+        if len(matches) > 1:
+            self._pending_error = OperationError(
+                OperationErrorCode.AMBIGUOUS_ELEMENT,
+                "the completion locator matched multiple elements",
+            )
+            self._pending_root = root
+            return True, nodes_scanned
+        if not matches:
+            return False, nodes_scanned
+        self._pending_root = root
+        return True, nodes_scanned
+
+    def _bind_snapshot_scope(self, token: str) -> bool:
+        """Bind the exact scope, then require a live scoped refresh before use."""
+        resolution = self._require_resolution()
+        snapshot = coordinator.observations.get_snapshot(
+            token,
+            expected_provider="native",
+            expected_mode=OperationMode.FOREGROUND,
+            expected_target_id=resolution.target.target_id,
+        )
+        elements = tuple(
+            record.value
+            for record in snapshot.elements
+            if isinstance(record.value, UIElement)
+        )
+        if not elements:
+            raise OperationError(
+                OperationErrorCode.STALE_SNAPSHOT,
+                "the supplied snapshot contains no native elements",
+            )
+        self._root = elements[0]
+        browser_target = resolution.target.browser_target
+        if browser_target is None:
+            # Legacy find snapshots can contain only a matching descendant.
+            # A PID transaction therefore validates the token/target binding,
+            # then reloads the complete PID tree instead of treating the first
+            # stored match as its scope root.
+            self._scope_anchor = None
+            return False
+        anchor = browser_target.window_element
+        if anchor is None or anchor.platform_ref is None:
+            raise OperationError(
+                OperationErrorCode.STALE_SNAPSHOT,
+                "the resolved browser window reference is unavailable",
+            )
+        self._scope_anchor = anchor
+        return True
+
+    def _view_from_root(self, root: UIElement):
+        from .locators import LocatorIndex
+        from .transactions import TransactionView
+
+        resolution = self._require_resolution()
+        self._root = root
+        self._assign_pid(root, resolution.target.pid)
+        index = LocatorIndex.from_roots(root)
+        unique_records: list[ElementRecord] = []
+        local_ids: set[int] = set()
+        for element in index.elements:
+            if element.id in local_ids:
+                continue
+            unique_records.append(ElementRecord(local_id=element.id, value=element))
+            local_ids.add(element.id)
+            if len(unique_records) >= self._MAX_SNAPSHOT_ELEMENTS:
+                break
+        snapshot = coordinator.observations.create(
+            provider="native",
+            mode=OperationMode.FOREGROUND,
+            target_id=resolution.target.target_id,
+            generation=0,
+            revision=time.monotonic_ns(),
+            elements=unique_records,
+            detach_ui_trees=True,
+            truncated=len(unique_records) < len(index.elements),
+        )
+        return TransactionView(index=index, snapshot=snapshot.token)
+
+    def _require_resolution(self):
+        if self._resolution is None:
+            raise OperationError(
+                OperationErrorCode.TARGET_MISMATCH,
+                "the transaction target is unresolved",
+            )
+        return self._resolution
+
+    @staticmethod
+    def _assign_pid(root: UIElement, pid: int | None) -> None:
+        if pid is None:
+            return
+        stack = [root]
+        visited: set[int] = set()
+        while stack:
+            element = stack.pop()
+            identity = id(element)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            element.pid = pid
+            stack.extend(reversed(element.children))
+
+
+async def _transaction_target_is_active(target, budget: OperationBudget) -> bool:
+    """Verify the resolved foreground target without activating it again."""
+    if target.browser_target is not None:
+        return await native_worker.run(
+            lambda: _browser_target_is_exactly_active(target.browser_target),
+            budget=budget.child(0.2),
+            operation="transaction browser focus verification",
+        )
+    input_backend = _input_backend
+    if input_backend is None or target.pid is None:
+        return False
+    return bool(
+        await input_worker.run(
+            lambda: input_backend.is_frontmost(target.pid),
+            budget=budget.child(0.2),
+            operation="transaction app focus verification",
+        )
+    )
+
+
+async def _run_transaction_mutation_until(
+    call,
+    condition,
+    *,
+    pid: int | None,
+    budget: OperationBudget,
+    operation: str,
+    action_worker: ProviderWorker,
+):
+    """Register completion observation, dispatch once, and never replay."""
+    if pid is None:
+        return await _run_native_mutation(
+            call,
+            budget=budget.child(0.75),
+            operation=operation,
+            worker=action_worker,
+        )
+
+    action_state = ProviderCallState()
+    completion_scan_nodes: list[int] = []
+
+    def tracked_condition() -> bool:
+        observed = condition()
+        if not isinstance(observed, tuple):
+            return bool(observed)
+        if len(observed) != 2:
+            raise TypeError("transaction completion observations must be (matched, nodes)")
+        matched, nodes = observed
+        if isinstance(nodes, bool) or not isinstance(nodes, int) or nodes < 0:
+            raise TypeError("transaction completion node counts must be non-negative integers")
+        completion_scan_nodes.append(nodes)
+        return bool(matched)
+
+    try:
+        result = await run_native_action_until(
+            pid,
+            call,
+            tracked_condition,
+            timeout=min(0.75, budget.remaining()),
+            budget=budget,
+            action_worker=action_worker,
+            condition_worker=native_worker,
+            action_state=action_state,
+        )
+    except (OperationError, asyncio.CancelledError) as exc:
+        if action_state.may_have_run:
+
+            async def recover_workers() -> None:
+                await asyncio.gather(
+                    action_worker.wait_until_idle(),
+                    native_worker.wait_until_idle(),
+                )
+
+            coordinator.poison_foreground_until(recover_workers())
+            raise _NativeMutationOutcomeUnknown(operation) from exc
+        raise
+    finally:
+        for nodes in completion_scan_nodes:
+            _record_transaction_scan(nodes)
+    if not result.condition_met and result.action_result:
+        raise _NativeMutationOutcomeUnknown(operation)
+    return result.action_result
+
+
+def _transaction_action_ports(
+    step,
+    element: UIElement | None,
+    target,
+    *,
+    completion_condition=None,
+):
+    """Select one provider action for a validated foreground transaction step."""
+    from .action_kernel import ActionDispatchResult, ActionPorts
+
+    condition = completion_condition or (lambda: True)
+
+    async def target_focused(budget: OperationBudget) -> bool:
+        return await _transaction_target_is_active(target, budget)
+
+    async def native_element_available(budget: OperationBudget) -> bool:
+        if native_adapter is None or element is None:
+            return False
+        return bool(
+            await native_worker.run(
+                lambda: native_adapter.is_element_valid(element),
+                budget=budget.child(0.2),
+                operation="transaction element validity",
+            )
+        )
+
+    async def physical_input_available(budget: OperationBudget) -> bool:
+        if _input_backend is None:
+            return False
+        return bool(
+            await input_worker.run(
+                _input_backend.is_available,
+                budget=budget.child(0.2),
+                operation="transaction input capability",
+            )
+        )
+
+    async def element_input_available(budget: OperationBudget) -> bool:
+        return await native_element_available(
+            budget,
+        ) and await physical_input_available(budget)
+
+    async def exact_pointer_target(budget: OperationBudget) -> bool:
+        if element is None or element.bounds is None or native_adapter is None:
+            return False
+        x, y, width, height = element.bounds
+        center_x = x + width // 2
+        center_y = y + height // 2
+
+        def matches() -> bool:
+            hit = native_adapter.element_at_position(center_x, center_y)
+            return bool(
+                hit is not None and native_adapter.is_same_element(element, hit)
+            )
+
+        return bool(
+            await native_worker.run(
+                matches,
+                budget=budget.child(0.2),
+                operation="transaction pointer target verification",
+            )
+        )
+
+    async def exact_element_focused(budget: OperationBudget) -> bool:
+        if element is None or native_adapter is None:
+            return False
+        if not await target_focused(budget):
+            return False
+
+        def is_focused() -> bool:
+            focused = native_adapter.get_focused_element()
+            return bool(
+                focused is not None and native_adapter.is_same_element(element, focused)
+            )
+
+        if await native_worker.run(
+            is_focused,
+            budget=budget.child(0.2),
+            operation="transaction element focus check",
+        ):
+            return True
+        focused = await native_worker.run(
+            lambda: native_adapter.focus_element(element),
+            budget=budget.child(0.35),
+            operation="transaction element focus",
+        )
+        if not focused:
+            return False
+        return bool(
+            await native_worker.run(
+                is_focused,
+                budget=budget.child(0.2),
+                operation="transaction exact element focus verification",
+            )
+        )
+
+    def receipt(succeeded: object):
+        if succeeded:
+            return ActionDispatchResult.succeeded(changed=True)
+        return ActionDispatchResult.failed(
+            OperationErrorCode.OUTCOME_UNKNOWN,
+        )
+
+    if step.operation.value == "click" and element is not None:
+        available_actions = {action.casefold(): action for action in element.actions}
+        action = next(
+            (
+                available_actions[name]
+                for name in ("press", "click", "confirm", "open")
+                if name in available_actions
+            ),
+            None,
+        )
+        if action is not None:
+
+            async def dispatch_native(budget: OperationBudget):
+                try:
+                    succeeded = await _run_transaction_mutation_until(
+                        lambda: native_adapter.perform_action(element, action),
+                        condition,
+                        pid=target.pid,
+                        budget=budget,
+                        operation="transaction native click",
+                        action_worker=native_worker,
+                    )
+                finally:
+                    _invalidate_native_mutation_state(
+                        pid=target.pid,
+                        target_id=target.target_id,
+                    )
+                if succeeded:
+                    return ActionDispatchResult.succeeded(changed=True)
+                return ActionDispatchResult.failed(
+                    OperationErrorCode.OUTCOME_UNKNOWN,
+                )
+
+            return ActionPorts(
+                provider_code="native.ax",
+                capability=native_element_available,
+                focus=target_focused,
+                dispatch=dispatch_native,
+            )
+
+        if element.bounds is not None:
+
+            async def input_available(budget: OperationBudget) -> bool:
+                if _input_backend is None or not await native_element_available(budget):
+                    return False
+                return bool(
+                    await input_worker.run(
+                        _input_backend.is_available,
+                        budget=budget.child(0.2),
+                        operation="transaction pointer capability",
+                    )
+                )
+
+            async def dispatch_coordinate(budget: OperationBudget):
+                x, y, width, height = element.bounds
+                if not await exact_pointer_target(budget):
+                    return ActionDispatchResult.failed(
+                        OperationErrorCode.FOCUS_MISMATCH,
+                        retry_safe=True,
+                    )
+                try:
+                    succeeded = await _run_transaction_mutation_until(
+                        lambda: _input_backend.click(
+                            x + width // 2,
+                            y + height // 2,
+                        ),
+                        condition,
+                        pid=target.pid,
+                        budget=budget,
+                        operation="transaction coordinate click",
+                        action_worker=input_worker,
+                    )
+                finally:
+                    _invalidate_native_mutation_state(
+                        pid=target.pid,
+                        target_id=target.target_id,
+                    )
+                if succeeded:
+                    return ActionDispatchResult.succeeded(changed=True)
+                return ActionDispatchResult.failed(
+                    OperationErrorCode.OUTCOME_UNKNOWN,
+                )
+
+            return ActionPorts(
+                provider_code="native.input",
+                capability=input_available,
+                focus=target_focused,
+                dispatch=dispatch_coordinate,
+            )
+
+    if step.operation.value == "type" and element is not None:
+        if "secure" in {state.casefold() for state in element.states}:
+
+            async def dispatch_secure_value(budget: OperationBudget):
+                try:
+                    succeeded = await _run_transaction_mutation_until(
+                        lambda: native_adapter.set_value(element, step.text),
+                        condition,
+                        pid=target.pid,
+                        budget=budget,
+                        operation="transaction secure value set",
+                        action_worker=native_worker,
+                    )
+                finally:
+                    _invalidate_native_mutation_state(
+                        pid=target.pid,
+                        target_id=target.target_id,
+                    )
+                return receipt(succeeded)
+
+            return ActionPorts(
+                provider_code="native.ax",
+                capability=native_element_available,
+                focus=target_focused,
+                dispatch=dispatch_secure_value,
+            )
+
+        is_web = "scrolltovisible" in {action.casefold() for action in element.actions}
+
+        async def dispatch_text(budget: OperationBudget):
+            try:
+                if is_web:
+                    succeeded = await _run_transaction_mutation_until(
+                        lambda: _input_backend.type_text(step.text),
+                        condition,
+                        pid=target.pid,
+                        budget=budget,
+                        operation="transaction web text input",
+                        action_worker=input_worker,
+                    )
+                else:
+                    succeeded = await _run_transaction_mutation_until(
+                        lambda: _input_backend.clear_and_type(step.text),
+                        condition,
+                        pid=target.pid,
+                        budget=budget,
+                        operation="transaction native text input",
+                        action_worker=input_worker,
+                    )
+            finally:
+                _invalidate_native_mutation_state(
+                    pid=target.pid,
+                    target_id=target.target_id,
+                )
+            return receipt(succeeded)
+
+        return ActionPorts(
+            provider_code="native.input",
+            capability=element_input_available,
+            focus=exact_element_focused,
+            dispatch=dispatch_text,
+        )
+
+    if step.operation.value == "press_key" and element is not None:
+        key_map = {
+            "enter": "return",
+            "arrowup": "up",
+            "arrowdown": "down",
+            "arrowleft": "left",
+            "arrowright": "right",
+            "backspace": "delete",
+            "pageup": "page_up",
+            "pagedown": "page_down",
+        }
+        native_key = key_map.get(step.key.casefold(), step.key.casefold())
+
+        async def dispatch_key(budget: OperationBudget):
+            try:
+                succeeded = await _run_transaction_mutation_until(
+                    lambda: _input_backend.press_key(native_key),
+                    condition,
+                    pid=target.pid,
+                    budget=budget,
+                    operation="transaction key input",
+                    action_worker=input_worker,
+                )
+            finally:
+                _invalidate_native_mutation_state(
+                    pid=target.pid,
+                    target_id=target.target_id,
+                )
+            return receipt(succeeded)
+
+        return ActionPorts(
+            provider_code="native.input",
+            capability=element_input_available,
+            focus=exact_element_focused,
+            dispatch=dispatch_key,
+        )
+
+    if step.operation.value == "hover" and element is not None and element.bounds:
+
+        async def dispatch_hover(budget: OperationBudget):
+            x, y, width, height = element.bounds
+            if not await exact_pointer_target(budget):
+                return ActionDispatchResult.failed(
+                    OperationErrorCode.FOCUS_MISMATCH,
+                    retry_safe=True,
+                )
+            try:
+                succeeded = await _run_transaction_mutation_until(
+                    lambda: _input_backend.move_mouse(
+                        x + width // 2,
+                        y + height // 2,
+                    ),
+                    condition,
+                    pid=target.pid,
+                    budget=budget,
+                    operation="transaction pointer hover",
+                    action_worker=input_worker,
+                )
+            finally:
+                _invalidate_native_mutation_state(
+                    pid=target.pid,
+                    target_id=target.target_id,
+                )
+            return receipt(succeeded)
+
+        return ActionPorts(
+            provider_code="native.input",
+            capability=element_input_available,
+            focus=target_focused,
+            dispatch=dispatch_hover,
+        )
+
+    if step.operation.value == "scroll":
+        x, y = 400, 400
+        if element is not None and element.bounds:
+            left, top, width, height = element.bounds
+            x, y = left + width // 2, top + height // 2
+
+        def wheel_steps(delta: int) -> int:
+            if not delta:
+                return 0
+            bounded = max(-20, min(20, int(round(delta / 100))))
+            return bounded or (1 if delta > 0 else -1)
+
+        async def scroll_available(budget: OperationBudget) -> bool:
+            if element is not None and not await native_element_available(budget):
+                return False
+            return await physical_input_available(budget)
+
+        async def dispatch_scroll(budget: OperationBudget):
+            if element is not None and not await exact_pointer_target(budget):
+                return ActionDispatchResult.failed(
+                    OperationErrorCode.FOCUS_MISMATCH,
+                    retry_safe=True,
+                )
+            try:
+                succeeded = await _run_transaction_mutation_until(
+                    lambda: _input_backend.scroll(
+                        x,
+                        y,
+                        delta_x=-wheel_steps(step.delta_x),
+                        delta_y=-wheel_steps(step.delta_y),
+                    ),
+                    condition,
+                    pid=target.pid,
+                    budget=budget,
+                    operation="transaction scroll",
+                    action_worker=input_worker,
+                )
+            finally:
+                _invalidate_native_mutation_state(
+                    pid=target.pid,
+                    target_id=target.target_id,
+                )
+            return receipt(succeeded)
+
+        return ActionPorts(
+            provider_code="native.input",
+            capability=scroll_available,
+            focus=target_focused,
+            dispatch=dispatch_scroll,
+        )
+
+    async def unavailable(_budget: OperationBudget) -> bool:
+        return False
+
+    async def should_not_dispatch(_budget: OperationBudget):
+        return ActionDispatchResult.failed(
+            OperationErrorCode.UNSUPPORTED_CAPABILITY,
+            retry_safe=True,
+        )
+
+    return ActionPorts(
+        provider_code="native.unsupported",
+        capability=unavailable,
+        dispatch=should_not_dispatch,
+    )
+
+
 def _invalidate_native_mutation_state(
     *,
     snapshot: ObservationSnapshot | None = None,
     pid: int | None = None,
+    target_id: str | None = None,
 ) -> None:
     """Discard native observations whose UI state may have changed."""
     registry.clear()
     _native_target_cache.clear()
+    if _transaction_target_resolver is not None:
+        _transaction_target_resolver.invalidate(
+            provider_identity=native_worker,
+            adapter_identity=native_adapter,
+            mode=TargetMode.FOREGROUND,
+        )
     if snapshot is not None and snapshot.provider == "native":
         coordinator.observations.invalidate_target(
             provider=snapshot.provider,
             mode=snapshot.mode,
             target_id=snapshot.target_id,
         )
+    elif target_id:
+        coordinator.observations.invalidate_target(
+            provider="native",
+            mode=OperationMode.FOREGROUND,
+            target_id=target_id,
+        )
+        if pid and target_id != f"pid:{pid}":
+            coordinator.observations.invalidate_target(
+                provider="native",
+                mode=OperationMode.FOREGROUND,
+                target_id=f"pid:{pid}",
+            )
     elif pid:
         coordinator.observations.invalidate_target(
             provider="native",
@@ -3169,8 +5114,14 @@ def _snapshot_shadow_tree(
         generation=generation,
         revision=revision,
         elements=records,
+        detach_ui_trees=True,
+        truncated=bool(pending),
     )
-    return snapshot.token, len(records), frozenset(record.local_id for record in records)
+    return (
+        snapshot.token,
+        len(records),
+        frozenset(record.local_id for record in records),
+    )
 
 
 async def _current_persistent_snapshot_session(
@@ -3336,6 +5287,12 @@ async def _handle_list_tabs(args: dict) -> str:
         )
 
     _native_target_cache = {target.identifier: target for target in native_targets}
+    _get_transaction_target_resolver().remember_targets(
+        provider_identity=native_worker,
+        adapter_identity=native_adapter,
+        mode=TargetMode.FOREGROUND,
+        targets=native_targets,
+    )
     native_result = format_browser_targets(
         native_targets,
         query=query,
@@ -3367,9 +5324,7 @@ async def _handle_list_tabs(args: dict) -> str:
             shadow_lines.append(
                 f"{len(shadow_tabs) - len(shown_shadow_tabs)} additional shadow targets omitted."
             )
-        shadow_lines.append(
-            "Use target_id for exact shadow targeting."
-        )
+        shadow_lines.append("Use target_id for exact shadow targeting.")
         return f"{native_result}\n\n" + "\n".join(shadow_lines)
 
     return (
@@ -3390,6 +5345,7 @@ def _is_pid_alive(pid: int) -> bool:
     """Check if a PID is still running."""
     try:
         import os
+
         os.kill(pid, 0)
         return True
     except (OSError, ProcessLookupError):
@@ -3408,11 +5364,14 @@ def _get_chrome_pid() -> int:
 
     try:
         import subprocess
+
         # Try common Chrome process names
         for browser in ["Google Chrome", "Chromium", "Chrome"]:
             result = subprocess.run(
                 ["pgrep", "-x", browser],
-                capture_output=True, text=True, timeout=2,
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             if result.returncode == 0 and result.stdout.strip():
                 pid = int(result.stdout.strip().split()[0])
@@ -3421,7 +5380,9 @@ def _get_chrome_pid() -> int:
         # Fallback: search by pattern
         result = subprocess.run(
             ["pgrep", "-f", "Google Chrome"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            timeout=2,
         )
         if result.returncode == 0 and result.stdout.strip():
             pid = int(result.stdout.strip().split()[0])
@@ -3569,11 +5530,7 @@ def _format_web_tree_response(
                 "Use full=True for the complete tree."
             )
         lines = [el.to_flat_line() for el in elements]
-        return (
-            f"snapshot={snapshot_token}\n"
-            f"{suffix}"
-            + "\n".join(lines)
-        )
+        return f"snapshot={snapshot_token}\n{suffix}" + "\n".join(lines)
 
     # Full nested format
     text = _render_snapshot_tree(tree, snapshot_ids, max_depth=max_depth)
@@ -3698,6 +5655,7 @@ async def _handle_get_web_tree(args: dict) -> str:
                 )
                 nodes = result.get("nodes", [])
                 if nodes:
+
                     async def send_secure_metadata(method: str, params: dict) -> dict:
                         return await session.send(
                             method,
@@ -3722,7 +5680,9 @@ async def _handle_get_web_tree(args: dict) -> str:
                             budget=budget,
                             operation="browser process lookup",
                         )
-                        registry.register_tree(tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url)
+                        registry.register_tree(
+                            tree, pid=chrome_pid, tab_index=tab_index, page_url=tab.url
+                        )
                         await budget.wait_for(
                             _append_persistent_shadow_dom_elements(
                                 tree,
@@ -3743,12 +5703,14 @@ async def _handle_get_web_tree(args: dict) -> str:
                                 "ERROR: Shadow document changed while it was being "
                                 "observed; retry web_tree."
                             )
-                        snapshot_token, snapshot_count, snapshot_ids = _snapshot_shadow_tree(
-                            tree,
-                            provider="cdp-persistent",
-                            target_id=tab.id,
-                            generation=session.generation,
-                            revision=revision_after,
+                        snapshot_token, snapshot_count, snapshot_ids = (
+                            _snapshot_shadow_tree(
+                                tree,
+                                provider="cdp-persistent",
+                                target_id=tab.id,
+                                generation=session.generation,
+                                revision=revision_after,
+                            )
                         )
                         return _format_web_tree_response(
                             tree,
@@ -3854,6 +5816,7 @@ async def _handle_get_web_tree(args: dict) -> str:
         and sys.platform == "darwin"
         and _as is not None
     ):
+
         def load_apple_tree():
             import hashlib
             import json
@@ -3921,10 +5884,14 @@ async def _handle_get_web_tree(args: dict) -> str:
                 ),
             )
 
-    return cdp_err or "ERROR: The explicitly requested shadow web-tree provider is unavailable."
+    return (
+        cdp_err
+        or "ERROR: The explicitly requested shadow web-tree provider is unavailable."
+    )
 
 
 # ── CDP action handlers ─────────────────────────────────────────────
+
 
 async def _ensure_tabs(
     force: bool = False,
@@ -3975,7 +5942,10 @@ def _get_tab(args: dict) -> tuple:
     """Get tab by index from args. Returns (tab, error_string)."""
     idx = args.get("tab_index", 0)
     if not isinstance(idx, int) or idx < 0 or idx >= len(_cached_tabs):
-        return None, f"ERROR: Tab index {idx} out of range. {len(_cached_tabs)} tab(s) available."
+        return (
+            None,
+            f"ERROR: Tab index {idx} out of range. {len(_cached_tabs)} tab(s) available.",
+        )
     return _cached_tabs[idx], ""
 
 
@@ -4064,7 +6034,10 @@ def _resolve_applescript_tab(global_index: int) -> tuple[int, int, str]:
     """
     as_tabs = _get_applescript_tabs()
     if not as_tabs:
-        logger.debug("_resolve_applescript_tab: no AS tabs, falling back to raw index %d", global_index)
+        logger.debug(
+            "_resolve_applescript_tab: no AS tabs, falling back to raw index %d",
+            global_index,
+        )
         return 0, global_index, ""  # best-effort fallback
 
     # Strategy A: CDP cache exists — match by URL
@@ -4085,17 +6058,29 @@ def _resolve_applescript_tab(global_index: int) -> tuple[int, int, str]:
         # Exact URL match
         for at in as_tabs:
             if at.url == target_url:
-                logger.debug("_resolve_applescript_tab: exact URL match → win=%d tab=%d", at.window_index, at.index)
+                logger.debug(
+                    "_resolve_applescript_tab: exact URL match → win=%d tab=%d",
+                    at.window_index,
+                    at.index,
+                )
                 return at.window_index, at.index, ""
         # Normalized URL match (trailing slash, case)
         for at in as_tabs:
             if _normalize_url(at.url) == target_url_norm:
-                logger.debug("_resolve_applescript_tab: normalized URL match → win=%d tab=%d", at.window_index, at.index)
+                logger.debug(
+                    "_resolve_applescript_tab: normalized URL match → win=%d tab=%d",
+                    at.window_index,
+                    at.index,
+                )
                 return at.window_index, at.index, ""
         # Title match
         for at in as_tabs:
             if at.title == target_title:
-                logger.debug("_resolve_applescript_tab: title match → win=%d tab=%d", at.window_index, at.index)
+                logger.debug(
+                    "_resolve_applescript_tab: title match → win=%d tab=%d",
+                    at.window_index,
+                    at.index,
+                )
                 return at.window_index, at.index, ""
 
         logger.debug(
@@ -4108,10 +6093,18 @@ def _resolve_applescript_tab(global_index: int) -> tuple[int, int, str]:
     # Strategy B: No CDP cache — AppleScript flat order IS the global index
     if global_index < len(as_tabs):
         at = as_tabs[global_index]
-        logger.debug("_resolve_applescript_tab: Strategy B (flat) → win=%d tab=%d", at.window_index, at.index)
+        logger.debug(
+            "_resolve_applescript_tab: Strategy B (flat) → win=%d tab=%d",
+            at.window_index,
+            at.index,
+        )
         return at.window_index, at.index, ""
 
-    return 0, global_index, f"ERROR: Tab index {global_index} out of range ({len(as_tabs)} tabs)"
+    return (
+        0,
+        global_index,
+        f"ERROR: Tab index {global_index} out of range ({len(as_tabs)} tabs)",
+    )
 
 
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "about", "chrome", "chrome-extension"})
@@ -4120,6 +6113,7 @@ _SAFE_URL_SCHEMES = frozenset({"http", "https", "about", "chrome", "chrome-exten
 def _validate_url(url: str) -> str | None:
     """Validate URL scheme. Returns error string or None if valid."""
     import urllib.parse
+
     if url.startswith("--"):
         return "ERROR: URL must not start with '--' (flag injection)."
     parsed = urllib.parse.urlparse(url)
@@ -4240,6 +6234,7 @@ async def _handle_navigate(args: dict) -> str:
         return "Navigation completed in the requested shadow target."
 
     if sys.platform == "darwin" and _as is not None:
+
         def apple_navigate():
             if not _as.is_available():
                 return None, ""
@@ -4392,6 +6387,7 @@ async def _handle_evaluate(args: dict) -> str:
 
     if _as is not None:
         try:
+
             def apple_evaluate():
                 if not _as.is_available():
                     return None, ""
@@ -4501,9 +6497,14 @@ async def _handle_press_key(args: dict) -> str:
 
     # ── Normalize key names to input_sim format ──
     key_map = {
-        "enter": "return", "arrowup": "up", "arrowdown": "down",
-        "arrowleft": "left", "arrowright": "right",
-        "backspace": "delete", "pageup": "page_up", "pagedown": "page_down",
+        "enter": "return",
+        "arrowup": "up",
+        "arrowdown": "down",
+        "arrowleft": "left",
+        "arrowright": "right",
+        "backspace": "delete",
+        "pageup": "page_up",
+        "pagedown": "page_down",
     }
     native_key = key_map.get(key.lower(), key.lower())
 
@@ -4643,11 +6644,13 @@ async def _handle_wait_for(args: dict) -> str:
                     )
                 ],
             )
-            mode = "native events" if result.event_driven else "adaptive native fallback"
+            mode = (
+                "native events" if result.event_driven else "adaptive native fallback"
+            )
             return (
                 f"snapshot={snapshot.token}\n"
                 f"Found [{result.element.id}] {result.element.role} "
-                f"\"{result.element.name}\" after {result.elapsed:.2f}s ({mode})"
+                f'"{result.element.name}" after {result.elapsed:.2f}s ({mode})'
             )
         return f"ERROR: Timeout after {timeout}s: no element matching role='{role}' name='{name}' found."
 
@@ -4665,7 +6668,9 @@ async def _handle_wait_for(args: dict) -> str:
         return target_error
     session, tab, provider_error = await _get_cdp_session(args, budget=budget)
     if session is None or tab is None:
-        return provider_error or "ERROR: Event-driven shadow wait provider is unavailable."
+        return (
+            provider_error or "ERROR: Event-driven shadow wait provider is unavailable."
+        )
 
     raw_node = None
     revision = 0
@@ -4734,7 +6739,7 @@ async def _handle_wait_for(args: dict) -> str:
     )
     return (
         f"snapshot={snapshot.token}\n"
-        f"Found element: [{element.id}] {element.role} \"{element.name}\" "
+        f'Found element: [{element.id}] {element.role} "{element.name}" '
         "(event-driven shadow wait)\nUse this [id] with click or type."
     )
 
@@ -4749,9 +6754,7 @@ async def _handle_new_tab(args: dict) -> str:
     shadow = bool(args.get("shadow", False))
     budget = _shared_operation_budget(args, 10.0)
     marker = (
-        "_shadow_coordinator_locked"
-        if shadow
-        else "_foreground_coordinator_locked"
+        "_shadow_coordinator_locked" if shadow else "_foreground_coordinator_locked"
     )
     if not args.get(marker, False):
         internal = _coordinator_args(args, budget=budget, marker=marker)
@@ -4868,21 +6871,14 @@ async def _handle_close_tab(args: dict) -> str:
                 budget=budget,
                 operation_manages_deadline=True,
             )
-        targets = await _collect_native_browser_targets(budget=budget)
         target_id = str(args.get("target_id", "")).strip()
         title_query = str(args.get("title", "")).strip()
         if target_id:
-            target = next(
-                (
-                    candidate
-                    for candidate in targets
-                    if candidate.identifier == target_id
-                ),
-                None,
-            )
+            target = _native_target_cache.get(target_id)
             if target is None:
                 return "ERROR: Native target is stale. Call list_tabs again."
         elif title_query:
+            targets = await _collect_native_browser_targets(budget=budget)
             query = title_query.casefold()
             matches = [target for target in targets if query in target.title.casefold()]
             if not matches:
@@ -5167,7 +7163,9 @@ async def _handle_file_upload(args: dict) -> str:
     if mode is not OperationMode.SHADOW or snapshot is None or element is None:
         return "ERROR: upload requires an explicit shadow snapshot."
     if element.source not in {"cdp", "shadow-dom"} or element.platform_ref is None:
-        return "ERROR: The selected element is not actionable by the shadow file provider."
+        return (
+            "ERROR: The selected element is not actionable by the shadow file provider."
+        )
 
     budget = OperationBudget.start(5.0)
 
@@ -5180,7 +7178,9 @@ async def _handle_file_upload(args: dict) -> str:
         operation="upload path validation",
     )
     if validation_error == "missing":
-        return "ERROR: One requested upload file does not exist or is not a regular file."
+        return (
+            "ERROR: One requested upload file does not exist or is not a regular file."
+        )
     if validation_error:
         return "ERROR: One requested upload file is in a protected location."
 
@@ -5212,7 +7212,11 @@ async def _handle_file_upload(args: dict) -> str:
             if err:
                 return err
             tab = next(
-                (candidate for candidate in _cached_tabs if candidate.id == snapshot.target_id),
+                (
+                    candidate
+                    for candidate in _cached_tabs
+                    if candidate.id == snapshot.target_id
+                ),
                 None,
             )
             if tab is None:
@@ -5293,13 +7297,16 @@ async def _handle_scroll(args: dict) -> str:
                 focus_ok, focus_err = await _verify_focus(pid, budget=budget)
                 if not focus_ok:
                     return f"ERROR: {focus_err}. Scroll was not sent."
+
             # The public API is pixel-like; native backends consume bounded
             # wheel steps/buttons.  Normalize once at the boundary so a
             # default 300px request never becomes 300 low-level events.
             def native_steps(delta: int) -> int:
                 if not delta:
                     return 0
-                return max(-20, min(20, int(round(delta / 100)))) or (1 if delta > 0 else -1)
+                return max(-20, min(20, int(round(delta / 100)))) or (
+                    1 if delta > 0 else -1
+                )
 
             native_delta_y = -native_steps(delta_y)
             native_delta_x = -native_steps(delta_x)
@@ -5324,7 +7331,7 @@ async def _handle_scroll(args: dict) -> str:
             if success:
                 direction = "down" if delta_y > 0 else "up" if delta_y < 0 else ""
                 if delta_x:
-                    direction += (" + right" if delta_x > 0 else " + left")
+                    direction += " + right" if delta_x > 0 else " + left"
                 return f"scrolled {direction}"
         return "ERROR: Foreground scroll failed or no input backend is available."
 
@@ -5529,7 +7536,9 @@ async def _handle_fill_form(args: dict) -> str:
                 break
         summary = f"filled {filled} field(s); {local_failures} failed"
         if uncertain:
-            return f"ERROR: OUTCOME_UNKNOWN: {summary}; stopped after an uncertain outcome"
+            return (
+                f"ERROR: OUTCOME_UNKNOWN: {summary}; stopped after an uncertain outcome"
+            )
         if local_failures:
             return f"ERROR: PARTIAL_FAILURE: {summary}"
         return summary
@@ -5549,6 +7558,7 @@ async def _handle_fill_form(args: dict) -> str:
 
 
 # ── New tool handlers ────────────────────────────────────────────────
+
 
 async def _handle_hover(args: dict) -> str:
     hover_x = args.get("x")
@@ -5663,6 +7673,7 @@ def _handle_app(args: dict) -> str:
 
     try:
         from AppKit import NSWorkspace
+
         ws = NSWorkspace.sharedWorkspace()
     except ImportError:
         return "ERROR: AppKit not available."
@@ -5760,7 +7771,7 @@ def _handle_get_subtree(args: dict) -> str:
         return "ERROR: No native adapter available."
 
     # Validate element is still alive
-    if hasattr(native_adapter, 'is_element_valid') and element.source == "native":
+    if hasattr(native_adapter, "is_element_valid") and element.source == "native":
         if not native_adapter.is_element_valid(element):
             return f"ERROR: Element [{element_id}] is stale. Call tree to refresh."
 
@@ -5909,7 +7920,7 @@ async def _handle_window(args: dict) -> str:
             title = " ".join(window_element.name.split())[:160]
             lines.append(
                 f"snapshot={token} id={window_element.id} PID {app_info.pid} | "
-                f"{app_info.name} | \"{title}\"{geometry}"
+                f'{app_info.name} | "{title}"{geometry}'
             )
         return "\n".join(lines)
 
@@ -5939,7 +7950,9 @@ async def _handle_window(args: dict) -> str:
     window_element = record.value
     if not isinstance(window_element, UIElement):
         return "ERROR: TARGET_MISMATCH: snapshot record is not a native window."
-    role = "".join(character for character in window_element.role.casefold() if character.isalnum())
+    role = "".join(
+        character for character in window_element.role.casefold() if character.isalnum()
+    )
     if role not in {"window", "dialog", "sheet"}:
         return "ERROR: TARGET_MISMATCH: requested element is not a window."
     if window_element.platform_ref is None:
@@ -5955,6 +7968,7 @@ async def _handle_window(args: dict) -> str:
 
     ax_value_create = point_type = size_type = point_factory = size_factory = None
     if action in {"move", "resize"}:
+
         def load_geometry_types():
             from ApplicationServices import (
                 AXValueCreate,
@@ -6044,7 +8058,9 @@ async def _handle_window(args: dict) -> str:
                 worker=native_worker,
             )
             if ax_error != 0:
-                return "ERROR: Native accessibility provider rejected window minimization."
+                return (
+                    "ERROR: Native accessibility provider rejected window minimization."
+                )
             _invalidate_native_mutation_state(pid=pid)
             return f"Minimized window [{window_id}] for PID {pid}."
         except _NativeMutationOutcomeUnknown:
@@ -6183,7 +8199,7 @@ def _handle_context(args: dict) -> str:
     focused = native_adapter.get_focused_element()
     if focused:
         registry.register_element(focused)
-        focused_label = f" | [{focused.id}] {focused.role} \"{focused.name}\" focused"
+        focused_label = f' | [{focused.id}] {focused.role} "{focused.name}" focused'
     else:
         focused_label = ""
 
@@ -6227,7 +8243,7 @@ async def _handle_context_async(args: dict) -> str:
     )
     return (
         f"snapshot={snapshot.token}\n"
-        f'{app_label}{window_label} | [{focused.id}] {focused.role} '
+        f"{app_label}{window_label} | [{focused.id}] {focused.role} "
         f'"{focused.name}" focused'
     )
 
@@ -6278,7 +8294,9 @@ def _handle_shadow(args: dict) -> str | _AppleShadowResult:
             )
         clicked = bool(outcome.value and outcome.value != "not found")
         return _AppleShadowResult(
-            "Shadow click completed." if clicked else "ERROR: Shadow click target not found.",
+            "Shadow click completed."
+            if clicked
+            else "ERROR: Shadow click target not found.",
             invalidate_target=clicked,
         )
 
@@ -6305,7 +8323,9 @@ def _handle_shadow(args: dict) -> str | _AppleShadowResult:
         key = text or "Enter"
         outcome = _as.shadow_press_key_outcome(key, **target_args)
         if outcome.status is _as.ShadowExecutionStatus.NOT_DISPATCHED:
-            return _AppleShadowResult("ERROR: Apple Events key input was not dispatched.")
+            return _AppleShadowResult(
+                "ERROR: Apple Events key input was not dispatched."
+            )
         if outcome.status is _as.ShadowExecutionStatus.OUTCOME_UNKNOWN:
             return _AppleShadowResult(
                 "ERROR: OUTCOME_UNKNOWN: Apple Events key input may have completed.",
@@ -6352,7 +8372,9 @@ def _handle_shadow(args: dict) -> str | _AppleShadowResult:
             return "ERROR: 'text' (JS code) required for js action."
         outcome = _as.shadow_execute_js_outcome(text, **target_args)
         if outcome.status is _as.ShadowExecutionStatus.NOT_DISPATCHED:
-            return _AppleShadowResult("ERROR: Apple Events JavaScript was not dispatched.")
+            return _AppleShadowResult(
+                "ERROR: Apple Events JavaScript was not dispatched."
+            )
         if outcome.status is _as.ShadowExecutionStatus.OUTCOME_UNKNOWN:
             return _AppleShadowResult(
                 "ERROR: OUTCOME_UNKNOWN: Apple Events JavaScript may have executed.",
@@ -6502,7 +8524,9 @@ def main():
 async def _run():
     try:
         async with stdio_server() as (read_stream, write_stream):
-            await app.run(read_stream, write_stream, app.create_initialization_options())
+            await app.run(
+                read_stream, write_stream, app.create_initialization_options()
+            )
     finally:
         cleanup = asyncio.create_task(
             _shutdown_runtime(),

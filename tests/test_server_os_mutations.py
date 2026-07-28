@@ -237,7 +237,10 @@ def test_window_list_returns_exact_snapshot_and_id_targets(monkeypatch):
     token = line.split()[0].removeprefix("snapshot=")
     assert "id=17" in line
     assert "PID 42" in line
-    assert coordinator.observations.resolve(token, 17).value is window
+    stored = coordinator.observations.resolve(token, 17).value
+    assert stored == window
+    assert stored is not window
+    assert stored.platform_ref is window.platform_ref
 
 
 def test_app_mutation_rejects_ambiguous_substring(monkeypatch):

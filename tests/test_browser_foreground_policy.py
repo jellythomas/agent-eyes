@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from types import ModuleType
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 from agent_eyes.adapters.base import UIElement
@@ -15,23 +13,25 @@ def _unexpected_shadow_probe(*args, **kwargs):
     raise AssertionError("foreground operation probed the shadow provider")
 
 
-def test_macos_activation_uses_runtime_selector_without_fixed_delay(monkeypatch):
-    fake_app = MagicMock()
-    fake_app.activateWithOptions_.return_value = True
-    running_application = MagicMock()
-    running_application.runningApplicationWithProcessIdentifier_.return_value = fake_app
-    appkit = ModuleType("AppKit")
-    appkit.NSRunningApplication = running_application
-    appkit.NSApplicationActivateIgnoringOtherApps = 2
-    monkeypatch.setitem(sys.modules, "AppKit", appkit)
-
+def test_macos_activation_uses_exact_pid_without_fixed_delay(monkeypatch):
     def unexpected_sleep(*args, **kwargs):
         raise AssertionError("activation used a fixed delay")
 
     monkeypatch.setattr("agent_eyes.input_sim.time.sleep", unexpected_sleep)
+    runner = MagicMock(return_value=MagicMock(returncode=0))
+    monkeypatch.setattr("agent_eyes.input_sim.subprocess.run", runner)
 
     assert MacOSInputBackend().activate_window(42) is True
-    fake_app.activateWithOptions_.assert_called_once_with(2)
+    runner.assert_called_once_with(
+        [
+            "/usr/bin/osascript",
+            "-e",
+            "tell application \"System Events\" to set frontmost of "
+            "(first process whose unix id is 42) to true",
+        ],
+        capture_output=True,
+        timeout=3,
+    )
 
 
 def test_browser_pid_press_key_uses_foreground_os_input(monkeypatch):
@@ -134,6 +134,39 @@ def test_browser_activation_without_owning_window_identity_fails_before_focus(mo
 
     assert asyncio.run(server._activate_browser_target_and_wait(target)) is False
     verify_focus.assert_not_awaited()
+
+
+def test_browser_activation_returns_immediately_when_exact_tab_is_already_active(
+    monkeypatch,
+):
+    from agent_eyes import server
+
+    class InlineWorker:
+        async def run(self, call, **_kwargs):
+            return call()
+
+    tab = UIElement(id=1, role="tab", platform_ref=object())
+    window = UIElement(id=2, role="window", platform_ref=object())
+    target = BrowserTarget(
+        browser="Firefox",
+        pid=42,
+        title="Already active",
+        element=tab,
+        window_element=window,
+    )
+    adapter = MagicMock()
+    adapter.is_window_focused.return_value = True
+    adapter.is_element_selected.return_value = True
+    verify_focus = AsyncMock(side_effect=AssertionError("PID focus must not run"))
+    events = AsyncMock(side_effect=AssertionError("event wrapper must not run"))
+    monkeypatch.setattr(server, "native_adapter", adapter)
+    monkeypatch.setattr(server, "native_worker", InlineWorker())
+    monkeypatch.setattr(server, "_verify_focus", verify_focus)
+    monkeypatch.setattr(server, "run_native_action_until", events)
+
+    assert asyncio.run(server._activate_browser_target_and_wait(target)) is True
+    verify_focus.assert_not_awaited()
+    events.assert_not_awaited()
 
 
 def test_foreground_navigate_reuses_native_policy_without_cdp(monkeypatch):
@@ -535,7 +568,37 @@ def test_shadow_type_verifies_protocol_result_without_fixed_sleep(monkeypatch):
     session.send = AsyncMock(
         side_effect=[
             {"object": {"objectId": "object-1"}},
+            {
+                "nodes": [
+                    {
+                        "backendDOMNodeId": 99,
+                        "ignored": False,
+                        "role": {"value": "textbox"},
+                        "name": {"value": "Search"},
+                        "properties": [],
+                    }
+                ]
+            },
             {},
+            {
+                "nodes": [
+                    {
+                        "backendDOMNodeId": 99,
+                        "ignored": False,
+                        "role": {"value": "textbox"},
+                        "name": {"value": "Search"},
+                        "properties": [
+                            {
+                                "name": "focused",
+                                "value": {
+                                    "type": "booleanOrUndefined",
+                                    "value": True,
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
             {},
             {"result": {"value": "hello"}},
         ]

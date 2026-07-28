@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from agent_eyes.adapters.macos import MacOSAdapter
 from agent_eyes.browser_inventory import extract_tab_elements
 
@@ -144,6 +146,34 @@ def test_browser_tree_rejects_ax_application_self_reference_without_fallback_wal
     assert fake_ax.action_reads == 0
 
 
+def test_complete_browser_tree_inventory_surfaces_ax_window_read_failure():
+    app = FakeAXElement(1, "AXApplication")
+    adapter, fake_ax = _adapter_with_ax(app)
+
+    assert adapter.get_browser_trees(42) == []
+    with pytest.raises(RuntimeError, match="AXWindows"):
+        adapter.get_browser_trees_complete(42)
+
+
+def test_complete_app_inventory_surfaces_windowserver_and_ax_fallback_failure():
+    running_apps = [FakeRunningApp(11, "Safari", "com.apple.Safari", active=True)]
+    workspace = SimpleNamespace(runningApplications=lambda: running_apps)
+    adapter, _fake_ax = _adapter_with_ax(FakeAXElement(1, "AXApplication"))
+    adapter._cocoa = SimpleNamespace(
+        NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace),
+        NSApplicationActivationPolicyRegular=0,
+    )
+    adapter._quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda _options, _window: None,
+    )
+
+    assert adapter.list_apps()[0].windows == []
+    with pytest.raises(RuntimeError, match="AXWindows"):
+        adapter.list_apps_complete()
+
+
 def test_browser_tree_has_an_independent_hard_limit_per_window(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
@@ -182,6 +212,113 @@ def test_browser_tree_has_an_independent_hard_limit_per_window(monkeypatch):
     assert len(trees[0].children) == adapter._BROWSER_MAX_ELEMENTS - 1
     assert len(trees[1].children) == 1
     assert fake_ax.batch_reads == adapter._BROWSER_MAX_ELEMENTS + 2
+
+
+def test_complete_browser_tree_rejects_traversal_cap_truncation(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "Foundation",
+        SimpleNamespace(
+            NSArray=SimpleNamespace(arrayWithArray_=lambda values: list(values))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        SimpleNamespace(kCFNull=object()),
+    )
+    window = FakeAXElement(
+        1,
+        "AXWindow",
+        children=[FakeAXElement(index, "AXGroup") for index in range(10, 20)],
+    )
+    app = FakeAXElement(2, "AXApplication")
+    app.windows = [window]
+    adapter, fake_ax = _adapter_with_ax(app)
+    adapter._BROWSER_MAX_ELEMENTS = 2
+
+    original_read = fake_ax.AXUIElementCopyAttributeValue
+
+    def read_with_windows(element, attr: str, out):
+        if element is app and attr == "AXWindows":
+            return 0, app.windows
+        return original_read(element, attr, out)
+
+    fake_ax.AXUIElementCopyAttributeValue = read_with_windows
+
+    assert len(adapter.get_browser_trees(42)[0].children) == 1
+    with pytest.raises(RuntimeError, match="traversal safety cap"):
+        adapter.get_browser_trees_complete(42)
+
+
+def test_complete_browser_tree_rejects_depth_truncation(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "Foundation",
+        SimpleNamespace(
+            NSArray=SimpleNamespace(arrayWithArray_=lambda values: list(values))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        SimpleNamespace(kCFNull=object()),
+    )
+    window = FakeAXElement(1, "AXWindow", children=[FakeAXElement(2, "AXTab")])
+    app = FakeAXElement(3, "AXApplication")
+    app.windows = [window]
+    adapter, fake_ax = _adapter_with_ax(app)
+    original_read = fake_ax.AXUIElementCopyAttributeValue
+
+    def read_with_windows(element, attr: str, out):
+        if element is app and attr == "AXWindows":
+            return 0, app.windows
+        return original_read(element, attr, out)
+
+    fake_ax.AXUIElementCopyAttributeValue = read_with_windows
+
+    assert adapter.get_browser_trees(42, max_depth=0)[0].children == []
+    with pytest.raises(RuntimeError, match="traversal depth bound"):
+        adapter.get_browser_trees_complete(42, max_depth=0)
+
+
+def test_complete_browser_tree_propagates_child_read_failure(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "Foundation",
+        SimpleNamespace(
+            NSArray=SimpleNamespace(arrayWithArray_=lambda values: list(values))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "CoreFoundation",
+        SimpleNamespace(kCFNull=object()),
+    )
+    broken = FakeAXElement(2, "AXTab")
+    window = FakeAXElement(1, "AXWindow", children=[broken])
+    app = FakeAXElement(3, "AXApplication")
+    app.windows = [window]
+    adapter, fake_ax = _adapter_with_ax(app)
+    original_read = fake_ax.AXUIElementCopyAttributeValue
+    original_batch = fake_ax.AXUIElementCopyMultipleAttributeValues
+
+    def read_with_windows(element, attr: str, out):
+        if element is app and attr == "AXWindows":
+            return 0, app.windows
+        return original_read(element, attr, out)
+
+    def fail_broken_child(element, attrs, options, out):
+        if element is broken:
+            raise RuntimeError("broken AX child")
+        return original_batch(element, attrs, options, out)
+
+    fake_ax.AXUIElementCopyAttributeValue = read_with_windows
+    fake_ax.AXUIElementCopyMultipleAttributeValues = fail_broken_child
+
+    assert len(adapter.get_browser_trees(42)[0].children) == 1
+    with pytest.raises(RuntimeError, match="broken AX child"):
+        adapter.get_browser_trees_complete(42)
 
 
 class FakeRunningApp:
@@ -243,6 +380,85 @@ def test_list_apps_uses_one_quartz_snapshot_instead_of_ax_round_trips():
         ("Firefox", ["Issue tracker"]),
     ]
     assert fake_ax.read_counts == Counter()
+
+
+def test_windowserver_visibility_includes_untitled_normal_windows():
+    running_apps = [
+        FakeRunningApp(11, "Safari", "com.apple.Safari", active=True),
+        FakeRunningApp(22, "Firefox", "org.mozilla.firefox"),
+    ]
+    workspace = SimpleNamespace(runningApplications=lambda: running_apps)
+    adapter, fake_ax = _adapter_with_ax(FakeAXElement(1, "AXApplication"))
+    adapter._cocoa = SimpleNamespace(
+        NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace),
+        NSApplicationActivationPolicyRegular=0,
+    )
+    adapter._quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        kCGWindowOwnerPID="pid",
+        kCGWindowLayer="layer",
+        kCGWindowName="name",
+        kCGWindowBounds="bounds",
+        kCGWindowNumber="number",
+        kCGWindowIsOnscreen="onscreen",
+        CGWindowListCopyWindowInfo=lambda _options, _window: [
+            {
+                "pid": 11,
+                "layer": 0,
+                "name": "",
+                "number": 101,
+                "onscreen": True,
+            },
+            {"pid": 99, "layer": 0, "name": "Other app", "number": 102},
+        ],
+    )
+
+    apps = adapter.list_apps()
+    safari, firefox = apps
+
+    assert safari.windows == []
+    assert adapter.browser_app_has_visible_windows(safari) is True
+    assert adapter.browser_app_required_window_count(safari) == 1
+    assert adapter.browser_app_has_visible_windows(firefox) is False
+    assert adapter.browser_app_required_window_count(firefox) == 0
+    assert fake_ax.read_counts == Counter()
+
+
+def test_failed_windowserver_snapshot_clears_previous_visibility_evidence():
+    adapter = MacOSAdapter()
+    adapter._window_server_visible_pids = {11}
+    adapter._window_server_required_window_counts = {11: 1}
+    adapter._quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        CGWindowListCopyWindowInfo=lambda _options, _window: None,
+    )
+
+    assert adapter._window_titles_by_pid() is None
+    app = SimpleNamespace(pid=11)
+    assert adapter.browser_app_has_visible_windows(app) is None
+    assert adapter.browser_app_required_window_count(app) is None
+
+
+def test_windowserver_counts_same_title_windows_by_native_identity():
+    adapter = MacOSAdapter()
+    adapter._quartz = SimpleNamespace(
+        kCGWindowListOptionAll=1,
+        kCGNullWindowID=0,
+        kCGWindowOwnerPID="pid",
+        kCGWindowLayer="layer",
+        kCGWindowName="name",
+        kCGWindowBounds="bounds",
+        kCGWindowNumber="number",
+        CGWindowListCopyWindowInfo=lambda _options, _window: [
+            {"pid": 11, "layer": 0, "name": "Same title", "number": 101},
+            {"pid": 11, "layer": 0, "name": "Same title", "number": 102},
+        ],
+    )
+
+    assert adapter._window_titles_by_pid() == {11: ["Same title"]}
+    assert adapter.browser_app_required_window_count(SimpleNamespace(pid=11)) == 2
 
 
 def _convert_macos_attrs(attrs: dict):

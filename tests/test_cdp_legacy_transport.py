@@ -10,6 +10,7 @@ from agent_eyes.adapters.base import UIElement
 from agent_eyes.cdp import (
     CDPClient,
     CDPDocumentChangedError,
+    CDPFocusMismatchError,
     CDPMutationOutcomeUnknown,
     ChromeTab,
 )
@@ -33,6 +34,43 @@ def _tab() -> ChromeTab:
         "https://example.test",
         "ws://127.0.0.1:9222/devtools/page/target-1",
     )
+
+
+def _element(*, role: str = "button", name: str = "Submit") -> UIElement:
+    return UIElement(
+        id=1,
+        role=role,
+        name=name,
+        source="cdp",
+        platform_ref=42,
+    )
+
+
+def _partial_ax_node(
+    *,
+    role: str = "button",
+    name: str = "Submit",
+    focused: bool = False,
+) -> dict:
+    properties = []
+    if focused:
+        properties.append(
+            {
+                "name": "focused",
+                "value": {"type": "booleanOrUndefined", "value": True},
+            }
+        )
+    return {
+        "nodes": [
+            {
+                "backendDOMNodeId": 42,
+                "ignored": False,
+                "role": {"value": role},
+                "name": {"value": name},
+                "properties": properties,
+            }
+        ]
+    }
 
 
 def test_send_preserves_protocol_events_that_arrive_before_command_response():
@@ -90,7 +128,9 @@ def test_navigate_consumes_load_event_arriving_before_navigation_response(monkey
         async def recv(self):
             self.recv_count += 1
             if not self.messages:
-                raise AssertionError("navigation waited after its load event was already received")
+                raise AssertionError(
+                    "navigation waited after its load event was already received"
+                )
             return self.messages.pop(0)
 
     async def run():
@@ -117,13 +157,16 @@ def test_enrichment_uses_only_one_high_value_read_per_element():
     async def run():
         client = CDPClient()
         element = UIElement(id=1, role="button", platform_ref=7)
+
         async def box(_ws, _backend_node_id):
             await asyncio.sleep(0)
             return (1, 2, 3, 4)
 
         client._get_box_model = box
         client._get_visual_summary = AsyncMock(
-            side_effect=AssertionError("legacy visual enrichment is intentionally skipped")
+            side_effect=AssertionError(
+                "legacy visual enrichment is intentionally skipped"
+            )
         )
 
         enriched = await client._enrich_subtree(object(), element, 1)
@@ -179,7 +222,12 @@ def test_click_rejects_changed_document_before_dispatch(monkeypatch):
         )
 
         with pytest.raises(CDPDocumentChangedError):
-            await client.click_element(_tab(), 42, expected_revision=123)
+            await client.click_element(
+                _tab(),
+                42,
+                expected_element=_element(),
+                expected_revision=123,
+            )
 
         assert [call.args[1] for call in client._send.await_args_list] == [
             "DOM.enable",
@@ -199,6 +247,7 @@ def test_click_raises_unknown_outcome_after_mutation_dispatch(monkeypatch):
             side_effect=[
                 {},
                 {"object": {"objectId": "object-1"}},
+                _partial_ax_node(),
                 RuntimeError("connection lost after dispatch"),
             ]
         )
@@ -209,12 +258,33 @@ def test_click_raises_unknown_outcome_after_mutation_dispatch(monkeypatch):
         )
 
         with pytest.raises(CDPMutationOutcomeUnknown):
-            await client.click_element(_tab(), 42)
+            await client.click_element(_tab(), 42, expected_element=_element())
 
     asyncio.run(run())
 
 
-def test_click_rejects_runtime_stale_element_exception(monkeypatch):
+@pytest.mark.parametrize(
+    ("runtime_result", "expected_error"),
+    [
+        (
+            {"result": {"value": "__agent_eyes_action_stale_v1__"}},
+            CDPMutationOutcomeUnknown,
+        ),
+        (
+            {
+                "exceptionDetails": {
+                    "exception": {"description": "Error: STALE_ELEMENT"}
+                }
+            },
+            CDPMutationOutcomeUnknown,
+        ),
+    ],
+)
+def test_click_trusts_only_fixed_stale_status(
+    monkeypatch,
+    runtime_result,
+    expected_error,
+):
     async def run():
         import websockets
 
@@ -223,11 +293,8 @@ def test_click_rejects_runtime_stale_element_exception(monkeypatch):
             side_effect=[
                 {},
                 {"object": {"objectId": "object-1"}},
-                {
-                    "exceptionDetails": {
-                        "exception": {"description": "Error: STALE_ELEMENT"}
-                    }
-                },
+                _partial_ax_node(),
+                runtime_result,
             ]
         )
         monkeypatch.setattr(
@@ -236,12 +303,13 @@ def test_click_rejects_runtime_stale_element_exception(monkeypatch):
             lambda _url, **_kwargs: _Connection(object()),
         )
 
-        with pytest.raises(CDPDocumentChangedError):
-            await client.click_element(_tab(), 42)
+        with pytest.raises(expected_error):
+            await client.click_element(_tab(), 42, expected_element=_element())
 
         assert [call.args[1] for call in client._send.await_args_list] == [
             "DOM.enable",
             "DOM.resolveNode",
+            "Accessibility.getPartialAXTree",
             "Runtime.callFunctionOn",
         ]
 
@@ -257,6 +325,7 @@ def test_type_raises_unknown_outcome_after_focus_dispatch(monkeypatch):
             side_effect=[
                 {},
                 {"object": {"objectId": "object-1"}},
+                _partial_ax_node(role="textbox", name="Comment"),
                 RuntimeError("connection lost after focus"),
             ]
         )
@@ -267,12 +336,38 @@ def test_type_raises_unknown_outcome_after_focus_dispatch(monkeypatch):
         )
 
         with pytest.raises(CDPMutationOutcomeUnknown):
-            await client.type_text(_tab(), 42, "secret")
+            await client.type_text(
+                _tab(),
+                42,
+                "secret",
+                expected_element=_element(role="textbox", name="Comment"),
+            )
 
     asyncio.run(run())
 
 
-def test_type_never_inserts_text_after_runtime_focus_exception(monkeypatch):
+@pytest.mark.parametrize(
+    ("focus_responses", "expected_error"),
+    [
+        (
+            [{}, _partial_ax_node(role="textbox", name="Comment")],
+            CDPFocusMismatchError,
+        ),
+        (
+            [{"unexpected": True}],
+            CDPMutationOutcomeUnknown,
+        ),
+        (
+            [{}, {"nodes": "malformed"}],
+            CDPMutationOutcomeUnknown,
+        ),
+    ],
+)
+def test_type_never_inserts_text_without_trusted_exact_focus(
+    monkeypatch,
+    focus_responses,
+    expected_error,
+):
     async def run():
         import websockets
 
@@ -281,11 +376,46 @@ def test_type_never_inserts_text_after_runtime_focus_exception(monkeypatch):
             side_effect=[
                 {},
                 {"object": {"objectId": "object-1"}},
-                {
-                    "exceptionDetails": {
-                        "exception": {"description": "Error: STALE_ELEMENT"}
-                    }
-                },
+                _partial_ax_node(role="textbox", name="Comment"),
+                *focus_responses,
+            ]
+        )
+        monkeypatch.setattr(
+            websockets,
+            "connect",
+            lambda _url, **_kwargs: _Connection(object()),
+        )
+
+        with pytest.raises(expected_error):
+            await client.type_text(
+                _tab(),
+                42,
+                "secret",
+                expected_element=_element(role="textbox", name="Comment"),
+            )
+
+        methods = [call.args[1] for call in client._send.await_args_list]
+        assert methods[:3] == [
+            "DOM.enable",
+            "DOM.resolveNode",
+            "Accessibility.getPartialAXTree",
+        ]
+        assert methods[3] == "DOM.focus"
+        assert "Input.insertText" not in methods
+
+    asyncio.run(run())
+
+
+def test_click_rejects_changed_exact_ax_semantics_before_dispatch(monkeypatch):
+    async def run():
+        import websockets
+
+        client = CDPClient()
+        client._send = AsyncMock(
+            side_effect=[
+                {},
+                {"object": {"objectId": "object-1"}},
+                _partial_ax_node(name="Delete"),
             ]
         )
         monkeypatch.setattr(
@@ -295,12 +425,16 @@ def test_type_never_inserts_text_after_runtime_focus_exception(monkeypatch):
         )
 
         with pytest.raises(CDPDocumentChangedError):
-            await client.type_text(_tab(), 42, "secret")
+            await client.click_element(
+                _tab(),
+                42,
+                expected_element=_element(name="Approve"),
+            )
 
         assert [call.args[1] for call in client._send.await_args_list] == [
             "DOM.enable",
             "DOM.resolveNode",
-            "Runtime.callFunctionOn",
+            "Accessibility.getPartialAXTree",
         ]
 
     asyncio.run(run())

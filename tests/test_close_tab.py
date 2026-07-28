@@ -73,7 +73,7 @@ def test_foreground_close_invalidates_native_state_after_confirmed_shortcut(monk
     monkeypatch.setattr(server, "native_adapter", adapter)
     monkeypatch.setattr(server, "_input_backend", backend)
     monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
-    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
+    monkeypatch.setattr(server, "_native_target_cache", {target.identifier: target})
     monkeypatch.setattr(
         server,
         "_activate_browser_target_and_wait",
@@ -103,7 +103,7 @@ def test_foreground_close_rejects_window_only_target_without_shortcut(monkeypatc
     monkeypatch.setattr(server, "native_adapter", MagicMock())
     monkeypatch.setattr(server, "_input_backend", backend)
     monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
-    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
+    monkeypatch.setattr(server, "_native_target_cache", {target.identifier: target})
 
     result = asyncio.run(server._handle_close_tab({"target_id": target.identifier}))
 
@@ -130,7 +130,7 @@ def test_foreground_close_rechecks_exact_window_and_tab_before_shortcut(monkeypa
     monkeypatch.setattr(server, "native_adapter", adapter)
     monkeypatch.setattr(server, "_input_backend", backend)
     monkeypatch.setattr(server, "coordinator", AutomationCoordinator())
-    monkeypatch.setattr(server, "collect_browser_targets", lambda _adapter: [target])
+    monkeypatch.setattr(server, "_native_target_cache", {target.identifier: target})
     monkeypatch.setattr(
         server,
         "_activate_browser_target_and_wait",

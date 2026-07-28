@@ -80,6 +80,9 @@ its own ephemeral package cache.
 uvx agent-eyes@latest setup
 ```
 
+Setup is the complete bootstrap. Do not run `agent-eyes install` or `agent-eyes init` afterward;
+those are repair and advanced split-flow commands.
+
 Setup displays one combined user-level plan and asks once before applying it.
 For an unattended environment where you have already reviewed the dry run:
 
@@ -114,17 +117,19 @@ already-running MCP client.
 
 ### 6. Make the first MCP calls
 
-Ask the restarted MCP client to call `status` once, then inventory browser tabs
-with `list_tabs` before taking browser action:
+Ask the restarted MCP client to call `status` once. For a known task, ask it to
+use one bounded `execute` call; the target query inventories and reuses open
+browser tabs internally:
 
 ```text
 status {}
-list_tabs {"query": "youtube rollerblade"}
+execute {"target":{"query":"youtube rollerblade","on_missing":"open","url":"https://www.youtube.com/"},"steps":[{"op":"expect","role":"document","name":"YouTube","match":"contains"}]}
 ```
 
-`status` should report `ready`. `list_tabs` should return ranked foreground
-targets without asking for a Chrome remote-debugging restart. MCP tools are
-called by the AI client, not entered directly in a shell.
+`status` should report `ready`. `execute` should stay foreground-native, inspect
+open targets first, and avoid asking for a Chrome remote-debugging restart. For
+exploration, use one `observe_target` call and then one `execute` call. MCP tools
+are called by the AI client, not entered directly in a shell.
 
 ## What setup changes
 
@@ -227,9 +232,10 @@ browsers without a Chrome remote-debugging restart:
 4. Open a new foreground tab only when no suitable target exists.
 5. Keep the returned provider-qualified `target_id` for exact follow-up actions.
 
-Native target IDs include a content fingerprint, for example
-`native:78738:w1:t3:h4a1c9e2d7b10`. Prefer them over mutable tab positions.
-Refresh inventory after navigation, closing, replacement, or reordering.
+Each native `target_id` is an opaque live handle, for example
+`native:78738:w1:t3:r4a1c9e2d7b10f84a`. Do not parse or reconstruct it. Reuse the
+exact provider-qualified handle only while it remains in the current short lease;
+refresh inventory after navigation, closing, replacement, or reordering.
 
 Some browsers expose limited URLs or DOM details for inactive tabs through
 accessibility APIs. That limitation does not cause an automatic switch to a
@@ -264,7 +270,16 @@ input semantics rather than load polling.
 
 For low latency and model-token use:
 
+- For a known task, call `execute` once with the target and at most eight bounded
+  locate/action/expect steps. A target `query` inventories and reuses open tabs
+  inside that call; `on_missing: "open"` requires an explicit safe URL.
+- For an exploratory task, call `observe_target` once with all needed selectors,
+  then call `execute` once with the returned snapshot and target selector: use
+  `target.id` for a `native:` browser target or `target.pid` for a PID target. A
+  native snapshot binds that exact scope; `execute` still performs one live scoped
+  accessibility refresh before locating or acting.
 - Call `context` once for orientation and `list_tabs` once for browser ranking.
+  Use these primitives only when the transaction fast path does not fit the task.
 - Prefer compact accessibility trees over screenshots.
 - Preserve observation `snapshot` tokens and use IDs only with their originating
   snapshot.
@@ -292,10 +307,11 @@ default, profile, JSON field, exit code, environment override, and example.
 
 ## MCP tools
 
-The server exposes 28 tools on macOS and 25 on Windows/Linux after omitting the
+The server exposes 30 tools on macOS and 27 on Windows/Linux after omitting the
 macOS-only `app`, `window`, and Apple Events compatibility `shadow` tools:
 
 - Orientation: `status`, `context`, `list_apps`, `focused`
+- Transaction fast path: `observe_target`, `execute`
 - Structured UI: `tree`, `subtree`, `find`, `pierce`
 - Input: `click`, `type`, `press_key`, `hover`, `scroll`, `drag`, `fill_form`, `upload`
 - Applications/windows on macOS: `app`, `window`
@@ -396,9 +412,10 @@ rollback orchestration is not implemented.
 
 The checked-in pre-hardening baseline and benchmark programs use deterministic
 fixtures so results are attributable to Agent Eyes rather than a website or
-network. The current post-tag, 0.9.0-version branch reference used macOS arm64
-and Python 3.12. Benchmarks use 30 measured samples after three warmups and
-p95=`sorted[ceil(0.95*n)-1]` unless a result records a different protocol.
+network. The historical 0.9.0 branch reference and the 0.10.0 release-candidate
+reference used macOS arm64 and Python 3.12. Benchmarks use 30 measured samples
+after three warmups and p95=`sorted[ceil(0.95*n)-1]` unless a result records a
+different protocol.
 
 | Gate | Before | Post-tag branch | Change |
 |---|---:|---:|---:|
@@ -414,6 +431,23 @@ p95=`sorted[ceil(0.95*n)-1]` unless a result records a different protocol.
 MCP launch through `tools/list`. The earlier baseline included interpreter
 lifecycle and transport cleanup, so those startup values are not like-for-like.
 
+The v0.10.0 bounded-transaction fixture records latency without using hosted
+wall time as a CI gate. Deterministic call, scan, activation, dispatch, output,
+and cleanup counts are the portable release gates:
+
+| v0.10.0 transaction evidence | Median | p95 |
+|---|---:|---:|
+| Known one-call inline-comment journey | 1.484 ms | 2.006 ms |
+| Discovery (`observe_target` then `execute`) | 1.797 ms | 2.672 ms |
+| Maximum `execute` output | 174 bytes | limit 2,048 bytes |
+| Maximum `observe_target` output | 505 bytes | limit 4,096 bytes |
+
+The fixture performs exactly one external write on success, zero foreground
+shadow probes, at most one activation, and at most one full scan before the
+first mutation. The transaction stress gate cancels every named boundary,
+serializes 32 queued foreground calls, and runs 10,000 resource lifecycles with
+zero retained measured resources and RSS growth bounded by max(10 MiB, 5%).
+
 The journey benchmark verifies that an existing YouTube target is activated with
 zero new tabs and zero implicit shadow probes, while an absent target opens one
 foreground tab. It deliberately excludes live browser, rendering, and network
@@ -424,8 +458,23 @@ uv run python benchmarks/benchmark_startup.py
 uv run python benchmarks/benchmark_runtime.py
 uv run python benchmarks/benchmark_cdp_bounds.py
 uv run python benchmarks/benchmark_journeys.py
+uv run python benchmarks/benchmark_transactions.py
+uv run python -m benchmarks.stress_transactions
+uv run python benchmarks/benchmark_live_transactions.py \
+  --executable "$(command -v agent-eyes)" \
+  --query "a unique title or URL already open in your browser" \
+  --wheel dist/agent_eyes-0.10.0-py3-none-any.whl
 uv run python benchmarks/stress_concurrency.py
 ```
+
+The live benchmark uses one real MCP session, redacts the supplied query from its
+JSON result, never requests shadow mode, and restores the previously selected
+native target when the provider exposed one. Pass `--wheel dist/<wheel>.whl` when
+recording release evidence so the result includes the exact artifact SHA-256.
+For a non-mutating real `execute` measurement, also pass a uniquely matching
+`--selector-role` and optional `--selector-name`; the benchmark executes only a
+read-only `expect` step. Reference-agent JSON/JSONL traces can be summarized
+without content fields using `benchmarks/analyze_reference_agent_trace.py`.
 
 The stress suite also validates bounded observation-store memory and 100
 barrier-synchronized cross-process setup-lock acquisitions. Machine-readable
@@ -437,7 +486,7 @@ results and the baseline protocol are under `benchmarks/results/` and
 ```bash
 uv sync --all-groups
 uv run python -m pytest -q
-uvx ruff check src benchmarks scripts
+uvx --from ruff==0.15.7 ruff check src benchmarks scripts
 uvx bandit -r src scripts -q -ll
 uv run agent-eyes doctor --verbose
 ```

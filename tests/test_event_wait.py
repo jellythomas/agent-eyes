@@ -214,7 +214,7 @@ def test_legacy_ax_wait_rechecks_on_protocol_event_without_poll_sleep(monkeypatc
     asyncio.run(run())
 
 
-def test_cancelling_send_cleans_pending_future():
+def test_cancelling_sent_send_releases_pending_future_after_response():
     async def run():
         session = make_session()
 
@@ -230,6 +230,8 @@ def test_cancelling_send_cleans_pending_future():
         except asyncio.CancelledError:
             pass
 
+        assert session.has_pending_commands is True
+        session._on_message({"id": 1, "result": {}})
         assert session._pending == {}
 
     asyncio.run(run())
@@ -452,13 +454,13 @@ def test_shadow_wait_timeout_is_an_mcp_tool_error(monkeypatch):
                 "role": "button",
                 "shadow": True,
                 "target_id": "target-7",
-                "timeout": 0.01,
+                "timeout": 1.0,
             },
         )
 
         assert isinstance(result, CallToolResult)
         assert result.isError is True
-        assert result.content[0].text.startswith("ERROR: Timeout")
+        assert result.content[0].text == "ERROR: Timeout: element not found after 1.0s."
 
     asyncio.run(run())
 

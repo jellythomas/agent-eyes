@@ -23,3 +23,26 @@ def test_sleep_scanner_detects_module_and_direct_import_aliases(tmp_path: Path):
         f"{source}:5",
         f"{source}:6",
     ]
+
+
+def test_static_runtime_gates_cover_only_deterministic_context_and_sleep_counts():
+    gates = benchmark_runtime._deterministic_static_gates()
+
+    assert gates["fixed_orchestration_sleep_calls"] == 0
+    assert gates["tools_list_compact_json_bytes"] <= 16 * 1024
+    assert gates["tool_catalog_limit_bytes"] == 16 * 1024
+    assert gates["passed"] is True
+    assert not any("latency" in key for key in gates)
+
+
+def test_static_runtime_gate_fails_on_a_fixed_orchestration_sleep(monkeypatch):
+    monkeypatch.setattr(
+        benchmark_runtime,
+        "_fixed_orchestration_sleep_calls",
+        lambda: ["server.py:1"],
+    )
+
+    gates = benchmark_runtime._deterministic_static_gates()
+
+    assert gates["fixed_orchestration_sleep_calls"] == 1
+    assert gates["passed"] is False

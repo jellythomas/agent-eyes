@@ -15,6 +15,7 @@ class LinuxAdapter(BaseAdapter):
         self._atspi = None
         self._id_counter = 0
         self._include_web_content = True
+        self._strict_reads = False
 
     def _next_id(self) -> int:
         self._id_counter += 1
@@ -56,8 +57,16 @@ class LinuxAdapter(BaseAdapter):
             return False, f"AT-SPI2 not available: {e}. Install: apt install at-spi2-core python3-gi"
 
     def list_apps(self) -> list[AppInfo]:
+        return self._list_apps(require_complete=False)
+
+    def list_apps_complete(self) -> list[AppInfo]:
+        return self._list_apps(require_complete=True)
+
+    def _list_apps(self, *, require_complete: bool) -> list[AppInfo]:
         self._load()
         desktop = self._atspi.get_desktop(0)
+        if desktop is None:
+            raise RuntimeError("AT-SPI2 desktop inventory is unavailable")
         apps = []
 
         for i in range(desktop.get_child_count()):
@@ -84,6 +93,8 @@ class LinuxAdapter(BaseAdapter):
                     windows=windows,
                 ))
             except Exception:
+                if require_complete:
+                    raise
                 continue
 
         return apps
@@ -115,6 +126,35 @@ class LinuxAdapter(BaseAdapter):
         return self._atspi_to_ui(target_app, 0, max_depth)
 
     def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        return self._get_browser_trees(
+            pid,
+            max_depth=max_depth,
+            require_complete=False,
+        )
+
+    def get_browser_trees_complete(
+        self,
+        pid: int,
+        max_depth: int = 6,
+    ) -> list[UIElement]:
+        previous = self._strict_reads
+        self._strict_reads = True
+        try:
+            return self._get_browser_trees(
+                pid,
+                max_depth=max_depth,
+                require_complete=True,
+            )
+        finally:
+            self._strict_reads = previous
+
+    def _get_browser_trees(
+        self,
+        pid: int,
+        *,
+        max_depth: int,
+        require_complete: bool,
+    ) -> list[UIElement]:
         """Return every browser window tree while pruning page documents."""
         self._load()
         self.reset_ids()
@@ -129,6 +169,8 @@ class LinuxAdapter(BaseAdapter):
                 break
         if target_app is None:
             self._include_web_content = True
+            if require_complete:
+                raise RuntimeError("AT-SPI2 browser process is unavailable")
             return []
 
         try:
@@ -146,6 +188,8 @@ class LinuxAdapter(BaseAdapter):
                 tree = self._atspi_to_ui(target_app, 0, max_depth)
                 if tree is not None:
                     trees.append(tree)
+            if require_complete and not trees:
+                raise RuntimeError("AT-SPI2 browser tree inventory is unavailable")
             return trees
         finally:
             self._include_web_content = True
@@ -218,6 +262,10 @@ class LinuxAdapter(BaseAdapter):
             return None
         cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
         if self._id_counter >= cap:
+            if self._strict_reads:
+                raise RuntimeError(
+                    "AT-SPI browser inventory exceeded its traversal safety cap"
+                )
             return None
 
         try:
@@ -329,9 +377,20 @@ class LinuxAdapter(BaseAdapter):
                     )
                     if child_ui:
                         element.children.append(child_ui)
+            elif (
+                self._strict_reads
+                and not getattr(self, "_include_web_content", True)
+                and role not in ("document web", "document frame")
+                and obj.get_child_count() > 0
+            ):
+                raise RuntimeError(
+                    "AT-SPI browser inventory exceeded its traversal depth bound"
+                )
 
             return element
         except Exception:
+            if self._strict_reads:
+                raise
             return None
 
     def find_elements(
@@ -405,6 +464,36 @@ class LinuxAdapter(BaseAdapter):
             return True
         except Exception:
             return False
+
+    def element_at_position(self, x: float, y: float) -> UIElement | None:
+        """Return the deepest AT-SPI element at physical screen coordinates."""
+        self._load()
+        try:
+            current = self._atspi.get_desktop(0)
+            deepest = None
+            visited: set[int] = set()
+            for _ in range(64):
+                if current is None or id(current) in visited:
+                    break
+                visited.add(id(current))
+                component = current.get_component()
+                if component is None:
+                    break
+                candidate = component.get_accessible_at_point(
+                    int(x),
+                    int(y),
+                    self._atspi.CoordType.SCREEN,
+                )
+                if candidate is None or candidate is current:
+                    break
+                deepest = candidate
+                current = candidate
+            if deepest is None:
+                return None
+            self.reset_ids()
+            return self._atspi_to_ui(deepest, 0, 0)
+        except Exception:
+            return None
 
     def focus_window(self, window: UIElement) -> bool:
         return self.focus_element(window)

@@ -199,6 +199,18 @@ class BaseAdapter(abc.ABC):
         """List running applications with visible windows."""
         ...
 
+    def list_apps_complete(self) -> list[AppInfo]:
+        """List apps or raise when the provider cannot prove completeness."""
+        return self.list_apps()
+
+    def browser_app_has_visible_windows(self, app: AppInfo) -> bool | None:
+        """Return known browser-window visibility, or ``None`` when unknown."""
+        return None
+
+    def browser_app_required_window_count(self, app: AppInfo) -> int | None:
+        """Return a conservative count of browser windows requiring verification."""
+        return None
+
     @abc.abstractmethod
     def get_tree(self, pid: int, max_depth: int = 5) -> UIElement | None:
         """Get the accessibility tree for an application."""
@@ -208,6 +220,14 @@ class BaseAdapter(abc.ABC):
     def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
         """Get every browser window tree while pruning page-document content."""
         ...
+
+    def get_browser_trees_complete(
+        self,
+        pid: int,
+        max_depth: int = 6,
+    ) -> list[UIElement]:
+        """Get browser trees or raise when provider enumeration is incomplete."""
+        return self.get_browser_trees(pid, max_depth=max_depth)
 
     @abc.abstractmethod
     def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:

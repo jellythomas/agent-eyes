@@ -1,4 +1,5 @@
 """Request-scoped operation modes, deadlines, and fail-closed errors."""
+
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +39,9 @@ class OperationErrorCode(Enum):
     PROVIDER_BUSY = "PROVIDER_BUSY"
     RESULT_TRUNCATED = "RESULT_TRUNCATED"
     UNSUPPORTED_CAPABILITY = "UNSUPPORTED_CAPABILITY"
+    INVALID_TRANSACTION = "INVALID_TRANSACTION"
+    AMBIGUOUS_ELEMENT = "AMBIGUOUS_ELEMENT"
+    OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
 
 
 class OperationError(RuntimeError):
@@ -72,6 +76,19 @@ class OperationBudget:
         if not math.isfinite(normalized) or normalized < 0:
             raise ValueError("timeout must be a finite non-negative number")
         return cls(deadline=clock() + normalized, _clock=clock)
+
+    def child(self, timeout: float) -> OperationBudget:
+        """Return a local budget that cannot outlive this parent budget."""
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("timeout must be a finite non-negative number")
+        normalized = float(timeout)
+        if not math.isfinite(normalized) or normalized < 0:
+            raise ValueError("timeout must be a finite non-negative number")
+        local_deadline = self._clock() + normalized
+        return OperationBudget(
+            deadline=min(self.deadline, local_deadline),
+            _clock=self._clock,
+        )
 
     def remaining(self) -> float:
         return max(0.0, self.deadline - self._clock())

@@ -27,7 +27,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install quality tools
-        run: python -m pip install --upgrade pip uv ruff bandit pip-audit
+        run: python -m pip install --upgrade pip uv ruff==0.15.7 bandit pip-audit
       - name: Lint source, benchmarks, and scripts
         run: ruff check src benchmarks scripts
       - name: Reject medium and high static-security findings
@@ -206,5 +206,11 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Gate catalog size and fixed orchestration sleeps
+        run: python benchmarks/benchmark_runtime.py --deterministic-gates-only
+      - name: Run deterministic transaction count and output gates
+        run: python benchmarks/benchmark_transactions.py --samples 3 --warmups 0
+      - name: Run deterministic transaction stress gates
+        run: python -m benchmarks.stress_transactions
       - name: Run deterministic stress gates
         run: python benchmarks/stress_concurrency.py

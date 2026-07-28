@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from agent_eyes.adapters.base import AppInfo, UIElement
 from agent_eyes.browser_inventory import (
+    BrowserQueryState,
     BrowserTarget,
     activate_browser_target,
     best_browser_target,
+    browser_name_for_app,
+    classify_browser_query,
     collect_browser_targets,
     extract_tab_elements,
     format_browser_targets,
@@ -42,6 +48,29 @@ class MultiWindowAdapter(FakeAdapter):
     def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
         self.browser_tree_calls.append((pid, max_depth))
         return self.window_trees.get(pid, [])
+
+
+class BrokenInventoryAdapter(FakeAdapter):
+    def __init__(self, *, fail_apps: bool = False, fail_pid: int | None = None):
+        super().__init__(
+            [
+                AppInfo(pid=51, name="Firefox", windows=["Open tab"]),
+                AppInfo(pid=73, name="Google Chrome", windows=["Pull request"]),
+            ],
+            {51: UIElement(id=1, role="window", name="Open tab")},
+        )
+        self.fail_apps = fail_apps
+        self.fail_pid = fail_pid
+
+    def list_apps(self) -> list[AppInfo]:
+        if self.fail_apps:
+            raise RuntimeError("application inventory unavailable")
+        return super().list_apps()
+
+    def get_tree(self, pid: int, max_depth: int = 5) -> UIElement | None:
+        if pid == self.fail_pid:
+            raise RuntimeError("browser tree unavailable")
+        return super().get_tree(pid, max_depth=max_depth)
 
 
 def test_browser_detection_is_not_chromium_specific():
@@ -147,6 +176,120 @@ def test_collects_every_browser_and_uses_window_fallback():
     assert adapter.tree_calls == [(101, 8), (202, 8)]
 
 
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        BrokenInventoryAdapter(fail_apps=True),
+        BrokenInventoryAdapter(fail_pid=73),
+    ],
+)
+def test_complete_inventory_propagates_global_and_per_browser_failures(adapter):
+    with pytest.raises(RuntimeError, match="inventory|tree"):
+        collect_browser_targets(adapter, require_complete=True)
+
+
+def test_complete_inventory_rejects_window_fallback_without_verified_tabs():
+    adapter = FakeAdapter(
+        [AppInfo(pid=73, name="Google Chrome", windows=["Pull request"])],
+        {73: UIElement(id=1, role="window", name="Pull request")},
+    )
+
+    with pytest.raises(RuntimeError, match="tab inventory"):
+        collect_browser_targets(adapter, require_complete=True)
+
+
+def test_complete_inventory_accepts_every_verified_browser_tab_strip():
+    tab = UIElement(id=2, role="tab", name="Pull request")
+    adapter = FakeAdapter(
+        [AppInfo(pid=73, name="Google Chrome", windows=["Pull request"])],
+        {73: UIElement(id=1, role="window", children=[tab])},
+    )
+
+    targets = collect_browser_targets(adapter, require_complete=True)
+
+    assert [(target.browser, target.title) for target in targets] == [
+        ("Google Chrome", "Pull request")
+    ]
+
+
+def test_complete_inventory_rejects_auxiliary_tabless_ax_window():
+    tab = UIElement(id=3, role="tab", name="Pull request")
+    adapter = MultiWindowAdapter(
+        apps=[AppInfo(pid=73, name="Google Chrome", windows=["Pull request"])],
+        window_trees={
+            73: [
+                UIElement(id=1, role="window", name="Auxiliary panel"),
+                UIElement(id=2, role="window", children=[tab]),
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="tab inventory"):
+        collect_browser_targets(adapter, require_complete=True)
+
+
+def test_complete_inventory_rejects_unverified_titled_browser_window():
+    tab = UIElement(id=3, role="tab", name="Pull request")
+    adapter = MultiWindowAdapter(
+        apps=[
+            AppInfo(
+                pid=73,
+                name="Google Chrome",
+                windows=["Pull request", "Release notes"],
+            )
+        ],
+        window_trees={
+            73: [
+                UIElement(id=1, role="window", children=[tab]),
+                UIElement(id=2, role="window", name="Auxiliary panel"),
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="tab inventory"):
+        collect_browser_targets(adapter, require_complete=True)
+
+
+def test_complete_inventory_uses_adapter_window_count_when_titles_repeat():
+    class CountedWindowAdapter(MultiWindowAdapter):
+        def browser_app_required_window_count(self, _app: AppInfo) -> int:
+            return 2
+
+    tab = UIElement(id=3, role="tab", name="Same title")
+    adapter = CountedWindowAdapter(
+        apps=[AppInfo(pid=73, name="Google Chrome", windows=["Same title"])],
+        window_trees={73: [UIElement(id=1, role="window", children=[tab])]},
+    )
+
+    with pytest.raises(RuntimeError, match="tab inventory"):
+        collect_browser_targets(adapter, require_complete=True)
+
+
+def test_complete_inventory_skips_browser_proven_to_have_no_windows():
+    class WindowlessAdapter(FakeAdapter):
+        def browser_app_has_visible_windows(self, _app: AppInfo) -> bool:
+            return False
+
+        def get_tree(self, pid: int, max_depth: int = 5) -> UIElement | None:
+            raise AssertionError(f"unexpected tree read for {pid} at depth {max_depth}")
+
+    adapter = WindowlessAdapter(
+        [AppInfo(pid=51, name="Safari", windows=[])],
+        {},
+    )
+
+    assert collect_browser_targets(adapter, require_complete=True) == []
+
+
+def test_best_effort_inventory_still_isolates_per_browser_failures():
+    targets = collect_browser_targets(BrokenInventoryAdapter(fail_pid=73))
+
+    assert [(target.browser, target.title) for target in targets] == [
+        ("Firefox", "Open tab"),
+        ("Google Chrome", "Pull request"),
+    ]
+
+
 def test_collects_tabs_from_every_native_browser_window():
     first = UIElement(id=3, role="tab", name="First window tab")
     second = UIElement(id=8, role="tab", name="Second window tab")
@@ -198,13 +341,33 @@ def test_windows_title_is_classified_by_process_name():
 
     with (
         patch("agent_eyes.browser_inventory.sys.platform", "win32"),
-        patch("agent_eyes.browser_inventory.get_process_name", return_value="msedge"),
+        patch(
+            "agent_eyes.browser_inventory.get_process_names",
+            return_value={77: "msedge"},
+        ),
     ):
         targets = collect_browser_targets(adapter)
 
     assert [(target.browser, target.title) for target in targets] == [
         ("Microsoft Edge", "Agent Eyes - GitHub")
     ]
+
+
+def test_windows_browser_identity_uses_a_fresh_snapshot_when_a_pid_is_reused():
+    app = AppInfo(pid=4242, name="Document title")
+
+    with (
+        patch("agent_eyes.browser_inventory.sys.platform", "win32"),
+        patch(
+            "agent_eyes.browser_inventory.get_process_names",
+            side_effect=[{4242: "notepad"}, {4242: "chrome"}],
+        ),
+    ):
+        first = browser_name_for_app(app)
+        second = browser_name_for_app(app)
+
+    assert first == ""
+    assert second == "Google Chrome"
 
 
 def test_query_ranking_prefers_reusable_title_and_url_matches():
@@ -229,6 +392,44 @@ def test_best_target_requires_a_meaningful_match():
     targets = [BrowserTarget(browser="Safari", pid=1, title="Unrelated news")]
 
     assert best_browser_target(targets, "agent eyes") is None
+
+
+def test_selected_target_bonus_never_turns_a_partial_query_into_a_match():
+    target = BrowserTarget(
+        browser="Google Chrome",
+        pid=1,
+        title="Agent Eyes",
+        selected=True,
+        frontmost=True,
+    )
+
+    assert (
+        best_browser_target(
+            [target],
+            "agent eyes definitely absent probe",
+        )
+        is None
+    )
+
+
+def test_query_tokens_never_match_inside_unrelated_larger_words():
+    wrong = BrowserTarget(
+        browser="Firefox",
+        pid=1,
+        title="Spring planning 42",
+        url="https://example.test/spring/42",
+        selected=True,
+        frontmost=True,
+    )
+    right = BrowserTarget(
+        browser="Firefox",
+        pid=2,
+        title="Pull request 42",
+        url="https://example.test/pull-request/42",
+    )
+
+    assert best_browser_target([wrong], "PR 42") is None
+    assert best_browser_target([right], "pull request 42") is not None
 
 
 def test_url_reuse_requires_same_host_and_path_when_url_is_known_or_requested():
@@ -295,7 +496,7 @@ def test_query_output_is_compact_but_reports_full_scan_count():
     output = format_browser_targets(targets, query="OpenAI docs", max_query_results=1)
 
     assert "Scanned 2 open browser targets" in output
-    assert "[native:1:w0:h" in output
+    assert "[native:1:w0:r" in output
     assert "OpenAI API docs" in output
     assert "Unrelated news" not in output
     assert "remote-debugging" not in output
@@ -351,9 +552,87 @@ def test_native_target_identity_does_not_change_when_results_are_ranked():
     unfiltered = format_browser_targets([target])
     ranked = format_browser_targets([target], query="Agent Eyes")
 
-    assert target.identifier.startswith("native:42:w2:t5:h")
+    assert target.identifier.startswith("native:42:w2:t5:r")
     assert f"[{target.identifier}]" in unfiltered
     assert f"[{target.identifier}]" in ranked
+
+
+def test_native_identifier_never_rebinds_by_content_identity():
+    observed = BrowserTarget(
+        browser="Google Chrome",
+        pid=42,
+        title="Agent Eyes",
+        url="https://example.test/agent-eyes",
+        window_index=0,
+        tab_index=5,
+    )
+    refreshed = BrowserTarget(
+        browser=observed.browser,
+        pid=observed.pid,
+        title=observed.title,
+        url=observed.url,
+        window_index=2,
+        tab_index=5,
+    )
+
+    assert refreshed.identifier != observed.identifier
+
+
+def test_complete_inventory_can_reuse_prelisted_apps_without_another_app_scan():
+    class PrelistedAdapter(FakeAdapter):
+        def list_apps(self) -> list[AppInfo]:
+            raise AssertionError("prelisted inventory must not list applications again")
+
+    app = AppInfo(pid=73, name="Google Chrome", windows=["Pull request"])
+    tab = UIElement(id=3, role="tab", name="Pull request")
+    adapter = PrelistedAdapter(
+        [app],
+        {73: UIElement(id=1, role="window", children=[tab])},
+    )
+
+    targets = collect_browser_targets(
+        adapter,
+        require_complete=True,
+        apps=[app],
+    )
+
+    assert [target.title for target in targets] == ["Pull request"]
+
+
+def test_browser_query_evidence_is_present_absent_or_unknown():
+    visible = BrowserTarget(
+        browser="Firefox",
+        pid=42,
+        title="Pull request 42",
+        url="",
+    )
+    known_other = BrowserTarget(
+        browser="Safari",
+        pid=73,
+        title="Release notes",
+        url="https://example.test/releases",
+    )
+
+    assert (
+        classify_browser_query([visible], "Pull request 42")
+        is BrowserQueryState.PRESENT
+    )
+    assert classify_browser_query([], "Pull request 42") is BrowserQueryState.ABSENT
+    assert (
+        classify_browser_query([visible], "Missing target")
+        is BrowserQueryState.UNKNOWN
+    )
+    assert (
+        classify_browser_query([known_other], "Missing target")
+        is BrowserQueryState.ABSENT
+    )
+    assert (
+        classify_browser_query(
+            [replace(known_other, title="")],
+            "Missing target",
+        )
+        is BrowserQueryState.UNKNOWN
+    )
 
 
 def test_default_server_tab_listing_never_probes_shadow_provider(monkeypatch):

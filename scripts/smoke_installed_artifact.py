@@ -16,9 +16,15 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from agent_eyes.setup.templates.skill import SKILL_MD
+
+
+_CATALOG_LIMIT_BYTES = 16 * 1024
+_OUTPUT_LIMITS = {"execute": 2 * 1024, "observe_target": 4 * 1024}
+
 
 def _expected_tool_count(platform_name: str) -> int:
-    return 28 if platform_name == "darwin" else 25
+    return 30 if platform_name == "darwin" else 27
 
 
 def _isolated_environment(root: Path) -> dict[str, str]:
@@ -78,6 +84,14 @@ async def _smoke_mcp(
                 initialized = await session.initialize()
                 tools = await session.list_tools()
                 status = await session.call_tool("status", {})
+                compact_errors = {
+                    "observe_target": await session.call_tool(
+                        "observe_target", {"query": ""}
+                    ),
+                    "execute": await session.call_tool(
+                        "execute", {"target": {}, "steps": []}
+                    ),
+                }
 
     tool_names = [tool.name for tool in tools.tools]
     expected_tool_count = _expected_tool_count(sys.platform)
@@ -95,10 +109,47 @@ async def _smoke_mcp(
         )
     if "status" not in tool_names or status.isError:
         raise RuntimeError("installed MCP status tool failed")
+    tools_by_name = {tool.name: tool for tool in tools.tools}
+    observe_schema = tools_by_name.get("observe_target")
+    execute_schema = tools_by_name.get("execute")
+    if observe_schema is None or execute_schema is None:
+        raise RuntimeError("installed MCP transaction tools are missing")
+    if "selectors" not in observe_schema.inputSchema.get("properties", {}):
+        raise RuntimeError("installed observe_target schema is incomplete")
+    execute_properties = execute_schema.inputSchema.get("properties", {})
+    if not {"target", "steps"}.issubset(execute_properties):
+        raise RuntimeError("installed execute schema is incomplete")
+    catalog_bytes = len(
+        json.dumps(
+            [tool.model_dump(mode="json", exclude_none=True) for tool in tools.tools],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if catalog_bytes > _CATALOG_LIMIT_BYTES:
+        raise RuntimeError(
+            f"installed MCP catalog exceeds {_CATALOG_LIMIT_BYTES} bytes: "
+            f"{catalog_bytes}"
+        )
+    compact_error_bytes: dict[str, int] = {}
+    for name, result in compact_errors.items():
+        if not result.isError:
+            raise RuntimeError(f"installed {name} accepted an invalid smoke request")
+        rendered = "\n".join(
+            item.text for item in result.content if hasattr(item, "text")
+        )
+        compact_error_bytes[name] = len(rendered.encode("utf-8"))
+        if compact_error_bytes[name] > _OUTPUT_LIMITS[name]:
+            raise RuntimeError(
+                f"installed {name} error exceeds its output budget: "
+                f"{compact_error_bytes[name]}"
+            )
     return {
         "protocol_version": initialized.protocolVersion,
         "server_version": initialized.serverInfo.version,
         "tool_count": len(tool_names),
+        "catalog_bytes": catalog_bytes,
+        "compact_error_bytes": compact_error_bytes,
         "status_content_items": len(status.content),
     }
 
@@ -128,6 +179,13 @@ def smoke_installed_artifact(executable: Path, expected_version: str) -> dict[st
         ).stdout
         if "Model-independent, native-first computer use over MCP" not in help_text:
             raise RuntimeError("installed CLI help is incomplete")
+        required_skill_markers = (
+            "For a known task, call `execute` once.",
+            "use at most two normal-path calls: `observe_target`",
+            "Never enter a repeated tree/find",
+        )
+        if any(marker not in SKILL_MD for marker in required_skill_markers):
+            raise RuntimeError("installed Agent Eyes skill lacks the bounded fast path")
 
         setup = _run_cli(
             executable,
@@ -158,6 +216,7 @@ def smoke_installed_artifact(executable: Path, expected_version: str) -> dict[st
     return {
         "cli_version": version,
         "setup_status": setup_payload["status"],
+        "skill_fast_path": True,
         "mcp": mcp,
     }
 

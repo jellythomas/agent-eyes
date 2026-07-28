@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent_eyes.adapters.linux import LinuxAdapter
 
 
@@ -136,3 +138,150 @@ def test_native_identity_uses_atspi_reference_equality():
 
     assert adapter.is_same_element(first, same) is True
     assert adapter.is_same_element(first, different) is False
+
+
+def test_element_at_position_returns_deepest_provider_owned_atspi_element():
+    from agent_eyes.adapters.base import UIElement
+
+    adapter = _make_linux_adapter()
+    desktop = MagicMock()
+    window = MagicMock()
+    button = _make_atspi_element(
+        role="push-button-role",
+        role_name="push button",
+        value="",
+    )
+
+    desktop_component = MagicMock()
+    window_component = MagicMock()
+    button_component = MagicMock()
+    desktop.get_component.return_value = desktop_component
+    window.get_component.return_value = window_component
+    button.get_component.return_value = button_component
+    desktop_component.get_accessible_at_point.return_value = window
+    window_component.get_accessible_at_point.return_value = button
+    button_component.get_accessible_at_point.return_value = None
+    button_component.get_extents.return_value = SimpleNamespace(
+        x=20,
+        y=30,
+        width=40,
+        height=20,
+    )
+    adapter._atspi.get_desktop = lambda _index: desktop
+
+    result = adapter.element_at_position(40.9, 50.8)
+
+    assert result is not None
+    assert result.platform_ref is button
+    assert adapter.is_same_element(
+        result,
+        UIElement(id=99, role="button", platform_ref=button),
+    )
+    desktop_component.get_accessible_at_point.assert_called_once_with(
+        40,
+        50,
+        adapter._atspi.CoordType.SCREEN,
+    )
+    window_component.get_accessible_at_point.assert_called_once_with(
+        40,
+        50,
+        adapter._atspi.CoordType.SCREEN,
+    )
+    button_component.get_accessible_at_point.assert_called_once_with(
+        40,
+        50,
+        adapter._atspi.CoordType.SCREEN,
+    )
+
+
+def test_element_at_position_fails_closed_when_atspi_hit_test_is_unavailable():
+    adapter = _make_linux_adapter()
+    desktop = MagicMock()
+    desktop.get_component.side_effect = RuntimeError("AT-SPI hit test unavailable")
+    adapter._atspi.get_desktop = lambda _index: desktop
+
+    assert adapter.element_at_position(40, 50) is None
+
+
+def test_complete_app_inventory_propagates_partial_atspi_failure():
+    adapter = _make_linux_adapter()
+    broken = MagicMock()
+    broken.get_name.side_effect = RuntimeError("AT-SPI app unavailable")
+    healthy = MagicMock()
+    healthy.get_name.return_value = "Firefox"
+    healthy.get_process_id.return_value = 73
+    healthy.get_child_count.return_value = 0
+    desktop = MagicMock()
+    desktop.get_child_count.return_value = 2
+    desktop.get_child_at_index.side_effect = [broken, healthy, broken]
+    adapter._atspi.get_desktop = lambda _index: desktop
+
+    assert [app.name for app in adapter.list_apps()] == ["Firefox"]
+    with pytest.raises(RuntimeError, match="AT-SPI app unavailable"):
+        adapter.list_apps_complete()
+
+
+def test_complete_browser_inventory_rejects_missing_atspi_process():
+    adapter = _make_linux_adapter()
+    desktop = MagicMock()
+    desktop.get_child_count.return_value = 0
+    adapter._atspi.get_desktop = lambda _index: desktop
+
+    assert adapter.get_browser_trees(73) == []
+    with pytest.raises(RuntimeError, match="browser process"):
+        adapter.get_browser_trees_complete(73)
+
+
+def _set_atspi_children(element, children):
+    element.get_child_count.return_value = len(children)
+    element.get_child_at_index.side_effect = lambda index: children[index]
+
+
+def _configure_linux_browser(adapter, window, *, pid=73):
+    app = MagicMock()
+    app.get_process_id.return_value = pid
+    _set_atspi_children(app, [window])
+    desktop = MagicMock()
+    _set_atspi_children(desktop, [app])
+    adapter._atspi.get_desktop = lambda _index: desktop
+
+
+def test_complete_browser_inventory_rejects_traversal_cap_truncation():
+    adapter = _make_linux_adapter()
+    first = _make_atspi_element(role="page-tab", role_name="page tab", value="")
+    second = _make_atspi_element(role="page-tab", role_name="page tab", value="")
+    window = _make_atspi_element(role="frame", role_name="frame", value="")
+    _set_atspi_children(window, [first, second])
+    _configure_linux_browser(adapter, window)
+    adapter._MAX_ELEMENTS = 2
+
+    assert len(adapter.get_browser_trees(73)[0].children) == 1
+    with pytest.raises(RuntimeError, match="traversal safety cap"):
+        adapter.get_browser_trees_complete(73)
+
+
+def test_complete_browser_inventory_rejects_depth_truncation():
+    adapter = _make_linux_adapter()
+    tab = _make_atspi_element(role="page-tab", role_name="page tab", value="")
+    group = _make_atspi_element(role="panel", role_name="panel", value="")
+    _set_atspi_children(group, [tab])
+    window = _make_atspi_element(role="frame", role_name="frame", value="")
+    _set_atspi_children(window, [group])
+    _configure_linux_browser(adapter, window)
+
+    assert adapter.get_browser_trees(73, max_depth=1)[0].children[0].children == []
+    with pytest.raises(RuntimeError, match="traversal depth bound"):
+        adapter.get_browser_trees_complete(73, max_depth=1)
+
+
+def test_complete_browser_inventory_propagates_child_read_failure():
+    adapter = _make_linux_adapter()
+    broken = MagicMock()
+    broken.get_role_name.side_effect = RuntimeError("broken AT-SPI child")
+    window = _make_atspi_element(role="frame", role_name="frame", value="")
+    _set_atspi_children(window, [broken])
+    _configure_linux_browser(adapter, window)
+
+    assert adapter.get_browser_trees(73)[0].children == []
+    with pytest.raises(RuntimeError, match="broken AT-SPI child"):
+        adapter.get_browser_trees_complete(73)

@@ -56,7 +56,18 @@ def test_checked_in_codex_skill_metadata_matches_the_installer_template():
     assert source.read_text(encoding="utf-8") == OPENAI_YAML
 
 
+def test_codex_skill_metadata_prompts_the_bounded_transaction_fast_path():
+    assert "$agent-eyes" in OPENAI_YAML
+    assert "one bounded execute call" in OPENAI_YAML
+    assert "reuse an open target" in OPENAI_YAML
+
+
 def test_generated_claude_guidance_uses_current_tool_names_and_policy():
+    assert "mcp__agent-eyes__execute" in CLAUDE_MD_SECTION
+    assert "mcp__agent-eyes__observe_target" in CLAUDE_MD_SECTION
+    assert "Known task" in CLAUDE_MD_SECTION
+    assert "Exploratory task" in CLAUDE_MD_SECTION
+    assert "Bounded recovery only" in CLAUDE_MD_SECTION
     assert "mcp__agent-eyes__list_tabs" in CLAUDE_MD_SECTION
     assert "reuse relevant open tabs across browsers" in CLAUDE_MD_SECTION
     assert "event-backed `wait`" in CLAUDE_MD_SECTION
@@ -151,6 +162,10 @@ def test_generated_agent_tool_names_follow_platform_specific_surface():
     assert "mcp__agent-eyes__window" not in linux_tools
     assert "mcp__agent-eyes__app" not in windows_tools
     assert "mcp__agent-eyes__window" not in windows_tools
+    assert {
+        "mcp__agent-eyes__observe_target",
+        "mcp__agent-eyes__execute",
+    } <= macos_tools & linux_tools & windows_tools
 
 
 def test_configure_preserves_unrelated_servers_and_creates_backup(tmp_path):

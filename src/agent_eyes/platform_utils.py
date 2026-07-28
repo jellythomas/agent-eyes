@@ -5,11 +5,13 @@ and URL opening. Works on macOS, Linux, and Windows.
 """
 from __future__ import annotations
 
+import csv
 import functools
 import logging
 import os
-import sys
 import subprocess
+import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -67,6 +69,47 @@ def _get_process_name_windows(pid: int) -> str:
         return ""
     except Exception:
         return ""
+
+
+def get_process_names(pids: Iterable[int]) -> dict[int, str]:
+    """Return a fresh process-name snapshot for the requested PIDs."""
+    requested = {
+        pid
+        for pid in pids
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    }
+    if not requested:
+        return {}
+    if sys.platform != "win32":
+        return {pid: get_process_name(pid) for pid in requested}
+
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    names: dict[int, str] = {}
+    for row in csv.reader(result.stdout.splitlines()):
+        if len(row) < 2:
+            continue
+        try:
+            pid = int(row[1])
+        except (TypeError, ValueError):
+            continue
+        if pid not in requested:
+            continue
+        process_name = row[0]
+        if process_name.casefold().endswith(".exe"):
+            process_name = process_name[:-4]
+        names[pid] = process_name
+    return names
 
 
 def is_browser_pid(pid: int) -> bool:

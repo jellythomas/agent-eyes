@@ -106,6 +106,20 @@ class CDPSession:
 
     # ── Public API ────────────────────────────────────────────────────
 
+    @property
+    def has_pending_commands(self) -> bool:
+        """Return whether a sent command still awaits transport settlement."""
+        return bool(self._pending)
+
+    async def wait_until_idle(self) -> None:
+        """Wait until every command already sent on this session settles."""
+        while self._pending:
+            pending = tuple(self._pending.values())
+            await asyncio.gather(
+                *(asyncio.shield(future) for future in pending),
+                return_exceptions=True,
+            )
+
     async def send(
         self,
         method: str,
@@ -202,24 +216,19 @@ class CDPSession:
                 params,
             )
             result = await asyncio.wait_for(
-                future,
+                asyncio.shield(future),
                 timeout=_COMMAND_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            self._pending.pop(msg_id, None)
             raise RuntimeError(
                 f"CDP command {method} timed out after "
                 f"{_COMMAND_TIMEOUT_SECONDS:g}s"
             )
         except asyncio.CancelledError:
-            self._pending.pop(msg_id, None)
-            if not future.done():
-                future.cancel()
             raise
         except Exception:
-            self._pending.pop(msg_id, None)
-            if not future.done():
-                future.cancel()
+            if future.done():
+                self._pending.pop(msg_id, None)
             raise
 
         if "error" in result:

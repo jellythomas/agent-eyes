@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from agent_eyes.adapters.base import UIElement
 from agent_eyes.observations import ElementRecord, ObservationStore
 from agent_eyes.operation import OperationError, OperationErrorCode, OperationMode
 
@@ -454,6 +455,49 @@ def test_snapshots_and_records_are_immutable():
         record.local_id = 2  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         snapshot.revision = 2  # type: ignore[misc]
+
+
+def test_detached_ui_tree_records_bound_recursive_retention_to_record_cap():
+    store = ObservationStore(max_elements_per_snapshot=500)
+
+    def create_deep_snapshot():
+        nodes = [
+            UIElement(id=index, role="group", name=f"node-{index}")
+            for index in range(1, 1_001)
+        ]
+        for parent, child in zip(nodes, nodes[1:]):
+            parent.children = [child]
+        original_root = weakref.ref(nodes[0])
+        excluded_tail = weakref.ref(nodes[-1])
+        snapshot = store.create(
+            provider="native",
+            mode=OperationMode.FOREGROUND,
+            target_id="pid:73",
+            generation=0,
+            revision=1,
+            elements=(
+                ElementRecord(local_id=node.id, value=node)
+                for node in nodes[:500]
+            ),
+            detach_ui_trees=True,
+            truncated=True,
+        )
+        return snapshot, original_root, excluded_tail
+
+    snapshot, original_root, excluded_tail = create_deep_snapshot()
+    gc.collect()
+
+    stored_root = snapshot.elements[0].value
+    retained = 0
+    current = stored_root
+    while current is not None:
+        retained += 1
+        current = current.children[0] if current.children else None
+
+    assert retained == 500
+    assert snapshot.truncated is True
+    assert original_root() is None
+    assert excluded_tail() is None
 
 
 def test_duplicate_local_ids_are_rejected():

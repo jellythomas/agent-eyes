@@ -38,6 +38,75 @@ def test_budget_uses_one_absolute_monotonic_deadline():
     assert budget.deadline == 102.0
 
 
+@pytest.mark.parametrize(
+    ("parent_timeout", "elapsed", "local_timeout", "expected_deadline"),
+    [
+        (10.0, 2.0, 3.0, 105.0),
+        (10.0, 2.0, 20.0, 110.0),
+    ],
+)
+def test_child_deadline_is_bounded_by_parent_and_local_deadlines(
+    parent_timeout: float,
+    elapsed: float,
+    local_timeout: float,
+    expected_deadline: float,
+):
+    clock = FakeClock()
+    parent = OperationBudget.start(parent_timeout, clock=clock)
+    clock.advance(elapsed)
+
+    child = parent.child(local_timeout)
+
+    assert child.deadline == expected_deadline
+
+
+def test_child_shares_the_parent_clock():
+    clock = FakeClock()
+    parent = OperationBudget.start(10.0, clock=clock)
+    child = parent.child(3.0)
+
+    assert child._clock is clock
+    assert child.remaining() == 3.0
+
+    clock.advance(1.25)
+
+    assert child.remaining() == 1.75
+
+
+def test_child_of_expired_parent_remains_expired_at_parent_deadline():
+    clock = FakeClock()
+    parent = OperationBudget.start(1.0, clock=clock)
+    clock.advance(2.0)
+
+    child = parent.child(5.0)
+
+    assert child.deadline == parent.deadline
+    assert child.remaining() == 0.0
+    assert child.expired is True
+
+
+def test_zero_length_child_is_valid_but_immediately_expired():
+    clock = FakeClock()
+    parent = OperationBudget.start(10.0, clock=clock)
+
+    child = parent.child(0.0)
+
+    assert child.deadline == clock.value
+    assert child.remaining() == 0.0
+    assert child.expired is True
+
+
+@pytest.mark.parametrize("timeout", [True, False, -1.0, math.inf, -math.inf, math.nan])
+def test_child_rejects_invalid_timeout(timeout: float):
+    parent = OperationBudget.start(10.0)
+
+    with pytest.raises(
+        ValueError,
+        match="timeout must be a finite non-negative number",
+    ):
+        parent.child(timeout)
+
+
 def test_checkpoint_fails_with_typed_deadline_error():
     clock = FakeClock()
     budget = OperationBudget.start(0.1, clock=clock)
@@ -73,6 +142,22 @@ def test_wait_for_uses_remaining_budget_and_classifies_timeout():
 
         assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
         assert "blocked provider" in str(exc_info.value)
+
+    asyncio.run(run())
+
+
+def test_child_wait_for_uses_the_bounded_local_deadline():
+    async def run() -> None:
+        blocker = asyncio.Event()
+        parent = OperationBudget.start(1.0)
+        child = parent.child(0.01)
+
+        with pytest.raises(OperationError) as exc_info:
+            await child.wait_for(blocker.wait(), operation="bounded child provider")
+
+        assert exc_info.value.code is OperationErrorCode.DEADLINE_EXCEEDED
+        assert "bounded child provider" in str(exc_info.value)
+        assert parent.expired is False
 
     asyncio.run(run())
 

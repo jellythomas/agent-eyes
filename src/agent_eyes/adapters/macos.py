@@ -18,6 +18,9 @@ class MacOSAdapter(BaseAdapter):
         self._include_web_content = True
         self._traversed_elements = 0
         self._visited_element_keys: set[int] = set()
+        self._strict_reads = False
+        self._window_server_visible_pids: set[int] | None = None
+        self._window_server_required_window_counts: dict[int, int] | None = None
 
     def _next_id(self) -> int:
         self._id_counter += 1
@@ -100,8 +103,29 @@ class MacOSAdapter(BaseAdapter):
 
         return sorted(apps, key=lambda a: (not a.is_frontmost, a.name))
 
+    def list_apps_complete(self) -> list[AppInfo]:
+        """Return app inventory or surface AX fallback failures to safe callers."""
+        previous = self._strict_reads
+        self._strict_reads = True
+        try:
+            return self.list_apps()
+        finally:
+            self._strict_reads = previous
+
+    def browser_app_has_visible_windows(self, app: AppInfo) -> bool | None:
+        """Use the last complete WindowServer snapshot, including untitled windows."""
+        visible_pids = self._window_server_visible_pids
+        return None if visible_pids is None else app.pid in visible_pids
+
+    def browser_app_required_window_count(self, app: AppInfo) -> int | None:
+        """Count distinct titled or on-screen normal WindowServer windows."""
+        counts = self._window_server_required_window_counts
+        return None if counts is None else counts.get(app.pid, 0)
+
     def _window_titles_by_pid(self) -> dict[int, list[str]] | None:
         """Read all normal-window titles with one WindowServer call."""
+        self._window_server_visible_pids = None
+        self._window_server_required_window_counts = None
         try:
             records = self._quartz.CGWindowListCopyWindowInfo(
                 self._quartz.kCGWindowListOptionAll,
@@ -113,7 +137,10 @@ class MacOSAdapter(BaseAdapter):
             return None
 
         titles: dict[int, list[str]] = defaultdict(list)
+        visible_pids: set[int] = set()
+        required_window_keys: dict[int, set[tuple[object, ...]]] = defaultdict(set)
         saw_title = False
+        saw_on_screen = False
         for record in records:
             try:
                 if int(record.get(self._quartz.kCGWindowLayer, -1)) != 0:
@@ -122,14 +149,41 @@ class MacOSAdapter(BaseAdapter):
                 title = str(record.get(self._quartz.kCGWindowName, "") or "").strip()
             except (TypeError, ValueError):
                 continue
-            if pid <= 0 or not title:
+            if pid <= 0:
                 continue
-            saw_title = True
-            if title not in titles[pid]:
-                titles[pid].append(title)
+            visible_pids.add(pid)
+            window_number_key = getattr(self._quartz, "kCGWindowNumber", None)
+            window_number = (
+                record.get(window_number_key) if window_number_key is not None else None
+            )
+            if window_number is not None:
+                identity: tuple[object, ...] = ("window", window_number)
+            else:
+                bounds_key = getattr(self._quartz, "kCGWindowBounds", None)
+                bounds = record.get(bounds_key, {}) if bounds_key is not None else {}
+                identity = ("fallback", title, repr(bounds))
+
+            on_screen_key = getattr(self._quartz, "kCGWindowIsOnscreen", None)
+            on_screen = bool(
+                record.get(on_screen_key, False) if on_screen_key is not None else False
+            )
+            if on_screen:
+                saw_on_screen = True
+                required_window_keys[pid].add(identity)
+            if title:
+                saw_title = True
+                required_window_keys[pid].add(identity)
+                if title not in titles[pid]:
+                    titles[pid].append(title)
 
         # An entirely title-less result usually means metadata access is not
         # available. Preserve the AX fallback in that environment.
+        self._window_server_visible_pids = visible_pids if saw_title else None
+        self._window_server_required_window_counts = (
+            {pid: len(keys) for pid, keys in required_window_keys.items()}
+            if saw_title or saw_on_screen
+            else None
+        )
         return dict(titles) if saw_title else None
 
     def _ax_window_titles(self, pid: int) -> list[str]:
@@ -148,9 +202,20 @@ class MacOSAdapter(BaseAdapter):
 
     def _read_attr(self, element, attr: str) -> any:
         """Safely read an accessibility attribute."""
-        err, val = self._ax.AXUIElementCopyAttributeValue(element, attr, None)
+        try:
+            err, val = self._ax.AXUIElementCopyAttributeValue(element, attr, None)
+        except Exception as exc:
+            if self._strict_reads:
+                raise RuntimeError(
+                    f"macOS accessibility read failed for {attr}"
+                ) from exc
+            return None
         if err == 0 and val is not None:
             return val
+        if self._strict_reads and err != 0:
+            raise RuntimeError(
+                f"macOS accessibility read failed for {attr} (error {err})"
+            )
         return None
 
     @staticmethod
@@ -232,6 +297,10 @@ class MacOSAdapter(BaseAdapter):
                 ax_el, attrs, 0, None  # 0 = don't stop on error
             )
             if err != 0 or values is None:
+                if self._strict_reads:
+                    raise RuntimeError(
+                        f"macOS accessibility batch read failed (error {err})"
+                    )
                 return {}
 
             result = {}
@@ -245,6 +314,8 @@ class MacOSAdapter(BaseAdapter):
                     result[attr] = val
             return result
         except Exception:
+            if self._strict_reads:
+                raise
             # Fallback to individual reads if batch API unavailable
             return {attr: self._read_attr(ax_el, attr) for attr in self._BATCH_ATTRS}
 
@@ -273,6 +344,10 @@ class MacOSAdapter(BaseAdapter):
         else:
             cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
         if self._traversed_elements >= cap:
+            if self._strict_reads:
+                raise RuntimeError(
+                    "macOS AX browser inventory exceeded its traversal safety cap"
+                )
             return None
         self._visited_element_keys.add(element_key)
         self._traversed_elements += 1
@@ -386,6 +461,8 @@ class MacOSAdapter(BaseAdapter):
                             if child:
                                 element.children.append(child)
                         except Exception:
+                            if self._strict_reads:
+                                raise
                             continue  # Skip crashed/invalid child elements
                 if element.children:
                     return element
@@ -402,7 +479,18 @@ class MacOSAdapter(BaseAdapter):
                     if child:
                         element.children.append(child)
                 except Exception:
+                    if self._strict_reads:
+                        raise
                     continue  # Skip crashed/invalid child elements
+        elif (
+            self._strict_reads
+            and browser_inventory
+            and children_raw
+            and role not in self._BROWSER_DOCUMENT_ROLES
+        ):
+            raise RuntimeError(
+                "macOS AX browser inventory exceeded its traversal depth bound"
+            )
 
         return element
 
@@ -483,6 +571,19 @@ class MacOSAdapter(BaseAdapter):
             return trees
         finally:
             self._include_web_content = True
+
+    def get_browser_trees_complete(
+        self,
+        pid: int,
+        max_depth: int = 6,
+    ) -> list[UIElement]:
+        """Return every browser tree or raise on any collapsed AX read failure."""
+        previous = self._strict_reads
+        self._strict_reads = True
+        try:
+            return self.get_browser_trees(pid, max_depth=max_depth)
+        finally:
+            self._strict_reads = previous
 
     def get_subtree(self, element: UIElement, max_depth: int = 5) -> UIElement | None:
         if element.platform_ref is None:

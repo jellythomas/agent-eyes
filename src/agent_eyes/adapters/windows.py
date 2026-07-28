@@ -84,6 +84,7 @@ class WindowsAdapter(BaseAdapter):
         self._id_counter = 0
         self._in_web_area = False
         self._include_web_content = True
+        self._strict_reads = False
         try:
             import comtypes
             import comtypes.client
@@ -110,7 +111,15 @@ class WindowsAdapter(BaseAdapter):
         return True, "UI Automation is system-level"
 
     def list_apps(self) -> list[AppInfo]:
+        return self._list_apps(require_complete=False)
+
+    def list_apps_complete(self) -> list[AppInfo]:
+        return self._list_apps(require_complete=True)
+
+    def _list_apps(self, *, require_complete: bool) -> list[AppInfo]:
         if self._uia is None or self._root is None:
+            if require_complete:
+                raise RuntimeError("Windows UI Automation inventory is unavailable")
             return []
         apps = []
         seen_pids: set[int] = set()
@@ -140,6 +149,8 @@ class WindowsAdapter(BaseAdapter):
                                 if t:
                                     windows.append(t)
                         except Exception:
+                            if require_complete:
+                                raise
                             continue
 
                     apps.append(AppInfo(
@@ -148,9 +159,12 @@ class WindowsAdapter(BaseAdapter):
                         windows=windows,
                     ))
                 except Exception:
+                    if require_complete:
+                        raise
                     continue
         except Exception:
-            pass
+            if require_complete:
+                raise
         return apps
 
     # Roles worth exposing inside web content
@@ -178,6 +192,10 @@ class WindowsAdapter(BaseAdapter):
             return None
         cap = self._WEB_MAX_ELEMENTS if self._in_web_area else self._MAX_ELEMENTS
         if self._id_counter >= cap:
+            if getattr(self, "_strict_reads", False):
+                raise RuntimeError(
+                    "Windows UIA browser inventory exceeded its traversal safety cap"
+                )
             return None
 
         try:
@@ -269,6 +287,8 @@ class WindowsAdapter(BaseAdapter):
                                 if child_ui:
                                     element.children.append(child_ui)
                         except Exception:
+                            if getattr(self, "_strict_reads", False):
+                                raise
                             pass
                     if element.children:
                         return element
@@ -286,10 +306,25 @@ class WindowsAdapter(BaseAdapter):
                         if child_ui:
                             element.children.append(child_ui)
                 except Exception:
+                    if getattr(self, "_strict_reads", False):
+                        raise
                     pass
+            elif (
+                getattr(self, "_strict_reads", False)
+                and not getattr(self, "_include_web_content", True)
+                and role != "document"
+            ):
+                condition = self._uia.CreateTrueCondition()
+                children = el.FindAll(_TREE_SCOPE_CHILDREN, condition)
+                if children.Length:
+                    raise RuntimeError(
+                        "Windows UIA browser inventory exceeded its traversal depth bound"
+                    )
 
             return element
         except Exception:
+            if getattr(self, "_strict_reads", False):
+                raise
             return None
 
     def get_tree(self, pid: int, max_depth: int = 5,
@@ -310,8 +345,39 @@ class WindowsAdapter(BaseAdapter):
             return None
 
     def get_browser_trees(self, pid: int, max_depth: int = 6) -> list[UIElement]:
+        return self._get_browser_trees(
+            pid,
+            max_depth=max_depth,
+            require_complete=False,
+        )
+
+    def get_browser_trees_complete(
+        self,
+        pid: int,
+        max_depth: int = 6,
+    ) -> list[UIElement]:
+        previous = getattr(self, "_strict_reads", False)
+        self._strict_reads = True
+        try:
+            return self._get_browser_trees(
+                pid,
+                max_depth=max_depth,
+                require_complete=True,
+            )
+        finally:
+            self._strict_reads = previous
+
+    def _get_browser_trees(
+        self,
+        pid: int,
+        *,
+        max_depth: int,
+        require_complete: bool,
+    ) -> list[UIElement]:
         """Return every top-level browser window, pruning document content."""
         if self._uia is None or self._root is None:
+            if require_complete:
+                raise RuntimeError("Windows UI Automation browser inventory is unavailable")
             return []
         self.reset_ids()
         self._include_web_content = False
@@ -330,6 +396,8 @@ class WindowsAdapter(BaseAdapter):
                     trees.append(tree)
             return trees
         except Exception:
+            if require_complete:
+                raise
             return []
         finally:
             self._include_web_content = True
@@ -440,6 +508,23 @@ class WindowsAdapter(BaseAdapter):
             return True
         except Exception:
             return False
+
+    def element_at_position(self, x: float, y: float) -> UIElement | None:
+        """Return the provider-owned UIA element at desktop coordinates."""
+        if self._uia is None:
+            return None
+        try:
+            from ctypes import wintypes
+
+            native_element = self._uia.ElementFromPoint(
+                wintypes.POINT(int(x), int(y))
+            )
+            if native_element is None:
+                return None
+            self.reset_ids()
+            return self._element_to_ui(native_element, 0, 0)
+        except Exception:
+            return None
 
     def focus_window(self, window: UIElement) -> bool:
         return self.focus_element(window)

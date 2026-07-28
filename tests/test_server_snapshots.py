@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent_eyes.adapters.base import UIElement
-from agent_eyes.cdp import CDPDocumentChangedError, CDPMutationOutcomeUnknown
+from agent_eyes.cdp import (
+    CDPDocumentChangedError,
+    CDPFocusMismatchError,
+    CDPMutationOutcomeUnknown,
+)
 from agent_eyes.coordinator import AutomationCoordinator
 from agent_eyes.observations import ElementRecord
 from agent_eyes.operation import OperationBudget, OperationMode
@@ -32,6 +36,34 @@ def _native_tree(label: str) -> UIElement:
         name=label,
         children=[UIElement(id=2, role="button", name=f"{label} button")],
     )
+
+
+def _partial_ax_node(
+    backend_id: int,
+    role: str,
+    name: str,
+    *,
+    focused: bool = False,
+) -> dict:
+    properties = []
+    if focused:
+        properties.append(
+            {
+                "name": "focused",
+                "value": {"type": "booleanOrUndefined", "value": True},
+            }
+        )
+    return {
+        "nodes": [
+            {
+                "backendDOMNodeId": backend_id,
+                "ignored": False,
+                "role": {"value": role},
+                "name": {"value": name},
+                "properties": properties,
+            }
+        ]
+    }
 
 
 def test_focused_element_emits_actionable_native_snapshot(monkeypatch):
@@ -87,7 +119,8 @@ def test_subtree_requires_and_derives_from_exact_native_snapshot(monkeypatch):
     assert "snapshot is required" in missing
     assert derived.provider == "native"
     assert derived.target_id == "pid:73"
-    assert record.value is child
+    assert record.value == child
+    assert record.value is not child
     adapter.get_subtree.assert_called_once_with(root, max_depth=3)
 
 
@@ -113,12 +146,14 @@ def test_context_emits_snapshot_when_it_displays_focused_id(monkeypatch):
     token = _snapshot_token(output)
     snapshot, record = coordinator.observations.resolve_with_snapshot(token, 12)
 
-    assert "Browser — Article | [12] button \"Publish\" focused" in output
+    assert 'Browser — Article | [12] button "Publish" focused' in output
     assert snapshot.target_id == "pid:73"
     assert record.value is focused
 
 
-def test_tree_emits_snapshot_and_later_tree_cannot_redirect_qualified_click(monkeypatch):
+def test_tree_emits_snapshot_and_later_tree_cannot_redirect_qualified_click(
+    monkeypatch,
+):
     from agent_eyes import server
 
     trees = {
@@ -288,9 +323,7 @@ def test_shadow_web_tree_emits_target_bound_snapshot(monkeypatch):
     )
 
     output = asyncio.run(
-        server._handle_get_web_tree(
-            {"shadow": True, "target_id": "target-7"}
-        )
+        server._handle_get_web_tree({"shadow": True, "target_id": "target-7"})
     )
     token = _snapshot_token(output)
     metadata, record = coordinator.observations.resolve_with_snapshot(token, 42)
@@ -299,7 +332,8 @@ def test_shadow_web_tree_emits_target_bound_snapshot(monkeypatch):
     assert metadata.target_id == "target-7"
     assert metadata.generation == 4
     assert metadata.revision == 101
-    assert record.value is tree.children[0]
+    assert record.value == tree.children[0]
+    assert record.value is not tree.children[0]
     assert record.actionable is True
 
 
@@ -390,9 +424,7 @@ def test_persistent_shadow_tree_redacts_dom_classified_secure_textbox(monkeypatc
     token = _snapshot_token(output)
     snapshot = coordinator.observations.get_snapshot(token)
     field = next(
-        record.value
-        for record in snapshot.elements
-        if record.value.platform_ref == 701
+        record.value for record in snapshot.elements if record.value.platform_ref == 701
     )
     assert secret not in output
     assert field.value == ""
@@ -443,16 +475,12 @@ def test_apple_web_tree_is_exact_target_bound_and_read_only(monkeypatch):
     )
 
     output = asyncio.run(
-        server._handle_get_web_tree(
-            {"shadow": True, "target_id": target.identifier}
-        )
+        server._handle_get_web_tree({"shadow": True, "target_id": target.identifier})
     )
     token = _snapshot_token(output)
     snapshot, record = coordinator.observations.resolve_with_snapshot(token, 2)
     click = asyncio.run(
-        server._handle_click(
-            {"shadow": True, "snapshot": token, "id": 2}
-        )
+        server._handle_click({"shadow": True, "snapshot": token, "id": 2})
     )
 
     assert snapshot.provider == "apple-events"
@@ -545,7 +573,8 @@ def test_shadow_click_uses_snapshot_target_generation_and_revision(monkeypatch):
         send=AsyncMock(
             side_effect=[
                 {"object": {"objectId": "object-1"}},
-                {},
+                _partial_ax_node(123, "button", "Submit"),
+                {"result": {"value": "__agent_eyes_click_applied_v1__"}},
             ]
         ),
     )
@@ -561,9 +590,7 @@ def test_shadow_click_uses_snapshot_target_generation_and_revision(monkeypatch):
     )
 
     result = asyncio.run(
-        server._handle_click(
-            {"snapshot": snapshot.token, "id": 9, "shadow": True}
-        )
+        server._handle_click({"snapshot": snapshot.token, "id": 9, "shadow": True})
     )
 
     assert result == 'clicked [9] button "Submit"'
@@ -572,10 +599,33 @@ def test_shadow_click_uses_snapshot_target_generation_and_revision(monkeypatch):
         "DOM.resolveNode",
         {"backendNodeId": 123},
     )
-    assert session.send.await_args_list[1].args[0] == "Runtime.callFunctionOn"
+    assert session.send.await_args_list[1].args[0] == "Accessibility.getPartialAXTree"
+    assert session.send.await_args_list[2].args[0] == "Runtime.callFunctionOn"
 
 
-def test_persistent_shadow_click_rejects_runtime_stale_element_exception(monkeypatch):
+@pytest.mark.parametrize(
+    ("runtime_result", "expected_code"),
+    [
+        (
+            {"result": {"value": "__agent_eyes_action_stale_v1__"}},
+            "OUTCOME_UNKNOWN",
+        ),
+        (
+            {
+                "exceptionDetails": {
+                    "text": "Uncaught",
+                    "exception": {"description": "Error: STALE_ELEMENT"},
+                }
+            },
+            "OUTCOME_UNKNOWN",
+        ),
+    ],
+)
+def test_persistent_shadow_click_trusts_only_fixed_runtime_status(
+    monkeypatch,
+    runtime_result,
+    expected_code,
+):
     from agent_eyes import server
 
     coordinator = AutomationCoordinator()
@@ -600,12 +650,8 @@ def test_persistent_shadow_click_rejects_runtime_stale_element_exception(monkeyp
         send=AsyncMock(
             side_effect=[
                 {"object": {"objectId": "object-1"}},
-                {
-                    "exceptionDetails": {
-                        "text": "Uncaught",
-                        "exception": {"description": "Error: STALE_ELEMENT"},
-                    }
-                },
+                _partial_ax_node(123, "button", "Submit"),
+                runtime_result,
             ]
         ),
     )
@@ -623,7 +669,7 @@ def test_persistent_shadow_click_rejects_runtime_stale_element_exception(monkeyp
         server._handle_click({"snapshot": snapshot.token, "id": 9, "shadow": True})
     )
 
-    assert "STALE_SNAPSHOT" in result
+    assert expected_code in result
     assert "clicked [9]" not in result
     with pytest.raises(OperationError) as exc_info:
         coordinator.observations.resolve(snapshot.token, 9)
@@ -655,6 +701,7 @@ def test_persistent_shadow_click_marks_unknown_runtime_exception(monkeypatch):
         send=AsyncMock(
             side_effect=[
                 {"object": {"objectId": "object-1"}},
+                _partial_ax_node(123, "button", "Submit"),
                 {"exceptionDetails": {"text": "Uncaught"}},
             ]
         ),
@@ -675,6 +722,58 @@ def test_persistent_shadow_click_marks_unknown_runtime_exception(monkeypatch):
 
     assert "OUTCOME_UNKNOWN" in result
     assert "clicked [9]" not in result
+
+
+def test_persistent_shadow_click_rejects_changed_ax_semantics_before_dispatch(
+    monkeypatch,
+):
+    from agent_eyes import server
+
+    coordinator = AutomationCoordinator()
+    element = UIElement(
+        id=9,
+        role="button",
+        name="Approve",
+        source="cdp",
+        platform_ref=123,
+    )
+    snapshot = coordinator.observations.create(
+        provider="cdp-persistent",
+        mode=OperationMode.SHADOW,
+        target_id="target-b",
+        generation=5,
+        revision=77,
+        elements=[ElementRecord(local_id=9, value=element)],
+    )
+    session = SimpleNamespace(
+        target_id="target-b",
+        generation=5,
+        send=AsyncMock(
+            side_effect=[
+                {"object": {"objectId": "object-1"}},
+                _partial_ax_node(123, "button", "Delete"),
+            ]
+        ),
+    )
+    pool = MagicMock()
+    pool.get_session_for_target.return_value = session
+    monkeypatch.setattr(server, "coordinator", coordinator)
+    monkeypatch.setattr(server, "cdp_pool", pool)
+    monkeypatch.setattr(
+        server,
+        "_persistent_document_revision",
+        AsyncMock(return_value=77),
+    )
+
+    result = asyncio.run(
+        server._handle_click({"snapshot": snapshot.token, "id": 9, "shadow": True})
+    )
+
+    assert "STALE_SNAPSHOT" in result
+    assert [call.args[0] for call in session.send.await_args_list] == [
+        "DOM.resolveNode",
+        "Accessibility.getPartialAXTree",
+    ]
 
 
 def test_shadow_click_rechecks_document_after_resolving_before_dispatch(monkeypatch):
@@ -712,9 +811,7 @@ def test_shadow_click_rechecks_document_after_resolving_before_dispatch(monkeypa
     )
 
     result = asyncio.run(
-        server._handle_click(
-            {"snapshot": snapshot.token, "id": 9, "shadow": True}
-        )
+        server._handle_click({"snapshot": snapshot.token, "id": 9, "shadow": True})
     )
 
     assert "STALE_SNAPSHOT" in result
@@ -722,7 +819,28 @@ def test_shadow_click_rechecks_document_after_resolving_before_dispatch(monkeypa
     assert session.send.await_args.args[0] == "DOM.resolveNode"
 
 
-def test_persistent_shadow_type_never_inserts_text_after_focus_exception(monkeypatch):
+@pytest.mark.parametrize(
+    ("focus_responses", "expected_code"),
+    [
+        (
+            [{}, _partial_ax_node(99, "textbox", "Search")],
+            "FOCUS_MISMATCH",
+        ),
+        (
+            [{"unexpected": True}],
+            "OUTCOME_UNKNOWN",
+        ),
+        (
+            [{}, {"nodes": "malformed"}],
+            "OUTCOME_UNKNOWN",
+        ),
+    ],
+)
+def test_persistent_shadow_type_never_inserts_text_without_exact_focus(
+    monkeypatch,
+    focus_responses,
+    expected_code,
+):
     from agent_eyes import server
 
     coordinator = AutomationCoordinator()
@@ -747,12 +865,8 @@ def test_persistent_shadow_type_never_inserts_text_after_focus_exception(monkeyp
         send=AsyncMock(
             side_effect=[
                 {"object": {"objectId": "object-1"}},
-                {
-                    "exceptionDetails": {
-                        "text": "Uncaught",
-                        "exception": {"description": "Error: STALE_ELEMENT"},
-                    }
-                },
+                _partial_ax_node(99, "textbox", "Search"),
+                *focus_responses,
             ]
         ),
     )
@@ -777,12 +891,15 @@ def test_persistent_shadow_type_never_inserts_text_after_focus_exception(monkeyp
         )
     )
 
-    assert "STALE_SNAPSHOT" in result
+    assert expected_code in result
     assert "text was not sent" in result
-    assert [call.args[0] for call in session.send.await_args_list] == [
+    methods = [call.args[0] for call in session.send.await_args_list]
+    assert methods[:3] == [
         "DOM.resolveNode",
-        "Runtime.callFunctionOn",
+        "Accessibility.getPartialAXTree",
+        "DOM.focus",
     ]
+    assert "Input.insertText" not in methods
 
 
 def test_persistent_shadow_type_reports_verification_exception_as_warning(monkeypatch):
@@ -810,7 +927,9 @@ def test_persistent_shadow_type_reports_verification_exception_as_warning(monkey
         send=AsyncMock(
             side_effect=[
                 {"object": {"objectId": "object-1"}},
+                _partial_ax_node(99, "textbox", "Search"),
                 {},
+                _partial_ax_node(99, "textbox", "Search", focused=True),
                 {},
                 {"exceptionDetails": {"text": "Uncaught"}},
             ]
@@ -840,7 +959,9 @@ def test_persistent_shadow_type_reports_verification_exception_as_warning(monkey
     assert result.startswith("WARNING: dispatched 5 characters")
     assert [call.args[0] for call in session.send.await_args_list] == [
         "DOM.resolveNode",
-        "Runtime.callFunctionOn",
+        "Accessibility.getPartialAXTree",
+        "DOM.focus",
+        "Accessibility.getPartialAXTree",
         "Input.insertText",
         "Runtime.callFunctionOn",
     ]
@@ -853,11 +974,7 @@ def test_persistent_document_revision_includes_dom_root_identity():
         session = SimpleNamespace(
             send=AsyncMock(
                 side_effect=[
-                    {
-                        "frameTree": {
-                            "frame": {"id": "frame-1", "loaderId": "loader-1"}
-                        }
-                    },
+                    {"frameTree": {"frame": {"id": "frame-1", "loaderId": "loader-1"}}},
                     {"root": {"backendNodeId": root_backend_id}},
                 ]
             )
@@ -918,9 +1035,7 @@ def test_shadow_web_tree_retries_one_document_race_before_snapshot(monkeypatch):
     )
 
     output = asyncio.run(
-        server._handle_get_web_tree(
-            {"shadow": True, "target_id": "target-race"}
-        )
+        server._handle_get_web_tree({"shadow": True, "target_id": "target-race"})
     )
     token = _snapshot_token(output)
     metadata, _record = coordinator.observations.resolve_with_snapshot(token, 2)
@@ -966,9 +1081,7 @@ def test_legacy_shadow_web_tree_brackets_tree_with_document_revision(monkeypatch
     )
 
     output = asyncio.run(
-        server._handle_get_web_tree(
-            {"shadow": True, "target_id": "legacy-target"}
-        )
+        server._handle_get_web_tree({"shadow": True, "target_id": "legacy-target"})
     )
     token = _snapshot_token(output)
     snapshot, _record = coordinator.observations.resolve_with_snapshot(token, 1)
@@ -1008,13 +1121,16 @@ def test_legacy_shadow_click_passes_snapshot_revision_and_reports_unknown(monkey
     monkeypatch.setattr(server.cdp_client, "click_element", click)
 
     output = asyncio.run(
-        server._handle_click(
-            {"shadow": True, "snapshot": snapshot.token, "id": 9}
-        )
+        server._handle_click({"shadow": True, "snapshot": snapshot.token, "id": 9})
     )
 
     assert "OUTCOME_UNKNOWN" in output
-    click.assert_awaited_once_with(tab, 123, expected_revision=77)
+    click.assert_awaited_once_with(
+        tab,
+        123,
+        expected_element=element,
+        expected_revision=77,
+    )
 
 
 def test_legacy_shadow_click_reports_stale_document_without_dispatch(monkeypatch):
@@ -1047,12 +1163,60 @@ def test_legacy_shadow_click_reports_stale_document_without_dispatch(monkeypatch
     )
 
     output = asyncio.run(
-        server._handle_click(
-            {"shadow": True, "snapshot": snapshot.token, "id": 9}
-        )
+        server._handle_click({"shadow": True, "snapshot": snapshot.token, "id": 9})
     )
 
     assert "STALE_SNAPSHOT" in output
+
+
+def test_legacy_shadow_type_reports_exact_focus_mismatch_without_input(monkeypatch):
+    from agent_eyes import server
+
+    coordinator = AutomationCoordinator()
+    element = UIElement(
+        id=9,
+        role="textbox",
+        name="Comment",
+        source="cdp",
+        platform_ref=123,
+    )
+    snapshot = coordinator.observations.create(
+        provider="cdp-legacy",
+        mode=OperationMode.SHADOW,
+        target_id="legacy-target",
+        generation=0,
+        revision=77,
+        elements=[ElementRecord(local_id=9, value=element)],
+    )
+    tab = SimpleNamespace(id="legacy-target", url="https://example.test")
+    type_text = AsyncMock(
+        side_effect=CDPFocusMismatchError("exact element was not focused")
+    )
+    monkeypatch.setattr(server, "coordinator", coordinator)
+    monkeypatch.setattr(server, "_cached_tabs", [tab])
+    monkeypatch.setattr(server, "_ensure_tabs", AsyncMock(return_value=""))
+    monkeypatch.setattr(server.cdp_client, "type_text", type_text)
+
+    output = asyncio.run(
+        server._handle_type(
+            {
+                "shadow": True,
+                "snapshot": snapshot.token,
+                "id": 9,
+                "text": "must-not-be-sent",
+            }
+        )
+    )
+
+    assert "FOCUS_MISMATCH" in output
+    assert "text was not sent" in output
+    type_text.assert_awaited_once_with(
+        tab,
+        123,
+        "must-not-be-sent",
+        expected_element=element,
+        expected_revision=77,
+    )
 
 
 def test_upload_uses_snapshot_target_and_accepts_shadow_dom_node(monkeypatch, tmp_path):
@@ -1159,8 +1323,7 @@ def test_upload_path_validation_resolves_protected_directory_symlinks(tmp_path):
         == "protected"
     )
     assert (
-        server._validate_upload_paths([str(outside_alias)], home=home)[1]
-        == "protected"
+        server._validate_upload_paths([str(outside_alias)], home=home)[1] == "protected"
     )
 
 
@@ -1298,9 +1461,7 @@ def test_tree_never_displays_ids_beyond_snapshot_element_cap(monkeypatch):
     monkeypatch.setattr(server._pu, "is_browser_pid", lambda _pid: False)
 
     output = asyncio.run(
-        server._handle_get_tree(
-            {"pid": 77, "full": True, "max_depth": 2}
-        )
+        server._handle_get_tree({"pid": 77, "full": True, "max_depth": 2})
     )
     token = _snapshot_token(output)
 
@@ -1334,11 +1495,12 @@ def test_fill_form_resolves_every_field_from_one_snapshot(monkeypatch):
         generation=2,
         revision=3,
         elements=[
-            ElementRecord(local_id=element.id, value=element)
-            for element in elements
+            ElementRecord(local_id=element.id, value=element) for element in elements
         ],
     )
-    typer = AsyncMock(side_effect=["typed 1 characters into [1]", "typed 1 characters into [2]"])
+    typer = AsyncMock(
+        side_effect=["typed 1 characters into [1]", "typed 1 characters into [2]"]
+    )
     monkeypatch.setattr(server, "coordinator", coordinator)
     monkeypatch.setattr(server, "_handle_type_resolved", typer)
 
@@ -1378,8 +1540,7 @@ def test_fill_form_partial_failure_is_reported_as_error(monkeypatch):
         generation=0,
         revision=1,
         elements=[
-            ElementRecord(local_id=element.id, value=element)
-            for element in elements
+            ElementRecord(local_id=element.id, value=element) for element in elements
         ],
     )
     typer = AsyncMock(
@@ -1428,6 +1589,28 @@ def test_call_tool_applies_default_output_ceiling(monkeypatch):
 
     assert len(text.encode("utf-8")) <= 16 * 1024
     assert "truncated" in text
+
+
+def test_transaction_tools_apply_smaller_output_ceilings(monkeypatch):
+    from agent_eyes import server
+
+    monkeypatch.setattr(
+        server,
+        "_dispatch_prepared",
+        AsyncMock(return_value="x" * 1_000_000),
+    )
+    execute = asyncio.run(
+        server.call_tool(
+            "execute",
+            {
+                "target": {"mode": "shadow", "target_id": "cdp:one"},
+                "steps": [{"op": "locate", "as": "save", "role": "button"}],
+            },
+        )
+    )
+
+    assert len(execute[0].text.encode("utf-8")) <= 2 * 1024
+    assert "truncated" in execute[0].text
 
 
 def test_parallel_identical_tree_observations_call_native_provider_once(monkeypatch):
@@ -1551,10 +1734,13 @@ def test_tree_total_deadline_bounds_slow_native_provider(monkeypatch):
         async def unrelated_foreground_read() -> str:
             return "available"
 
-        assert await asyncio.wait_for(
-            coordinator.execute_foreground(unrelated_foreground_read),
-            timeout=0.05,
-        ) == "available"
+        assert (
+            await asyncio.wait_for(
+                coordinator.execute_foreground(unrelated_foreground_read),
+                timeout=0.05,
+            )
+            == "available"
+        )
 
         release.set()
         await worker.wait_until_idle()
