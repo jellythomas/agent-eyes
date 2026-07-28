@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from benchmarks import benchmark_live_transactions
 
 
@@ -19,10 +21,39 @@ def _result(text: str):
     )
 
 
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        "ERROR: ELEMENT_NOT_FOUND: private title",
+        'ERROR: {"status":"failed","code":"ELEMENT_NOT_FOUND",'
+        '"detail":"private title"}',
+    ],
+)
+def test_tool_error_reports_only_the_stable_code(rendered: str) -> None:
+    result = SimpleNamespace(
+        isError=True,
+        content=[SimpleNamespace(text=rendered)],
+    )
+
+    with pytest.raises(RuntimeError, match="ELEMENT_NOT_FOUND") as raised:
+        benchmark_live_transactions._tool_text(result)
+
+    assert "private title" not in str(raised.value)
+
+
 def _inventory(target_id: str, browser: str, title: str) -> str:
     return (
         "Scanned 2 open browser targets across 1 browser processes using foreground accessibility.\n"
         f"[{target_id}] {browser} pid=42 tab=0 (selected,frontmost) — {title}"
+    )
+
+
+def _after_inventory() -> str:
+    return (
+        "Scanned 2 open browser targets across 2 browser processes using foreground accessibility.\n"
+        f"[{_ORIGINAL_ID}] Safari pid=42 tab=0 — Original\n"
+        f"[{_TARGET_ID}] Mozilla Firefox pid=42 tab=1 "
+        "(selected,frontmost) — Reference fixture"
     )
 
 
@@ -59,6 +90,8 @@ def _install_fake_session(monkeypatch, *, restore_exact: bool):
                     return _result(
                         _inventory(_TARGET_ID, "Mozilla Firefox", "Reference fixture")
                     )
+                if inventory_calls >= 3:
+                    return _result(_after_inventory())
                 return _result(_inventory(_ORIGINAL_ID, "Safari", "Original"))
             if name == "execute":
                 return _result(
@@ -76,7 +109,10 @@ def _install_fake_session(monkeypatch, *, restore_exact: bool):
                 json.dumps(
                     {
                         "status": "ok",
-                        "target": {"id": chosen},
+                        "target": {
+                            "id": chosen,
+                            "activated": chosen == _ORIGINAL_ID,
+                        },
                         "scan": {"inventory_cache": "hit"},
                     }
                 )
@@ -119,6 +155,13 @@ def test_inventory_parser_returns_count_and_selected_native_target() -> None:
     text = _inventory(_TARGET_ID, "Mozilla Firefox", "Agent Eyes")
 
     assert benchmark_live_transactions._inventory_evidence(text) == (2, _TARGET_ID)
+    assert benchmark_live_transactions._first_target_id(text) == _TARGET_ID
+    assert benchmark_live_transactions._target_slot(_TARGET_ID) == "native:42:w0:t1"
+    assert (
+        benchmark_live_transactions._target_id_for_slot(text, "native:42:w0:t1")
+        == _TARGET_ID
+    )
+    assert benchmark_live_transactions._target_id_for_slot(text, "native:99:w0") == ""
     assert benchmark_live_transactions._browser_name(text, _TARGET_ID) == (
         "Mozilla Firefox"
     )
@@ -173,6 +216,11 @@ def test_live_mcp_benchmark_separates_reference_latency_from_deterministic_gates
     }
     assert [name for name, _arguments in calls].count("observe_target") == 6
     assert [name for name, _arguments in calls].count("list_tabs") == 3
+    assert [name for name, _arguments in calls[:3]] == [
+        "list_tabs",
+        "list_tabs",
+        "observe_target",
+    ]
     assert "confidential query" not in json.dumps(result)
 
 
@@ -201,7 +249,7 @@ def test_live_reference_can_measure_a_read_only_execute_expect_journey(
     assert [name for name, _arguments in calls].count("execute") == 4
 
 
-def test_focus_restore_requires_the_returned_exact_original_identifier(
+def test_focus_restore_requires_the_original_selected_target_after_inventory(
     monkeypatch,
 ) -> None:
     _install_fake_session(monkeypatch, restore_exact=False)

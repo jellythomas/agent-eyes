@@ -26,7 +26,10 @@ OBSERVE_TARGET_OUTPUT_GATE_BYTES = 4 * 1024
 EXECUTE_OUTPUT_GATE_BYTES = 2 * 1024
 _TARGET_COUNT_PATTERN = re.compile(r"\AScanned (?P<count>[0-9]+) open browser targets")
 _TARGET_ID_PATTERN = re.compile(r"\[(?P<id>native:[^\]]+)\]")
+_TARGET_SLOT_PATTERN = re.compile(r"native:[0-9]+:w[0-9]+(?::t[0-9]+)?\Z")
 _BROWSER_VERSION_PATTERN = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,63}\Z")
+_ERROR_CODE_PATTERN = re.compile(r"\AERROR:\s*(?P<code>[A-Z][A-Z_]+):")
+_STABLE_CODE_PATTERN = re.compile(r"[A-Z][A-Z_]+\Z")
 
 
 def _positive_integer(value: str) -> int:
@@ -63,11 +66,24 @@ def _summary(samples: list[float]) -> dict[str, float]:
 
 def _tool_text(result) -> str:
     content = getattr(result, "content", ())
-    if getattr(result, "isError", False) or len(content) != 1:
+    if len(content) != 1:
         raise RuntimeError("live MCP tool call failed")
     text = getattr(content[0], "text", None)
     if not isinstance(text, str):
         raise RuntimeError("live MCP tool did not return one text result")
+    if getattr(result, "isError", False):
+        match = _ERROR_CODE_PATTERN.match(text)
+        code = match.group("code") if match is not None else ""
+        if not code:
+            try:
+                payload = json.loads(text.removeprefix("ERROR: "))
+            except (TypeError, ValueError):
+                payload = None
+            candidate = payload.get("code") if isinstance(payload, dict) else None
+            if isinstance(candidate, str) and _STABLE_CODE_PATTERN.fullmatch(candidate):
+                code = candidate
+        code = code or "UNKNOWN"
+        raise RuntimeError(f"live MCP tool call failed: {code}")
     return text
 
 
@@ -94,6 +110,32 @@ def _inventory_evidence(text: str) -> tuple[int | None, str]:
             selected_id = target_match.group("id")
             break
     return count, selected_id
+
+
+def _first_target_id(text: str) -> str:
+    for line in text.splitlines():
+        target_match = _TARGET_ID_PATTERN.search(line)
+        if target_match is not None:
+            return target_match.group("id")
+    return ""
+
+
+def _target_slot(target_id: str) -> str:
+    """Strip only the inventory revision from a native browser target ID."""
+    slot, separator, revision = target_id.rpartition(":r")
+    if separator and revision and _TARGET_SLOT_PATTERN.fullmatch(slot):
+        return slot
+    return ""
+
+
+def _target_id_for_slot(text: str, slot: str) -> str:
+    if not slot:
+        return ""
+    for line in text.splitlines():
+        target_match = _TARGET_ID_PATTERN.search(line)
+        if target_match is not None and _target_slot(target_match.group("id")) == slot:
+            return target_match.group("id")
+    return ""
 
 
 def _browser_name(text: str, target_id: str) -> str:
@@ -173,9 +215,17 @@ async def _run_session(
     async with stdio_client(parameters, errlog=errlog) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             initialized = await session.initialize()
-            before_count, original_target_id = _inventory_evidence(
-                _tool_text(await session.call_tool("list_tabs", {}))
+            before_inventory = _tool_text(await session.call_tool("list_tabs", {}))
+            before_count, original_target_id = _inventory_evidence(before_inventory)
+            original_target_slot = _target_slot(original_target_id)
+            metadata_inventory = _tool_text(
+                await session.call_tool(
+                    "list_tabs",
+                    {"query": query, "max_results": 1},
+                )
             )
+            metadata_target_id = _first_target_id(metadata_inventory)
+            browser_name = _browser_name(metadata_inventory, metadata_target_id)
 
             query_payload, query_ms, query_output_bytes = await _timed_observation(
                 session,
@@ -190,13 +240,6 @@ async def _run_session(
             if not isinstance(target, dict) or not isinstance(target.get("id"), str):
                 raise RuntimeError("live query did not return an exact target ID")
             target_id = target["id"]
-            metadata_inventory = _tool_text(
-                await session.call_tool(
-                    "list_tabs",
-                    {"query": query, "max_results": 1},
-                )
-            )
-            browser_name = _browser_name(metadata_inventory, target_id)
 
             latencies: list[float] = []
             output_sizes = [query_output_bytes]
@@ -240,31 +283,37 @@ async def _run_session(
                 if index >= warmups:
                     latencies.append(elapsed)
 
-            restored = not original_target_id or original_target_id == target_id
-            focus_restore_calls = 0
-            if original_target_id and original_target_id != target_id:
-                focus_restore_calls = 1
-                restore_payload, _elapsed, output_bytes = await _timed_observation(
-                    session,
-                    {
-                        "target_id": original_target_id,
-                        "intent": "interact",
-                        "max_results": 1,
-                        "deadline_ms": deadline_ms,
-                    },
-                )
-                output_sizes.append(output_bytes)
-                restored_target = restore_payload.get("target")
-                restored = bool(
-                    isinstance(restored_target, dict)
-                    and restored_target.get("id") == original_target_id
-                )
-
-            after_count, selected_after = _inventory_evidence(
-                _tool_text(await session.call_tool("list_tabs", {}))
+            after_inventory = _tool_text(await session.call_tool("list_tabs", {}))
+            after_count, selected_after_id = _inventory_evidence(after_inventory)
+            selected_after_slot = _target_slot(selected_after_id)
+            restored = (
+                not original_target_slot
+                or selected_after_slot == original_target_slot
             )
-            if original_target_id:
-                restored = restored and selected_after == original_target_id
+            focus_restore_calls = 0
+            if original_target_slot and not restored:
+                restore_target_id = _target_id_for_slot(
+                    after_inventory,
+                    original_target_slot,
+                )
+                if restore_target_id:
+                    focus_restore_calls = 1
+                    restore_payload, _elapsed, output_bytes = await _timed_observation(
+                        session,
+                        {
+                            "target_id": restore_target_id,
+                            "intent": "interact",
+                            "max_results": 1,
+                            "deadline_ms": deadline_ms,
+                        },
+                    )
+                    output_sizes.append(output_bytes)
+                    restored_target = restore_payload.get("target")
+                    restored = bool(
+                        isinstance(restored_target, dict)
+                        and restored_target.get("id") == restore_target_id
+                        and restored_target.get("activated") is True
+                    )
 
     exact_latency = _summary(latencies)
     reference_latency_passed = bool(
