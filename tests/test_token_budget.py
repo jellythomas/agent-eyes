@@ -21,6 +21,16 @@ def test_tool_catalog_fits_the_16_kib_context_budget():
     assert len(_serialized_tool_catalog()) <= 16 * 1024
 
 
+def test_transaction_tools_fit_without_raising_context_budget():
+    from agent_eyes.server import TOOLS
+
+    names = {tool.name for tool in TOOLS}
+    encoded = _serialized_tool_catalog()
+
+    assert {"observe_target", "execute"} <= names
+    assert len(encoded) <= 16_128, {"catalog_bytes": len(encoded)}
+
+
 def test_compact_catalog_preserves_native_first_and_shadow_consent_cues():
     from agent_eyes.server import TOOLS
 

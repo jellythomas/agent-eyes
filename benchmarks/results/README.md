@@ -13,3 +13,18 @@ live browser rendering and network latency.
 Reproduce them from the repository root with the commands in the main README.
 The comparison input is
 `../baselines/macos-arm64-py312-pre-hardening.json`.
+
+The `macos-arm64-py312-v0.10.0-*` files are the 2026-07-28 deterministic
+release-candidate evidence from the working tree based on `6a18442`, before the
+immutable release commit and exact-wheel live run. They cover:
+
+- 30 known/discovery transaction samples after three warmups;
+- deterministic call, scan, activation, external-write, shadow, event, and
+  output-budget gates;
+- cancellation at seven transaction boundaries and 32 queued foreground calls;
+- 10,000 snapshot/reference/subscription/worker/resolver lifecycle cycles with
+  the max(10 MiB, 5%) RSS gate; and
+- the compact 16 KiB catalog and zero-fixed-orchestration-sleep gate.
+
+The exact tagged-wheel live result is generated after the immutable commit so it
+can carry the final wheel SHA-256 without creating circular build provenance.

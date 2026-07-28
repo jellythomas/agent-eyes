@@ -270,6 +270,48 @@ def test_foreground_poison_rejects_work_until_recovery_finishes():
     asyncio.run(run())
 
 
+def test_shadow_poison_rejects_queued_and_new_same_target_work() -> None:
+    async def run() -> None:
+        coordinator = AutomationCoordinator()
+        first_started = asyncio.Event()
+        allow_first = asyncio.Event()
+        recovery = asyncio.Event()
+        later_runs = 0
+
+        async def first() -> str:
+            first_started.set()
+            await allow_first.wait()
+            coordinator.poison_shadow_until("target-a", recovery.wait())
+            return "unknown"
+
+        async def later() -> str:
+            nonlocal later_runs
+            later_runs += 1
+            return "later"
+
+        first_task = asyncio.create_task(coordinator.execute_shadow("target-a", first))
+        await first_started.wait()
+        queued = asyncio.create_task(coordinator.execute_shadow("target-a", later))
+        allow_first.set()
+        assert await first_task == "unknown"
+
+        with pytest.raises(OperationError) as queued_error:
+            await queued
+        assert queued_error.value.code is OperationErrorCode.PROVIDER_BUSY
+        with pytest.raises(OperationError) as new_error:
+            await coordinator.execute_shadow("target-a", later)
+        assert new_error.value.code is OperationErrorCode.PROVIDER_BUSY
+        assert later_runs == 0
+
+        assert await coordinator.execute_shadow("target-b", later) == "later"
+        recovery.set()
+        while coordinator._shadow_poison:
+            await asyncio.sleep(0)
+        assert await coordinator.execute_shadow("target-a", later) == "later"
+
+    asyncio.run(run())
+
+
 def test_lock_wait_consumes_the_callers_deadline_without_running_action():
     async def run() -> None:
         coordinator = AutomationCoordinator()

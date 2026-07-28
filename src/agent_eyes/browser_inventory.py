@@ -5,15 +5,16 @@ It does not discover, connect to, or launch a browser debugging endpoint.
 """
 from __future__ import annotations
 
-import re
+import secrets
 import sys
-import hashlib
+import re
 import urllib.parse
 from dataclasses import dataclass, field, replace
-from typing import Iterable
+from enum import Enum
+from typing import Iterable, Mapping
 
 from .adapters.base import AppInfo, UIElement
-from .platform_utils import get_process_name
+from .platform_utils import get_process_name, get_process_names
 
 
 _BROWSER_NAMES = frozenset(
@@ -130,7 +131,7 @@ def is_browser_app(name: str, bundle_id: str = "") -> bool:
     )
 
 
-def _browser_name(app: AppInfo) -> str:
+def _browser_name(app: AppInfo, *, process_name: str | None = None) -> str:
     if is_browser_app(app.name, app.bundle_id):
         return app.name
 
@@ -141,7 +142,9 @@ def _browser_name(app: AppInfo) -> str:
     if sys.platform != "win32":
         return ""
 
-    raw_process_name = get_process_name(app.pid).removesuffix(".exe")
+    raw_process_name = (
+        get_process_name(app.pid) if process_name is None else process_name
+    ).removesuffix(".exe")
     process_name = _normalize(raw_process_name)
     for alias in sorted(_PROCESS_BROWSER_NAMES, key=len, reverse=True):
         if process_name == alias or f" {alias} " in f" {process_name} ":
@@ -149,6 +152,34 @@ def _browser_name(app: AppInfo) -> str:
     if is_browser_app(raw_process_name):
         return " ".join(part.capitalize() for part in process_name.split())
     return ""
+
+
+def browser_name_for_app(app: AppInfo) -> str:
+    """Return the cross-platform browser identity for one application record."""
+    return browser_names_for_apps([app]).get(app.pid, "")
+
+
+def browser_names_for_apps(apps: Iterable[AppInfo]) -> dict[int, str]:
+    """Resolve browser identities with one fresh Windows process snapshot."""
+    observed = tuple(apps)
+    names = {
+        app.pid: app.name
+        for app in observed
+        if is_browser_app(app.name, app.bundle_id)
+    }
+    if sys.platform != "win32":
+        return names
+
+    unresolved = [app for app in observed if app.pid not in names]
+    process_names = get_process_names(app.pid for app in unresolved)
+    for app in unresolved:
+        browser_name = _browser_name(
+            app,
+            process_name=process_names.get(app.pid, ""),
+        )
+        if browser_name:
+            names[app.pid] = browser_name
+    return names
 
 
 @dataclass
@@ -165,18 +196,28 @@ class BrowserTarget:
     frontmost: bool = False
     source: str = "native"
     score: int = 0
+    identity_token: str = field(
+        default_factory=lambda: secrets.token_hex(8),
+        repr=False,
+        compare=False,
+    )
     element: UIElement | None = field(default=None, repr=False, compare=False)
     window_element: UIElement | None = field(default=None, repr=False, compare=False)
 
     @property
     def identifier(self) -> str:
-        """Return a provider-qualified identity bound to the observed tab content."""
+        """Return an opaque provider-qualified identity for this live observation."""
         window = max(self.window_index, 0)
         suffix = f":t{self.tab_index}" if self.tab_index >= 0 else ""
-        fingerprint = hashlib.sha256(
-            f"{self.browser}\0{self.title}\0{self.url}".encode("utf-8")
-        ).hexdigest()[:12]
-        return f"native:{self.pid}:w{window}{suffix}:h{fingerprint}"
+        return f"native:{self.pid}:w{window}{suffix}:r{self.identity_token}"
+
+
+class BrowserQueryState(Enum):
+    """Whether native evidence proves a query present, absent, or unknowable."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
 
 
 def extract_tab_elements(root: UIElement | None) -> list[UIElement]:
@@ -212,7 +253,7 @@ def extract_tab_elements(root: UIElement | None) -> list[UIElement]:
 
 
 def _element_title(element: UIElement) -> str:
-    return (element.name or element.value or element.description or "Untitled tab").strip()
+    return (element.name or element.value or element.description).strip()
 
 
 def _element_url(element: UIElement) -> str:
@@ -223,52 +264,120 @@ def _element_url(element: UIElement) -> str:
     return ""
 
 
-def collect_browser_targets(adapter, *, tree_depth: int = 8) -> list[BrowserTarget]:
+def collect_browser_targets(
+    adapter,
+    *,
+    tree_depth: int = 8,
+    require_complete: bool = False,
+    apps: Iterable[AppInfo] | None = None,
+    browser_names: Mapping[int, str] | None = None,
+) -> list[BrowserTarget]:
     """Inventory every visible browser process using native accessibility only.
 
     Tab controls are preferred. Window titles remain as conservative fallbacks
     for browsers or windows whose tab strip is not exposed by the OS provider.
-    Failures are isolated per application so one inaccessible browser cannot
-    hide the others.
+    Failures are isolated per application for best-effort inventory. Callers
+    that may open a missing URL can require a complete inventory so provider
+    failures are never mistaken for target absence.
     """
     if adapter is None:
         return []
 
-    try:
-        apps: list[AppInfo] = adapter.list_apps()
-    except Exception:
-        return []
+    if apps is None:
+        try:
+            list_apps = (
+                getattr(adapter, "list_apps_complete", None)
+                if require_complete
+                else None
+            )
+            observed_apps: list[AppInfo] = (
+                list_apps() if callable(list_apps) else adapter.list_apps()
+            )
+        except Exception:
+            if require_complete:
+                raise
+            return []
+    else:
+        observed_apps = list(apps)
 
+    resolved_browser_names = (
+        dict(browser_names)
+        if browser_names is not None
+        else browser_names_for_apps(observed_apps)
+    )
     targets: list[BrowserTarget] = []
-    for app in apps:
-        browser_name = _browser_name(app)
+    for app in observed_apps:
+        browser_name = resolved_browser_names.get(app.pid, "")
         if not browser_name:
             continue
 
+        visibility = None
+        required_window_count = None
+        if require_complete:
+            visible_windows = getattr(
+                adapter,
+                "browser_app_has_visible_windows",
+                None,
+            )
+            if callable(visible_windows):
+                visibility = visible_windows(app)
+            if visibility is False:
+                continue
+            count_required_windows = getattr(
+                adapter,
+                "browser_app_required_window_count",
+                None,
+            )
+            if callable(count_required_windows):
+                required_window_count = count_required_windows(app)
+
         app_targets: list[BrowserTarget] = []
         try:
-            get_browser_trees = getattr(adapter, "get_browser_trees", None)
+            get_browser_trees = getattr(
+                adapter,
+                (
+                    "get_browser_trees_complete"
+                    if require_complete
+                    else "get_browser_trees"
+                ),
+                None,
+            )
+            if require_complete and not callable(get_browser_trees):
+                get_browser_trees = getattr(adapter, "get_browser_trees", None)
             if callable(get_browser_trees):
                 trees = list(get_browser_trees(app.pid, max_depth=tree_depth))
             else:
                 tree = adapter.get_tree(app.pid, max_depth=tree_depth)
                 trees = [tree] if tree is not None else []
         except Exception:
+            if require_complete:
+                raise
             trees = []
 
+        if require_complete and not trees:
+            raise RuntimeError(
+                f"browser tree inventory is incomplete for PID {app.pid}"
+            )
+
         global_tab_index = 0
+        tab_window_index = 0
+        verified_tab_windows = 0
         represented_window_indices: set[int] = set()
-        for window_index, tree in enumerate(trees):
+        for provider_window_index, tree in enumerate(trees):
             tab_elements = extract_tab_elements(tree)
+            if require_complete and not tab_elements:
+                raise RuntimeError(
+                    f"browser tab inventory is incomplete for PID {app.pid}"
+                )
             for element in tab_elements:
-                element.window_index = window_index
+                element.window_index = tab_window_index
                 app_targets.append(
                     BrowserTarget(
                         browser=browser_name,
                         pid=app.pid,
                         title=_element_title(element),
                         url=_element_url(element),
-                        window_index=window_index,
+                        window_index=tab_window_index,
                         tab_index=global_tab_index,
                         selected=any(
                             state.casefold() in {"selected", "focused", "active"}
@@ -281,14 +390,16 @@ def collect_browser_targets(adapter, *, tree_depth: int = 8) -> list[BrowserTarg
                 )
                 global_tab_index += 1
             if tab_elements:
-                represented_window_indices.add(window_index)
-            elif tree.name.strip():
+                verified_tab_windows += 1
+                tab_window_index += 1
+                represented_window_indices.add(provider_window_index)
+            elif not require_complete and tree.name.strip():
                 app_targets.append(
                     BrowserTarget(
                         browser=browser_name,
                         pid=app.pid,
                         title=tree.name.strip(),
-                        window_index=window_index,
+                        window_index=provider_window_index,
                         selected=app.is_frontmost and not app_targets,
                         frontmost=app.is_frontmost,
                         source="native-window",
@@ -296,7 +407,23 @@ def collect_browser_targets(adapter, *, tree_depth: int = 8) -> list[BrowserTarg
                         window_element=tree,
                     )
                 )
-                represented_window_indices.add(window_index)
+                represented_window_indices.add(provider_window_index)
+
+        if require_complete:
+            visible_window_count = (
+                required_window_count
+                if required_window_count is not None
+                else sum(bool(title.strip()) for title in app.windows)
+            )
+            if (
+                (trees and verified_tab_windows == 0)
+                or visible_window_count > verified_tab_windows
+            ):
+                raise RuntimeError(
+                    f"browser tab inventory is incomplete for PID {app.pid}"
+                )
+            targets.extend(app_targets)
+            continue
 
         for window_index, title in enumerate(app.windows):
             clean_title = title.strip()
@@ -387,9 +514,11 @@ def _match_score(target: BrowserTarget, query: str) -> int:
     title = _normalize(target.title)
     url = _normalize(target.url)
     browser = _normalize(target.browser)
-    combined = f"{title} {url} {browser}"
-    matched_tokens = [token for token in tokens if token in combined]
-    if not matched_tokens:
+    title_tokens = set(title.split())
+    url_tokens = set(url.split())
+    browser_tokens = set(browser.split())
+    combined_tokens = title_tokens | url_tokens | browser_tokens
+    if any(token not in combined_tokens for token in tokens):
         return 0
 
     score = 0
@@ -397,11 +526,10 @@ def _match_score(target: BrowserTarget, query: str) -> int:
         score += 120
     if phrase and phrase in url:
         score += 140
-    score += sum(28 for token in tokens if token in title)
-    score += sum(32 for token in tokens if token in url)
-    score += sum(6 for token in tokens if token in browser)
-    if len(matched_tokens) == len(tokens):
-        score += 60
+    score += sum(28 for token in tokens if token in title_tokens)
+    score += sum(32 for token in tokens if token in url_tokens)
+    score += sum(6 for token in tokens if token in browser_tokens)
+    score += 60
     if target.selected:
         score += 8
     if target.frontmost:
@@ -430,6 +558,21 @@ def best_browser_target(
     if not ranked or ranked[0].score < minimum_score:
         return None
     return ranked[0]
+
+
+def classify_browser_query(
+    targets: Iterable[BrowserTarget],
+    query: str,
+) -> BrowserQueryState:
+    """Classify absence only when every visible tab exposes title and URL evidence."""
+    observed = tuple(targets)
+    if best_browser_target(observed, query) is not None:
+        return BrowserQueryState.PRESENT
+    if not observed:
+        return BrowserQueryState.ABSENT
+    if any(not target.title.strip() or not target.url.strip() for target in observed):
+        return BrowserQueryState.UNKNOWN
+    return BrowserQueryState.ABSENT
 
 
 def select_browser_target(adapter, target: BrowserTarget) -> bool:
@@ -594,7 +737,7 @@ def format_browser_targets(
             location += f" window={target.window_index}"
         line = (
             f"[{target.identifier}] {target.browser} {location}{state} — "
-            f"{_compact(target.title, 160)}"
+            f"{_compact(target.title or 'Untitled tab', 160)}"
         )
         if target.url:
             line += f" — {_compact(sanitize_url_for_display(target.url), 180)}"

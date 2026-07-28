@@ -87,9 +87,7 @@ def test_sensitive_operation_limits_are_explicit():
             name="upload",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "files": {"type": "array", "items": {"type": "string"}}
-                },
+                "properties": {"files": {"type": "array", "items": {"type": "string"}}},
             },
         ),
         SimpleNamespace(
@@ -113,7 +111,9 @@ def test_sensitive_operation_limits_are_explicit():
 
     by_name = {tool.name: tool.inputSchema for tool in tools}
     assert by_name["type"]["properties"]["text"]["maxLength"] == MAX_TYPED_TEXT_CHARS
-    assert by_name["js"]["properties"]["expression"]["maxLength"] == MAX_JAVASCRIPT_CHARS
+    assert (
+        by_name["js"]["properties"]["expression"]["maxLength"] == MAX_JAVASCRIPT_CHARS
+    )
     files = by_name["upload"]["properties"]["files"]
     assert files["maxItems"] == MAX_FILES
     assert files["items"]["maxLength"] == MAX_PATH_CHARS
@@ -126,7 +126,7 @@ def test_every_targeted_shadow_tool_accepts_one_bounded_stable_target_id():
     from agent_eyes.server import TOOLS
 
     by_name = {tool.name: tool.inputSchema for tool in TOOLS}
-    for name in (
+    targeted_tools = (
         "web_tree",
         "navigate",
         "js",
@@ -135,10 +135,14 @@ def test_every_targeted_shadow_tool_accepts_one_bounded_stable_target_id():
         "close_tab",
         "dialog",
         "scroll",
-        "shadow",
         "drag",
         "pierce",
-    ):
+    )
+    if sys.platform == "darwin":
+        targeted_tools += ("shadow",)
+    assert set(targeted_tools) <= set(by_name)
+
+    for name in targeted_tools:
         target = by_name[name]["properties"]["target_id"]
         assert target["type"] == "string"
         assert target["maxLength"] == 512
@@ -165,7 +169,10 @@ def test_shadow_only_contracts_require_explicit_mode_and_target():
     upload = by_name["upload"]
     assert "shadow" in upload["required"]
     assert upload["properties"]["shadow"]["enum"] == [True]
-    assert "target_id" in by_name["shadow"]["required"]
+    if sys.platform == "darwin":
+        assert "target_id" in by_name["shadow"]["required"]
+    else:
+        assert "shadow" not in by_name
 
 
 def test_dual_mode_shadow_contracts_conditionally_require_target_id():
@@ -353,14 +360,14 @@ def test_catalog_only_advertises_platform_supported_app_and_window_tools():
     names = {tool.name for tool in TOOLS}
     if sys.platform == "darwin":
         assert {"app", "window", "shadow"} <= names
-        assert len(names) == 28
+        assert len(names) == 30
         window = next(tool for tool in TOOLS if tool.name == "window")
         assert {"snapshot", "id"} <= set(window.inputSchema["properties"])
     else:
         assert "app" not in names
         assert "window" not in names
         assert "shadow" not in names
-        assert len(names) == 25
+        assert len(names) == 27
 
 
 def test_setup_template_uses_the_same_platform_specific_legacy_surface():
@@ -373,6 +380,6 @@ def test_setup_template_uses_the_same_platform_specific_legacy_surface():
     assert "mcp__agent-eyes__shadow" in macos
     assert "mcp__agent-eyes__shadow" not in linux
     assert "mcp__agent-eyes__shadow" not in windows
-    assert len(macos) == 27
-    assert len(linux) == 24
-    assert len(windows) == 24
+    assert len(macos) == 29
+    assert len(linux) == 26
+    assert len(windows) == 26

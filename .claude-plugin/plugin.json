@@ -1,6 +1,6 @@
 {
   "name": "agent-eyes",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Model-independent native computer use with cross-browser tab reuse and explicit background automation",
   "author": {
     "name": "Jelly Thomas",

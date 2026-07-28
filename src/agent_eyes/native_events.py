@@ -34,6 +34,9 @@ _EVENT_WATCHDOG_DEADLINE_RESERVE = 0.1
 
 class _ChangeSubscription(Protocol):
     @property
+    def active(self) -> bool: ...
+
+    @property
     def generation(self) -> int: ...
 
     async def wait_for_change(self, after_generation: int, timeout: float) -> bool: ...
@@ -76,6 +79,7 @@ async def _run_sync_with_budget(
     operation: str,
     worker: ProviderWorker | None,
     state: ProviderCallState | None = None,
+    pre_dispatch: Callable[[], None] | None = None,
 ) -> Any:
     """Run sync provider work off-loop and return promptly on deadline expiry."""
     if worker is not None:
@@ -84,9 +88,15 @@ async def _run_sync_with_budget(
             budget=budget,
             operation=operation,
             state=state,
+            pre_dispatch=pre_dispatch,
         )
 
-    task = asyncio.create_task(asyncio.to_thread(call))
+    def guarded_call() -> Any:
+        if pre_dispatch is not None:
+            pre_dispatch()
+        return call()
+
+    task = asyncio.create_task(asyncio.to_thread(guarded_call))
     try:
         return await budget.wait_for(asyncio.shield(task), operation=operation)
     except BaseException:
@@ -196,6 +206,57 @@ class NativeActionResult:
     elapsed: float
     event_driven: bool
     checks: int
+    action_dispatched: bool = True
+
+
+class _CompositeChangeSubscription:
+    """Merge several process observers into one lossless action subscription."""
+
+    def __init__(self, subscriptions: tuple[_ChangeSubscription, ...]) -> None:
+        self._subscriptions = subscriptions
+        self._baselines = tuple(subscription.generation for subscription in subscriptions)
+
+    @property
+    def active(self) -> bool:
+        return all(getattr(subscription, "active", True) for subscription in self._subscriptions)
+
+    @property
+    def generation(self) -> int:
+        self._baselines = tuple(
+            subscription.generation for subscription in self._subscriptions
+        )
+        return sum(self._baselines)
+
+    async def wait_for_change(self, _after_generation: int, timeout: float) -> bool:
+        baselines = self._baselines
+        if any(
+            subscription.generation > baseline
+            for subscription, baseline in zip(self._subscriptions, baselines)
+        ):
+            return True
+        tasks = {
+            asyncio.create_task(subscription.wait_for_change(baseline, timeout))
+            for subscription, baseline in zip(self._subscriptions, baselines)
+        }
+        try:
+            while tasks:
+                done, tasks = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if any(bool(task.result()) for task in done):
+                    return True
+            return False
+        finally:
+            for task in tasks:
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+
+    async def aclose(self) -> None:
+        await asyncio.gather(
+            *(subscription.aclose() for subscription in self._subscriptions),
+            return_exceptions=True,
+        )
 
 
 class NativeChangeSubscription:
@@ -219,6 +280,12 @@ class NativeChangeSubscription:
         with self._generation_lock:
             return self._generation
 
+    @property
+    def active(self) -> bool:
+        with self._generation_lock:
+            ended = self._ended
+        return self._available and not ended and not self._closed
+
     async def start(self, timeout: float = _EVENT_STARTUP_TIMEOUT) -> bool:
         """Start the platform observer and wait for registration to finish."""
         if self._thread is not None:
@@ -240,7 +307,7 @@ class NativeChangeSubscription:
             logger.debug("Native event registration timed out for PID %s", self.pid)
             await self.aclose()
             return False
-        return self._available
+        return self.active
 
     async def wait_for_change(self, after_generation: int, timeout: float) -> bool:
         """Wait until a generation newer than ``after_generation`` exists.
@@ -323,6 +390,7 @@ class NativeChangeSubscription:
     def _mark_ended(self) -> None:
         with self._generation_lock:
             self._ended = True
+            self._generation += 1
         loop = self._loop
         wake = self._wake
         if loop is not None and wake is not None and not loop.is_closed():
@@ -371,11 +439,23 @@ class MacOSAXChangeSubscription(NativeChangeSubscription):
         "kAXSelectedRowsChangedNotification",
         "kAXSelectedTextChangedNotification",
     )
+    _MUTATION_CRITICAL_NOTIFICATIONS = frozenset(
+        {
+            "kAXCreatedNotification",
+            "kAXWindowCreatedNotification",
+            "kAXUIElementDestroyedNotification",
+            "kAXValueChangedNotification",
+            "kAXTitleChangedNotification",
+        }
+    )
 
     def __init__(self, pid: int) -> None:
         super().__init__(pid)
         self._ax: Any = None
         self._run_loop: Any = None
+
+    def _run_backend_for_test(self) -> None:
+        self._run_backend()
 
     def _run_backend(self) -> None:
         import ApplicationServices as ax
@@ -393,7 +473,7 @@ class MacOSAXChangeSubscription(NativeChangeSubscription):
             return
 
         application = ax.AXUIElementCreateApplication(self.pid)
-        registered: list[Any] = []
+        registered: list[tuple[str, Any]] = []
         source = None
         run_loop = None
         try:
@@ -408,9 +488,13 @@ class MacOSAXChangeSubscription(NativeChangeSubscription):
                 except Exception:
                     continue
                 if result == 0:
-                    registered.append(notification)
+                    registered.append((constant_name, notification))
 
-            if not registered:
+            registered_names = {name for name, _notification in registered}
+            coverage_complete = self._MUTATION_CRITICAL_NOTIFICATIONS.issubset(
+                registered_names
+            )
+            if not coverage_complete:
                 self._mark_ready(False)
                 return
 
@@ -431,7 +515,7 @@ class MacOSAXChangeSubscription(NativeChangeSubscription):
                     ax.CFRunLoopRemoveSource(run_loop, source, ax.kCFRunLoopDefaultMode)
                 except Exception:
                     pass
-            for notification in reversed(registered):
+            for _name, notification in reversed(registered):
                 try:
                     ax.AXObserverRemoveNotification(observer, application, notification)
                 except Exception:
@@ -457,6 +541,7 @@ class _WindowsUIARuntime:
     tree_scope_subtree = 7
     event_ids = (20008, 20015, 20024)  # layout, text, live-region changes
     global_event_ids = (20016,)  # top-level window opened
+    mutation_critical_global_event_ids = (20016,)
     # Name/value/focus/selection changes.  ProcessId is 30002; 30008 is
     # HasKeyboardFocus and 30079 is SelectionItemIsSelected.
     property_ids = (30003, 30005, 30008, 30010, 30022, 30045, 30079)
@@ -596,6 +681,7 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
         runtime = self._runtime_factory()
         self._runtime = runtime
         registrations: list[tuple[str, Any, int | None, Any]] = []
+        registered_global_events: set[int] = set()
         structure_handler = runtime.make_structure_handler(self._signal_change)
 
         def handle_event(sender, event_id) -> None:
@@ -624,6 +710,7 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
                         event_handler,
                     )
                     registrations.append(("event", root, event_id, event_handler))
+                    registered_global_events.add(event_id)
                 except Exception:
                     continue
 
@@ -636,7 +723,10 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
                 if target is not None:
                     targets.append(target)
 
+            target_coverage: list[tuple[bool, bool]] = []
             for target in targets:
+                structure_registered = False
+                property_registered = False
                 try:
                     runtime.automation.AddStructureChangedEventHandler(
                         target,
@@ -645,6 +735,7 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
                         structure_handler,
                     )
                     registrations.append(("structure", target, None, structure_handler))
+                    structure_registered = True
                 except Exception:
                     pass
 
@@ -658,6 +749,7 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
                         len(runtime.property_ids),
                     )
                     registrations.append(("property", target, None, property_handler))
+                    property_registered = True
                 except Exception:
                     pass
 
@@ -674,8 +766,27 @@ class WindowsUIAChangeSubscription(NativeChangeSubscription):
                     except Exception:
                         continue
 
-            self._mark_ready(bool(registrations))
-            if registrations and not self._stop_requested.is_set():
+                target_coverage.append(
+                    (structure_registered, property_registered)
+                )
+
+            required_global_events = set(
+                getattr(
+                    runtime,
+                    "mutation_critical_global_event_ids",
+                    (20016,),
+                )
+            )
+            coverage_complete = (
+                bool(target_coverage)
+                and required_global_events.issubset(registered_global_events)
+                and all(
+                    structure_registered and property_registered
+                    for structure_registered, property_registered in target_coverage
+                )
+            )
+            self._mark_ready(coverage_complete)
+            if coverage_complete and not self._stop_requested.is_set():
                 runtime.wait_until_stopped(self._stop_requested)
         finally:
             for kind, target, event_id, handler in reversed(registrations):
@@ -722,6 +833,14 @@ class _LinuxATSPIRuntime:
         "window:create",
         "window:activate",
         "window:deactivate",
+    )
+    mutation_critical_event_types = frozenset(
+        {
+            "object:children-changed",
+            "object:property-change:accessible-name",
+            "object:property-change:accessible-value",
+            "window:create",
+        }
     )
 
     def __init__(self) -> None:
@@ -799,8 +918,16 @@ class LinuxATSPIChangeSubscription(NativeChangeSubscription):
                 except Exception:
                     continue
 
-            self._mark_ready(bool(registered))
-            if registered and not self._stop_requested.is_set():
+            required_events = set(
+                getattr(
+                    runtime,
+                    "mutation_critical_event_types",
+                    _LinuxATSPIRuntime.mutation_critical_event_types,
+                )
+            )
+            coverage_complete = required_events.issubset(registered)
+            self._mark_ready(coverage_complete)
+            if coverage_complete and not self._stop_requested.is_set():
                 main_loop.run()
         finally:
             for event_type in reversed(registered):
@@ -891,6 +1018,10 @@ async def run_native_action_until(
     action_worker: ProviderWorker | None = None,
     condition_worker: ProviderWorker | None = None,
     action_state: ProviderCallState | None = None,
+    skip_action_if_condition: bool = False,
+    require_subscription_for_dispatch: bool = False,
+    abort_dispatch_on_change: bool = False,
+    pre_dispatch_check: Callable[[], None] | None = None,
 ) -> NativeActionResult:
     """Run one foreground action and observe its completion without a fixed delay.
 
@@ -902,7 +1033,9 @@ async def run_native_action_until(
     loop = asyncio.get_running_loop()
     started = loop.time()
     timeout = max(0.0, float(timeout))
-    operation_budget = budget or OperationBudget.start(timeout)
+    operation_budget = (
+        budget.child(timeout) if budget is not None else OperationBudget.start(timeout)
+    )
     dispatch_worker = action_worker or worker
     observation_worker = condition_worker or worker
     subscription: _ChangeSubscription | None = None
@@ -946,15 +1079,6 @@ async def run_native_action_until(
 
     generation = subscription.generation if subscription is not None else 0
     try:
-        operation_budget.checkpoint("native action dispatch")
-        action_result = await _run_sync_with_budget(
-            action,
-            budget=operation_budget,
-            operation="native action",
-            worker=dispatch_worker,
-            state=action_state,
-        )
-
         async def completed() -> bool:
             nonlocal checks
             checks += 1
@@ -966,6 +1090,68 @@ async def run_native_action_until(
                     worker=observation_worker,
                 )
             )
+
+        if skip_action_if_condition:
+            if await completed():
+                return NativeActionResult(
+                    action_result=None,
+                    condition_met=True,
+                    elapsed=loop.time() - started,
+                    event_driven=subscription is not None,
+                    checks=checks,
+                    action_dispatched=False,
+                )
+            if (
+                abort_dispatch_on_change
+                and subscription is not None
+                and subscription.generation != generation
+            ):
+                raise OperationError(
+                    OperationErrorCode.PROVIDER_BUSY,
+                    "native state changed during pre-dispatch verification",
+                )
+
+        if require_subscription_for_dispatch and (
+            subscription is None or not getattr(subscription, "active", True)
+        ):
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "native observer coverage is required before action dispatch",
+            )
+
+        def pre_dispatch_guard() -> None:
+            def verify_subscription() -> None:
+                if require_subscription_for_dispatch and (
+                    subscription is None or not getattr(subscription, "active", True)
+                ):
+                    raise OperationError(
+                        OperationErrorCode.PROVIDER_BUSY,
+                        "native observer coverage ended before action dispatch",
+                    )
+                if (
+                    abort_dispatch_on_change
+                    and subscription is not None
+                    and subscription.generation != generation
+                ):
+                    raise OperationError(
+                        OperationErrorCode.PROVIDER_BUSY,
+                        "native state changed during pre-dispatch verification",
+                    )
+
+            verify_subscription()
+            if pre_dispatch_check is not None:
+                pre_dispatch_check()
+            verify_subscription()
+
+        operation_budget.checkpoint("native action dispatch")
+        action_result = await _run_sync_with_budget(
+            action,
+            budget=operation_budget,
+            operation="native action",
+            worker=dispatch_worker,
+            state=action_state,
+            pre_dispatch=pre_dispatch_guard,
+        )
 
         if await completed():
             return NativeActionResult(
@@ -1052,6 +1238,83 @@ async def run_native_action_until(
             await _close_with_budget(subscription, budget=operation_budget)
 
 
+async def run_native_action_until_any(
+    pids: tuple[int, ...],
+    action: Callable[[], Any],
+    condition: Callable[[], bool],
+    *,
+    timeout: float = 0.5,
+    subscription_factory: SubscriptionFactory | None = None,
+    fallback_initial_interval: float = 0.01,
+    fallback_max_interval: float = 0.08,
+    budget: OperationBudget | None = None,
+    action_worker: ProviderWorker | None = None,
+    condition_worker: ProviderWorker | None = None,
+    action_state: ProviderCallState | None = None,
+    skip_action_if_condition: bool = False,
+    require_all_subscriptions: bool = False,
+    abort_dispatch_on_change: bool = False,
+    pre_dispatch_check: Callable[[], None] | None = None,
+) -> NativeActionResult:
+    """Observe one action across all current candidate application processes."""
+    unique_pids = tuple(
+        dict.fromkeys(
+            pid
+            for pid in pids
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+        )
+    )
+
+    async def open_composite(_pid: int) -> _ChangeSubscription | None:
+        if not unique_pids:
+            return None
+        factory = subscription_factory
+
+        async def open_one(pid: int) -> _ChangeSubscription | None:
+            if factory is None:
+                return await open_native_change_subscription(pid)
+            return await _call_subscription_factory(factory, pid, timeout)
+
+        opened = await asyncio.gather(
+            *(open_one(pid) for pid in unique_pids),
+            return_exceptions=True,
+        )
+        subscriptions = tuple(
+            candidate
+            for candidate in opened
+            if candidate is not None and not isinstance(candidate, BaseException)
+        )
+        if require_all_subscriptions and len(subscriptions) != len(unique_pids):
+            await asyncio.gather(
+                *(subscription.aclose() for subscription in subscriptions),
+                return_exceptions=True,
+            )
+            return None
+        if not subscriptions:
+            return None
+        return _CompositeChangeSubscription(subscriptions)
+
+    return await run_native_action_until(
+        unique_pids[0] if unique_pids else 0,
+        action,
+        condition,
+        timeout=timeout,
+        subscription_factory=open_composite,
+        fallback_initial_interval=fallback_initial_interval,
+        fallback_max_interval=fallback_max_interval,
+        budget=budget,
+        action_worker=action_worker,
+        condition_worker=condition_worker,
+        action_state=action_state,
+        skip_action_if_condition=skip_action_if_condition,
+        require_subscription_for_dispatch=(
+            require_all_subscriptions and bool(unique_pids)
+        ),
+        abort_dispatch_on_change=abort_dispatch_on_change,
+        pre_dispatch_check=pre_dispatch_check,
+    )
+
+
 async def wait_for_native_element(
     adapter: Any,
     pid: int,
@@ -1075,7 +1338,9 @@ async def wait_for_native_element(
     loop = asyncio.get_running_loop()
     started = loop.time()
     timeout = max(0.0, float(timeout))
-    operation_budget = budget or OperationBudget.start(timeout)
+    operation_budget = (
+        budget.child(timeout) if budget is not None else OperationBudget.start(timeout)
+    )
     subscription: _ChangeSubscription | None = None
     checks = 0
     watchdog_rechecks = 0

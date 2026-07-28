@@ -6,9 +6,10 @@ import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+from .adapters.base import UIElement
 from .operation import OperationError, OperationErrorCode, OperationMode
 
 
@@ -33,6 +34,7 @@ class ObservationSnapshot:
     revision: int
     created_at: float
     elements: tuple[ElementRecord, ...]
+    truncated: bool = False
 
 
 @dataclass(slots=True)
@@ -95,6 +97,8 @@ class ObservationStore:
         revision: int,
         elements: Iterable[ElementRecord],
         release: Callable[[object], None] | None = None,
+        detach_ui_trees: bool = False,
+        truncated: bool = False,
     ) -> ObservationSnapshot:
         self._ensure_open()
         if not provider:
@@ -105,6 +109,10 @@ class ObservationStore:
             raise ValueError("target_id is required")
         if generation < 0 or revision < 0:
             raise ValueError("generation and revision must be non-negative")
+        if not isinstance(detach_ui_trees, bool):
+            raise ValueError("detach_ui_trees must be a boolean")
+        if not isinstance(truncated, bool):
+            raise ValueError("truncated must be a boolean")
 
         records: list[ElementRecord] = []
         index: dict[int, ElementRecord] = {}
@@ -131,6 +139,10 @@ class ObservationStore:
                     )
                 index[record.local_id] = record
 
+            if detach_ui_trees:
+                records = self._detach_ui_trees(records)
+                index = {record.local_id: record for record in records}
+
             self.evict_expired()
             token = self._unique_token()
             snapshot = ObservationSnapshot(
@@ -142,6 +154,7 @@ class ObservationStore:
                 revision=revision,
                 created_at=self._clock(),
                 elements=tuple(records),
+                truncated=truncated,
             )
             self._snapshots[token] = _StoredSnapshot(snapshot, index, release)
             stored = True
@@ -343,6 +356,37 @@ class ObservationStore:
         if stored is None or stored.release is None:
             return
         self._release_records(stored.snapshot.elements, stored.release)
+
+    @staticmethod
+    def _detach_ui_trees(records: list[ElementRecord]) -> list[ElementRecord]:
+        """Clone only stored UI nodes and edges so the record cap bounds memory."""
+        originals = tuple(
+            record.value
+            for record in records
+            if isinstance(record.value, UIElement)
+        )
+        clones = {
+            id(element): replace(
+                element,
+                states=list(element.states),
+                actions=list(element.actions),
+                children=[],
+            )
+            for element in originals
+        }
+        for element in originals:
+            clone = clones[id(element)]
+            clone.children = [
+                clones[id(child)]
+                for child in element.children
+                if id(child) in clones
+            ]
+        return [
+            replace(record, value=clones[id(record.value)])
+            if isinstance(record.value, UIElement)
+            else record
+            for record in records
+        ]
 
     @staticmethod
     def _release_records(

@@ -118,7 +118,9 @@ work is written.
 - Shadow target: exact provider-qualified `target_id` only; no query, PID, implicit
   fallback, or foreground hover substitution.
 - Missing browser target: default `fail`; `open` is accepted only with an explicit
-  bounded `http`, `https`, `file`, or `about` URL.
+  bounded `http`, `https`, or `about` URL. Local `file` URLs are intentionally
+  excluded because the fast path is for browser-target reuse/opening and must not
+  broaden remote MCP callers into implicit local-file disclosure.
 - One to eight steps using only `locate`, `hover`, `click`, `type`, `press_key`,
   `scroll`, and `expect`.
 - Local aliases are unique, defined before use, and revision-scoped. Every locator
@@ -267,8 +269,10 @@ Steps:
    selector in memory and render only target metadata and matches.
 4. `intent=inspect` never activates. `intent=interact` activates and verifies the exact
    resolved target once.
-5. A valid supplied snapshot avoids a provider scan; a stale snapshot allows only one
-   bounded scoped refresh.
+5. A native or persistent-CDP snapshot binds the exact target/scope but still requires
+   one fresh scoped accessibility observation before a locator or action. Shadow
+   actions also revalidate the exact backend node's accessible role and name
+   immediately before dispatch; loader and root identity alone are insufficient.
 6. Wire `_handle_observe_target` into readiness and dispatch.
 
 Gate: all selectors share one observation; at most one full scan; no PID find loop;

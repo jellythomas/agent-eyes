@@ -24,6 +24,40 @@ from agent_eyes.cdp_persistent import (
 )
 
 
+def test_cancelled_sent_command_remains_pending_until_the_transport_settles() -> None:
+    async def run() -> None:
+        sent = asyncio.Event()
+
+        class Connection:
+            def __init__(self) -> None:
+                self.message_id = 0
+
+            def _next_id(self) -> int:
+                self.message_id += 1
+                return self.message_id
+
+            async def _send_raw(self, _session_id, _msg_id, _method, _params) -> None:
+                sent.set()
+
+        session = CDPSession("session-1", Connection())
+        command = asyncio.create_task(session.send("Runtime.callFunctionOn"))
+        await sent.wait()
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+
+        assert session.has_pending_commands is True
+        recovery = asyncio.create_task(session.wait_until_idle())
+        await asyncio.sleep(0)
+        assert recovery.done() is False
+
+        session._on_message({"id": 1, "result": {}})
+        await recovery
+        assert session.has_pending_commands is False
+
+    asyncio.run(run())
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 

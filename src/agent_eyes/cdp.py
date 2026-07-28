@@ -4,6 +4,7 @@ Cross-platform: works on macOS, Windows, and Linux — anywhere Chrome runs.
 Gets accessibility trees enriched with bounded DOM targeting metadata and
 bounding boxes, giving AI agents spatial awareness without screenshots.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,6 +20,14 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from .adapters.base import UIElement
+from .cdp_runtime import (
+    CLICK_FUNCTION,
+    RuntimeActionStatus,
+    ax_element_has_exact_focus,
+    ax_element_semantics_match,
+    parse_runtime_action_status,
+    require_empty_command_result,
+)
 from .js_bridge import _tree_node_is_secure
 from .platform_utils import discover_cdp_port
 
@@ -131,7 +140,12 @@ def _cdp_http_get(
 ) -> tuple[int, bytes]:
     """Issue one bounded, redirect-free request to a local CDP endpoint."""
     host, port = _validate_cdp_endpoint(host, port)
-    if not path.startswith("/") or path.startswith("//") or "\r" in path or "\n" in path:
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "\r" in path
+        or "\n" in path
+    ):
         raise ValueError("CDP HTTP path must use origin form")
 
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -167,25 +181,8 @@ class CDPMutationOutcomeUnknown(RuntimeError):
     """A mutation was dispatched but its response was not confirmed."""
 
 
-def _runtime_exception_details(result: object) -> dict | None:
-    if not isinstance(result, dict):
-        return None
-    details = result.get("exceptionDetails")
-    return details if isinstance(details, dict) else None
-
-
-def _runtime_exception_is_stale(result: object) -> bool:
-    details = _runtime_exception_details(result)
-    if details is None:
-        return False
-    exception = details.get("exception")
-    candidates = [details.get("text")]
-    if isinstance(exception, dict):
-        candidates.extend((exception.get("description"), exception.get("value")))
-    return any(
-        isinstance(candidate, str) and "STALE_ELEMENT" in candidate
-        for candidate in candidates
-    )
+class CDPFocusMismatchError(RuntimeError):
+    """The exact target did not own document focus, so input was not sent."""
 
 
 def _document_revision(frame_result: dict, document_result: dict) -> int:
@@ -214,11 +211,7 @@ def _flatten_dom_nodes(
     """Flatten a nested ``DOM.getDocument`` result in stable tree order."""
     if not isinstance(root, dict):
         raise TypeError("DOM root must be a dictionary")
-    if (
-        isinstance(max_nodes, bool)
-        or not isinstance(max_nodes, int)
-        or max_nodes < 1
-    ):
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
         raise ValueError("max_nodes must be a positive integer")
 
     flattened: list[dict] = []
@@ -261,17 +254,9 @@ def _bounded_ax_nodes(
     max_bytes: int = _MAX_AX_CONVERSION_BYTES,
 ) -> tuple[list[dict], bool]:
     """Bound AX conversion work by count and compact-JSON byte size."""
-    if (
-        isinstance(max_nodes, bool)
-        or not isinstance(max_nodes, int)
-        or max_nodes < 1
-    ):
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
         raise ValueError("max_nodes must be a positive integer")
-    if (
-        isinstance(max_bytes, bool)
-        or not isinstance(max_bytes, int)
-        or max_bytes < 1
-    ):
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
         raise ValueError("max_bytes must be a positive integer")
 
     selected: list[dict] = []
@@ -305,42 +290,44 @@ def _bounded_ax_nodes(
         truncated = True
     return selected, truncated
 
+
 # Key name → CDP key descriptor mapping for special keys
 _KEY_MAP: dict[str, dict[str, Any]] = {
-    "enter":     {"key": "Enter", "code": "Enter", "keyCode": 13, "text": "\r"},
-    "return":    {"key": "Enter", "code": "Enter", "keyCode": 13, "text": "\r"},
-    "tab":       {"key": "Tab", "code": "Tab", "keyCode": 9},
-    "escape":    {"key": "Escape", "code": "Escape", "keyCode": 27},
-    "esc":       {"key": "Escape", "code": "Escape", "keyCode": 27},
+    "enter": {"key": "Enter", "code": "Enter", "keyCode": 13, "text": "\r"},
+    "return": {"key": "Enter", "code": "Enter", "keyCode": 13, "text": "\r"},
+    "tab": {"key": "Tab", "code": "Tab", "keyCode": 9},
+    "escape": {"key": "Escape", "code": "Escape", "keyCode": 27},
+    "esc": {"key": "Escape", "code": "Escape", "keyCode": 27},
     "backspace": {"key": "Backspace", "code": "Backspace", "keyCode": 8},
-    "delete":    {"key": "Delete", "code": "Delete", "keyCode": 46},
-    "space":     {"key": " ", "code": "Space", "keyCode": 32, "text": " "},
-    "arrowup":   {"key": "ArrowUp", "code": "ArrowUp", "keyCode": 38},
+    "delete": {"key": "Delete", "code": "Delete", "keyCode": 46},
+    "space": {"key": " ", "code": "Space", "keyCode": 32, "text": " "},
+    "arrowup": {"key": "ArrowUp", "code": "ArrowUp", "keyCode": 38},
     "arrowdown": {"key": "ArrowDown", "code": "ArrowDown", "keyCode": 40},
     "arrowleft": {"key": "ArrowLeft", "code": "ArrowLeft", "keyCode": 37},
-    "arrowright":{"key": "ArrowRight", "code": "ArrowRight", "keyCode": 39},
-    "home":      {"key": "Home", "code": "Home", "keyCode": 36},
-    "end":       {"key": "End", "code": "End", "keyCode": 35},
-    "pageup":    {"key": "PageUp", "code": "PageUp", "keyCode": 33},
-    "pagedown":  {"key": "PageDown", "code": "PageDown", "keyCode": 34},
-    "f1":        {"key": "F1", "code": "F1", "keyCode": 112},
-    "f2":        {"key": "F2", "code": "F2", "keyCode": 113},
-    "f3":        {"key": "F3", "code": "F3", "keyCode": 114},
-    "f4":        {"key": "F4", "code": "F4", "keyCode": 115},
-    "f5":        {"key": "F5", "code": "F5", "keyCode": 116},
-    "f6":        {"key": "F6", "code": "F6", "keyCode": 117},
-    "f7":        {"key": "F7", "code": "F7", "keyCode": 118},
-    "f8":        {"key": "F8", "code": "F8", "keyCode": 119},
-    "f9":        {"key": "F9", "code": "F9", "keyCode": 120},
-    "f10":       {"key": "F10", "code": "F10", "keyCode": 121},
-    "f11":       {"key": "F11", "code": "F11", "keyCode": 122},
-    "f12":       {"key": "F12", "code": "F12", "keyCode": 123},
+    "arrowright": {"key": "ArrowRight", "code": "ArrowRight", "keyCode": 39},
+    "home": {"key": "Home", "code": "Home", "keyCode": 36},
+    "end": {"key": "End", "code": "End", "keyCode": 35},
+    "pageup": {"key": "PageUp", "code": "PageUp", "keyCode": 33},
+    "pagedown": {"key": "PageDown", "code": "PageDown", "keyCode": 34},
+    "f1": {"key": "F1", "code": "F1", "keyCode": 112},
+    "f2": {"key": "F2", "code": "F2", "keyCode": 113},
+    "f3": {"key": "F3", "code": "F3", "keyCode": 114},
+    "f4": {"key": "F4", "code": "F4", "keyCode": 115},
+    "f5": {"key": "F5", "code": "F5", "keyCode": 116},
+    "f6": {"key": "F6", "code": "F6", "keyCode": 117},
+    "f7": {"key": "F7", "code": "F7", "keyCode": 118},
+    "f8": {"key": "F8", "code": "F8", "keyCode": 119},
+    "f9": {"key": "F9", "code": "F9", "keyCode": 120},
+    "f10": {"key": "F10", "code": "F10", "keyCode": 121},
+    "f11": {"key": "F11", "code": "F11", "keyCode": 122},
+    "f12": {"key": "F12", "code": "F12", "keyCode": 123},
 }
 
 
 @dataclass
 class ChromeTab:
     """A Chrome browser tab."""
+
     id: str
     title: str
     url: str
@@ -406,6 +393,7 @@ class CDPClient:
         """Check if CDP is available on a specific port."""
         try:
             import aiohttp
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"http://{_cdp_http_authority(self.host, port)}/json/version",
@@ -421,6 +409,7 @@ class CDPClient:
 
     async def _check_port_urllib(self, port: int) -> bool:
         """Fallback availability check without aiohttp."""
+
         def _check_sync() -> bool:
             try:
                 status, _body = _cdp_http_get(
@@ -432,10 +421,12 @@ class CDPClient:
                 return status == 200
             except Exception:
                 return False
+
         return await asyncio.get_running_loop().run_in_executor(None, _check_sync)
 
     async def list_tabs(self) -> list[ChromeTab]:
         """List all Chrome tabs."""
+
         def _list_sync() -> list[ChromeTab]:
             try:
                 status, body = _cdp_http_get(
@@ -463,15 +454,18 @@ class CDPClient:
                             "CDPClient: rejected non-loopback WS endpoint",
                         )
                         continue
-                    tabs.append(ChromeTab(
-                        id=item.get("id", ""),
-                        title=item.get("title", ""),
-                        url=item.get("url", ""),
-                        ws_url=ws_url,
-                    ))
+                    tabs.append(
+                        ChromeTab(
+                            id=item.get("id", ""),
+                            title=item.get("title", ""),
+                            url=item.get("url", ""),
+                            ws_url=ws_url,
+                        )
+                    )
                 return tabs
             except Exception:
                 return []
+
         return await asyncio.get_running_loop().run_in_executor(None, _list_sync)
 
     async def collect_secure_dom_metadata(
@@ -724,12 +718,30 @@ class CDPClient:
             return None
 
     # Interactive roles worth enriching with layout/visual data
-    _ENRICH_ROLES = frozenset({
-        "button", "link", "textbox", "combobox", "searchbox",
-        "checkbox", "radio", "switch", "slider", "spinbutton",
-        "menuitem", "tab", "heading", "img", "banner", "navigation",
-        "main", "complementary", "contentinfo", "form",
-    })
+    _ENRICH_ROLES = frozenset(
+        {
+            "button",
+            "link",
+            "textbox",
+            "combobox",
+            "searchbox",
+            "checkbox",
+            "radio",
+            "switch",
+            "slider",
+            "spinbutton",
+            "menuitem",
+            "tab",
+            "heading",
+            "img",
+            "banner",
+            "navigation",
+            "main",
+            "complementary",
+            "contentinfo",
+            "form",
+        }
+    )
 
     async def _enrich_tree(self, ws, element: UIElement, limit: int = 60) -> int:
         """Walk tree and enrich interactive elements with bounds + visual info.
@@ -769,12 +781,18 @@ class CDPClient:
 
         return enriched
 
-    async def _get_box_model(self, ws, backend_node_id: int) -> tuple[int, int, int, int] | None:
+    async def _get_box_model(
+        self, ws, backend_node_id: int
+    ) -> tuple[int, int, int, int] | None:
         """Get element bounding box via DOM.getBoxModel. Returns (x, y, w, h)."""
         try:
-            result = await self._send(ws, "DOM.getBoxModel", {
-                "backendNodeId": backend_node_id,
-            })
+            result = await self._send(
+                ws,
+                "DOM.getBoxModel",
+                {
+                    "backendNodeId": backend_node_id,
+                },
+            )
             model = result.get("model", {})
             border = model.get("border", [])
             if len(border) >= 8:
@@ -793,22 +811,36 @@ class CDPClient:
         """Get key visual properties for an element. Returns compact description."""
         try:
             # Resolve to DOM nodeId first
-            desc = await self._send(ws, "DOM.describeNode", {
-                "backendNodeId": backend_node_id,
-            })
+            desc = await self._send(
+                ws,
+                "DOM.describeNode",
+                {
+                    "backendNodeId": backend_node_id,
+                },
+            )
             node_id = desc.get("node", {}).get("nodeId")
             if not node_id:
                 return ""
 
-            result = await self._send(ws, "CSS.getComputedStyleForNode", {
-                "nodeId": node_id,
-            })
+            result = await self._send(
+                ws,
+                "CSS.getComputedStyleForNode",
+                {
+                    "nodeId": node_id,
+                },
+            )
             styles = {
                 s["name"]: s["value"]
                 for s in result.get("computedStyle", [])
-                if s["name"] in {
-                    "color", "background-color", "font-size", "font-weight",
-                    "visibility", "opacity", "display",
+                if s["name"]
+                in {
+                    "color",
+                    "background-color",
+                    "font-size",
+                    "font-weight",
+                    "visibility",
+                    "opacity",
+                    "display",
                 }
             }
 
@@ -853,10 +885,15 @@ class CDPClient:
 
         # Map to basic color names for common cases
         _COLORS = [
-            ((255, 255, 255), "white"), ((0, 0, 0), "black"),
-            ((255, 0, 0), "red"), ((0, 128, 0), "green"), ((0, 0, 255), "blue"),
-            ((128, 128, 128), "gray"), ((255, 255, 0), "yellow"),
-            ((255, 165, 0), "orange"), ((128, 0, 128), "purple"),
+            ((255, 255, 255), "white"),
+            ((0, 0, 0), "black"),
+            ((255, 0, 0), "red"),
+            ((0, 128, 0), "green"),
+            ((0, 0, 255), "blue"),
+            ((128, 128, 128), "gray"),
+            ((255, 255, 0), "yellow"),
+            ((255, 165, 0), "orange"),
+            ((128, 0, 128), "purple"),
         ]
         # Find closest by Euclidean distance
         best_name, best_dist = "", 999
@@ -884,9 +921,7 @@ class CDPClient:
                 if name:
                     params["accessibleName"] = name
 
-                result = await self._send(
-                    ws, "Accessibility.queryAXTree", params
-                )
+                result = await self._send(ws, "Accessibility.queryAXTree", params)
 
                 nodes = result.get("nodes", [])
                 secure_metadata = await self.collect_secure_dom_metadata(
@@ -919,7 +954,8 @@ class CDPClient:
             async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
                 result = await self._send(
-                    ws, "DOM.resolveNode",
+                    ws,
+                    "DOM.resolveNode",
                     {"backendNodeId": backend_node_id},
                 )
                 object_id = result.get("object", {}).get("objectId")
@@ -946,7 +982,48 @@ class CDPClient:
         if current_revision != expected_revision:
             raise CDPDocumentChangedError("shadow document changed")
 
-    async def get_element_value(self, tab: ChromeTab, backend_node_id: int) -> str | None:
+    async def _assert_element_semantics(
+        self,
+        ws,
+        backend_node_id: int,
+        expected_element: UIElement,
+    ) -> None:
+        result = await self._send(
+            ws,
+            "Accessibility.getPartialAXTree",
+            {"backendNodeId": backend_node_id, "fetchRelatives": False},
+        )
+        if not ax_element_semantics_match(
+            result,
+            backend_node_id=backend_node_id,
+            expected_role=expected_element.role,
+            expected_name=expected_element.name,
+        ):
+            raise CDPDocumentChangedError(
+                "shadow element accessibility semantics changed"
+            )
+
+    async def _element_has_exact_focus(
+        self,
+        ws,
+        backend_node_id: int,
+        expected_element: UIElement,
+    ) -> bool:
+        result = await self._send(
+            ws,
+            "Accessibility.getPartialAXTree",
+            {"backendNodeId": backend_node_id, "fetchRelatives": False},
+        )
+        return ax_element_has_exact_focus(
+            result,
+            backend_node_id=backend_node_id,
+            expected_role=expected_element.role,
+            expected_name=expected_element.name,
+        )
+
+    async def get_element_value(
+        self, tab: ChromeTab, backend_node_id: int
+    ) -> str | None:
         """Get the current value of an input element.
 
         Returns the value string, or None if the element doesn't exist or has no value.
@@ -956,7 +1033,8 @@ class CDPClient:
             async with _connect_websocket(tab.ws_url) as ws:
                 await self._send(ws, "DOM.enable")
                 result = await self._send(
-                    ws, "DOM.resolveNode",
+                    ws,
+                    "DOM.resolveNode",
                     {"backendNodeId": backend_node_id},
                 )
                 object_id = result.get("object", {}).get("objectId")
@@ -965,7 +1043,8 @@ class CDPClient:
 
                 # Get value via JS
                 result = await self._send(
-                    ws, "Runtime.callFunctionOn",
+                    ws,
+                    "Runtime.callFunctionOn",
                     {
                         "functionDeclaration": """function() {
                             if (this.value !== undefined) return this.value;
@@ -986,9 +1065,15 @@ class CDPClient:
         tab: ChromeTab,
         backend_node_id: int,
         *,
+        expected_element: UIElement,
         expected_revision: int | None = None,
     ) -> bool:
         """Click an element by its backend DOM node ID."""
+        if (
+            not isinstance(expected_element, UIElement)
+            or expected_element.platform_ref != backend_node_id
+        ):
+            raise ValueError("expected_element must match backend_node_id")
         dispatched = False
         try:
             async with _connect_websocket(tab.ws_url) as ws:
@@ -998,7 +1083,8 @@ class CDPClient:
 
                 # Resolve to JS object
                 result = await self._send(
-                    ws, "DOM.resolveNode",
+                    ws,
+                    "DOM.resolveNode",
                     {"backendNodeId": backend_node_id},
                 )
                 object_id = result.get("object", {}).get("objectId")
@@ -1006,26 +1092,30 @@ class CDPClient:
                     return False
                 if expected_revision is not None:
                     await self._assert_document_revision(ws, expected_revision)
+                await self._assert_element_semantics(
+                    ws,
+                    backend_node_id,
+                    expected_element,
+                )
 
                 # Click via JS
                 dispatched = True
                 click_result = await self._send(
-                    ws, "Runtime.callFunctionOn",
+                    ws,
+                    "Runtime.callFunctionOn",
                     {
-                        "functionDeclaration": (
-                            "function() { if (!this.isConnected) "
-                            "throw new Error('STALE_ELEMENT'); this.click(); }"
-                        ),
+                        "functionDeclaration": CLICK_FUNCTION,
                         "objectId": object_id,
+                        "awaitPromise": True,
+                        "returnByValue": True,
                     },
                 )
-                if _runtime_exception_details(click_result) is not None:
-                    if _runtime_exception_is_stale(click_result):
-                        dispatched = False
-                        raise CDPDocumentChangedError("shadow element changed")
-                    raise CDPMutationOutcomeUnknown(
-                        "legacy shadow click ended with a runtime exception"
-                    )
+                click_status = parse_runtime_action_status(
+                    click_result,
+                    allowed=frozenset({RuntimeActionStatus.CLICK_APPLIED}),
+                )
+                if click_status is not RuntimeActionStatus.CLICK_APPLIED:
+                    raise AssertionError("unreachable click action status")
                 return True
         except CDPDocumentChangedError:
             if dispatched:
@@ -1048,9 +1138,15 @@ class CDPClient:
         backend_node_id: int,
         text: str,
         *,
+        expected_element: UIElement,
         expected_revision: int | None = None,
     ) -> bool:
         """Type text into an element."""
+        if (
+            not isinstance(expected_element, UIElement)
+            or expected_element.platform_ref != backend_node_id
+        ):
+            raise ValueError("expected_element must match backend_node_id")
         dispatched = False
         try:
             async with _connect_websocket(tab.ws_url) as ws:
@@ -1060,7 +1156,8 @@ class CDPClient:
 
                 # Focus the element
                 result = await self._send(
-                    ws, "DOM.resolveNode",
+                    ws,
+                    "DOM.resolveNode",
                     {"backendNodeId": backend_node_id},
                 )
                 object_id = result.get("object", {}).get("objectId")
@@ -1068,36 +1165,42 @@ class CDPClient:
                     return False
                 if expected_revision is not None:
                     await self._assert_document_revision(ws, expected_revision)
+                await self._assert_element_semantics(
+                    ws,
+                    backend_node_id,
+                    expected_element,
+                )
 
                 dispatched = True
                 focus_result = await self._send(
-                    ws, "Runtime.callFunctionOn",
-                    {
-                        "functionDeclaration": (
-                            "function() { if (!this.isConnected) "
-                            "throw new Error('STALE_ELEMENT'); this.focus(); }"
-                        ),
-                        "objectId": object_id,
-                    },
+                    ws,
+                    "DOM.focus",
+                    {"backendNodeId": backend_node_id},
                 )
-                if _runtime_exception_details(focus_result) is not None:
-                    if _runtime_exception_is_stale(focus_result):
-                        dispatched = False
-                        raise CDPDocumentChangedError("shadow element changed")
-                    raise CDPMutationOutcomeUnknown(
-                        "legacy shadow focus ended with a runtime exception; text was not sent"
+                require_empty_command_result(focus_result)
+                if not await self._element_has_exact_focus(
+                    ws,
+                    backend_node_id,
+                    expected_element,
+                ):
+                    dispatched = False
+                    raise CDPFocusMismatchError(
+                        "exact shadow element focus was not proven"
                     )
+                dispatched = False
                 if expected_revision is not None:
                     await self._assert_document_revision(ws, expected_revision)
 
                 # Insert full text in one CDP call (vs 2N calls for per-char dispatch)
+                dispatched = True
                 await self._send(
-                    ws, "Input.insertText",
+                    ws,
+                    "Input.insertText",
                     {"text": text},
                 )
 
                 return True
-        except CDPDocumentChangedError:
+        except (CDPDocumentChangedError, CDPFocusMismatchError):
             if dispatched:
                 raise CDPMutationOutcomeUnknown(
                     "legacy shadow input outcome is unknown"
@@ -1189,7 +1292,10 @@ class CDPClient:
                 val = result.get("result", {}).get("value")
                 # Truncate large return values
                 if isinstance(val, str) and len(val) > MAX_EVAL_RESULT_LEN:
-                    val = val[:MAX_EVAL_RESULT_LEN] + f"… [truncated, {len(val)} chars total]"
+                    val = (
+                        val[:MAX_EVAL_RESULT_LEN]
+                        + f"… [truncated, {len(val)} chars total]"
+                    )
                 return {"value": val}
         except Exception as exc:
             if dispatched:
@@ -1203,7 +1309,7 @@ class CDPClient:
     ) -> bool:
         """Press a key (Enter, Tab, Escape, etc.) with optional modifiers."""
         mod_flags = 0
-        for m in (modifiers or []):
+        for m in modifiers or []:
             m_lower = m.lower()
             if m_lower in ("alt", "option"):
                 mod_flags |= 1
@@ -1353,9 +1459,7 @@ class CDPClient:
         try:
             async with _connect_websocket(tabs[0].ws_url) as ws:
                 dispatched = True
-                result = await self._send(
-                    ws, "Target.createTarget", {"url": url}
-                )
+                result = await self._send(ws, "Target.createTarget", {"url": url})
                 target_id = result.get("targetId")
                 if not target_id:
                     return None
@@ -1369,7 +1473,9 @@ class CDPClient:
         # Target.createTarget acknowledged creation. Metadata discovery may lag,
         # so retain the browser-owned ID instead of inviting a duplicate retry.
         new_tabs = await self.list_tabs()
-        new_tab = next((candidate for candidate in new_tabs if candidate.id == target_id), None)
+        new_tab = next(
+            (candidate for candidate in new_tabs if candidate.id == target_id), None
+        )
         if new_tab is None:
             return ChromeTab(id=target_id, title="", url=url, ws_url="")
 
@@ -1419,6 +1525,7 @@ class CDPClient:
 
     async def close_tab(self, tab: ChromeTab) -> bool:
         """Close a browser tab."""
+
         def close() -> bool:
             try:
                 status, _body = _cdp_http_get(
@@ -1443,9 +1550,7 @@ class CDPClient:
                 params: dict[str, Any] = {"accept": accept}
                 if prompt_text:
                     params["promptText"] = prompt_text
-                await self._send(
-                    ws, "Page.handleJavaScriptDialog", params
-                )
+                await self._send(ws, "Page.handleJavaScriptDialog", params)
                 return True
         except Exception as e:
             logger.debug(
@@ -1670,7 +1775,8 @@ class CDPClient:
         try:
             async with _connect_websocket(tab.ws_url) as ws:
                 result = await self._send(
-                    ws, "Runtime.evaluate",
+                    ws,
+                    "Runtime.evaluate",
                     {"expression": js_code, "returnByValue": True},
                 )
                 value = result.get("result", {}).get("value", "")
@@ -1879,19 +1985,35 @@ class CDPClient:
     ) -> UIElement | None:
         """Convert a CDP AXNode to UIElement."""
         role_val = node.get("role", {})
-        role = role_val.get("value", "unknown") if isinstance(role_val, dict) else str(role_val)
+        role = (
+            role_val.get("value", "unknown")
+            if isinstance(role_val, dict)
+            else str(role_val)
+        )
 
         if role in ("none", "generic", "InlineTextBox"):
             return None
 
         name_val = node.get("name", {})
-        name = name_val.get("value", "") if isinstance(name_val, dict) else str(name_val or "")
+        name = (
+            name_val.get("value", "")
+            if isinstance(name_val, dict)
+            else str(name_val or "")
+        )
 
         value_val = node.get("value", {})
-        value = value_val.get("value", "") if isinstance(value_val, dict) else str(value_val or "")
+        value = (
+            value_val.get("value", "")
+            if isinstance(value_val, dict)
+            else str(value_val or "")
+        )
 
         desc_val = node.get("description", {})
-        description = desc_val.get("value", "") if isinstance(desc_val, dict) else str(desc_val or "")
+        description = (
+            desc_val.get("value", "")
+            if isinstance(desc_val, dict)
+            else str(desc_val or "")
+        )
 
         # Extract states from properties. Chromium normally identifies native
         # password controls here, but DOM metadata remains authoritative for
@@ -1943,7 +2065,11 @@ class CDPClient:
             id=self._next_id(),
             role=role,
             name=name,
-            value="" if secure or redact_unverified else str(value)[:200] if value else "",
+            value=""
+            if secure or redact_unverified
+            else str(value)[:200]
+            if value
+            else "",
             description=description,
             states=states,
             platform_ref=backend_id,  # Store backend DOM node ID
@@ -1969,8 +2095,7 @@ class CDPClient:
             or not 1 <= max_nodes <= _MAX_PIERCED_DOM_NODES
         ):
             raise ValueError(
-                "max_nodes must be an integer between 1 and "
-                f"{_MAX_PIERCED_DOM_NODES}"
+                f"max_nodes must be an integer between 1 and {_MAX_PIERCED_DOM_NODES}"
             )
 
         try:

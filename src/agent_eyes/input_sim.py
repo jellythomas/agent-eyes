@@ -448,33 +448,50 @@ class MacOSInputBackend(InputBackend):
             return False
 
     def is_frontmost(self, pid: int) -> bool:
-        """Check if a given PID is the frontmost application."""
+        """Check the frontmost normal WindowServer window without AppKit state."""
+        self._load()
+        Q = self._quartz
         try:
-            from AppKit import NSWorkspace
-            front = NSWorkspace.sharedWorkspace().frontmostApplication()
-            return front is not None and front.processIdentifier() == pid
+            options = Q.kCGWindowListOptionOnScreenOnly
+            options |= getattr(Q, "kCGWindowListExcludeDesktopElements", 0)
+            records = Q.CGWindowListCopyWindowInfo(options, Q.kCGNullWindowID) or []
+            for record in records:
+                if int(record.get(Q.kCGWindowLayer, -1)) != 0:
+                    continue
+                owner_pid = int(record.get(Q.kCGWindowOwnerPID, 0))
+                if owner_pid > 0:
+                    return owner_pid == pid
+            return False
         except Exception:
             return False
 
     def activate_window(self, pid: int) -> bool:
-        """Bring an app to front via NSRunningApplication (Cocoa API).
-
-        More reliable than AppleScript — works for apps that don't respond
-        to System Events (like Jamf Self Service+).
-        """
+        """Request foreground activation by exact PID without a fixed wait."""
+        script = (
+            'tell application "System Events" to set frontmost of '
+            f"(first process whose unix id is {pid}) to true"
+        )
         try:
-            from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+            completed = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True,
+                timeout=3,
+            )
+            if completed.returncode == 0:
+                return True
+        except Exception:
+            pass
+
+        try:
+            from AppKit import (
+                NSApplicationActivateIgnoringOtherApps,
+                NSRunningApplication,
+            )
+
             app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
             if app:
                 return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
-            # Fallback to System Events if NSRunningApplication fails
-            completed = subprocess.run(
-                ["osascript", "-e",
-                 f'tell application "System Events" to set frontmost of '
-                 f'(first process whose unix id is {pid}) to true'],
-                capture_output=True, timeout=3,
-            )
-            return completed.returncode == 0
+            return False
         except Exception as e:
             logger.error(
                 "macOS activate_window failed (exception_type=%s)",
@@ -1021,29 +1038,18 @@ class WindowsInputBackend(InputBackend):
 
     def click(self, x: int, y: int, button: str = "left") -> bool:
         self._load()
-        MOUSEEVENTF_MOVE = 0x0001
-        MOUSEEVENTF_ABSOLUTE = 0x8000
         MOUSEEVENTF_LEFTDOWN = 0x0002
         MOUSEEVENTF_LEFTUP = 0x0004
         MOUSEEVENTF_RIGHTDOWN = 0x0008
         MOUSEEVENTF_RIGHTUP = 0x0010
 
         try:
-            screen_w = self._user32.GetSystemMetrics(0)
-            screen_h = self._user32.GetSystemMetrics(1)
-            nx = int(x * 65535 / screen_w)
-            ny = int(y * 65535 / screen_h)
-
             down_flag = MOUSEEVENTF_RIGHTDOWN if button == "right" else MOUSEEVENTF_LEFTDOWN
             up_flag = MOUSEEVENTF_RIGHTUP if button == "right" else MOUSEEVENTF_LEFTUP
 
             return self._send_inputs(
                 [
-                    self._mouse_input(
-                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                        dx=nx,
-                        dy=ny,
-                    ),
+                    self._move_input(x, y),
                     self._mouse_input(down_flag),
                     self._mouse_input(up_flag),
                 ]
@@ -1076,17 +1082,37 @@ class WindowsInputBackend(InputBackend):
         )
 
     def _move_input(self, x: int, y: int):
-        """Move mouse to absolute position using normalized coords."""
-        screen_w = self._user32.GetSystemMetrics(0)
-        screen_h = self._user32.GetSystemMetrics(1)
-        if screen_w <= 0 or screen_h <= 0:
-            raise RuntimeError("invalid Windows screen metrics")
-        nx = int(x * 65535 / screen_w)
-        ny = int(y * 65535 / screen_h)
-        return self._mouse_input(0x0001 | 0x8000, dx=nx, dy=ny)
+        """Map desktop pixels onto the complete Windows virtual desktop."""
+        left = self._user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        top = self._user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        width = self._user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = self._user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if width <= 0 or height <= 0:
+            raise RuntimeError("invalid Windows virtual-desktop metrics")
+
+        x_span = max(width - 1, 1)
+        y_span = max(height - 1, 1)
+        relative_x = min(max(int(x) - left, 0), width - 1)
+        relative_y = min(max(int(y) - top, 0), height - 1)
+        normalized_x = round(relative_x * 65535 / x_span)
+        normalized_y = round(relative_y * 65535 / y_span)
+        flags = 0x0001 | 0x4000 | 0x8000
+        return self._mouse_input(flags, dx=normalized_x, dy=normalized_y)
 
     def _move_to(self, x: int, y: int) -> bool:
         return self._send_input(self._move_input(x, y))
+
+    def move_mouse(self, x: int, y: int) -> bool:
+        """Move the pointer once through the absolute SendInput path."""
+        self._load()
+        try:
+            return self._move_to(x, y)
+        except Exception as e:
+            logger.error(
+                "Windows move_mouse failed (exception_type=%s)",
+                type(e).__name__,
+            )
+            return False
 
     def _mouse_event(self, flags: int, data: int = 0) -> bool:
         """Send a mouse event with given flags."""

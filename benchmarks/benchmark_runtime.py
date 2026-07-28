@@ -28,6 +28,7 @@ from agent_eyes.server import TOOLS
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_ROOT = _PROJECT_ROOT / "src" / "agent_eyes"
+_TOOL_CATALOG_LIMIT_BYTES = 16 * 1024
 _ALLOWED_SLEEP_MODULES = frozenset({
     Path("input_sim.py"),
     Path("native_events.py"),
@@ -81,6 +82,28 @@ def _fixed_orchestration_sleep_calls() -> list[str]:
         if source_path.relative_to(_SOURCE_ROOT) not in _ALLOWED_SLEEP_MODULES
     )
     return _sleep_calls_in(source_paths)
+
+
+def _compact_tool_catalog_bytes() -> int:
+    catalog = json.dumps(
+        [tool.model_dump(mode="json", exclude_none=True) for tool in TOOLS],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return len(catalog)
+
+
+def _deterministic_static_gates() -> dict[str, int | bool]:
+    """Return fast count/size gates without sampling hosted-runner wall time."""
+    fixed_sleep_count = len(_fixed_orchestration_sleep_calls())
+    catalog_bytes = _compact_tool_catalog_bytes()
+    return {
+        "fixed_orchestration_sleep_calls": fixed_sleep_count,
+        "tools_list_compact_json_bytes": catalog_bytes,
+        "tool_catalog_limit_bytes": _TOOL_CATALOG_LIMIT_BYTES,
+        "passed": fixed_sleep_count == 0
+        and catalog_bytes <= _TOOL_CATALOG_LIMIT_BYTES,
+    }
 
 
 def _summary(samples: list[float]) -> dict[str, float]:
@@ -297,10 +320,8 @@ async def _deadline_sample() -> float:
 
 
 async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, object]:
+    static_gates = _deterministic_static_gates()
     fixed_orchestration_sleep_calls = _fixed_orchestration_sleep_calls()
-    if fixed_orchestration_sleep_calls:
-        joined = ", ".join(fixed_orchestration_sleep_calls)
-        raise RuntimeError(f"fixed orchestration sleep call found: {joined}")
 
     cli_import = _summary([
         _subprocess_sample([sys.executable, "-c", "import agent_eyes.cli"])
@@ -408,14 +429,14 @@ async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, 
             "shown_targets": output.count("[native:"),
         }
 
-    catalog_json = json.dumps(
-        [tool.model_dump(mode="json", exclude_none=True) for tool in TOOLS],
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    deterministic_gates = {
+        **static_gates,
+        "singleflight_provider_calls": sorted(singleflight_calls),
+        "passed": bool(static_gates["passed"] and singleflight_calls == {1}),
+    }
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "environment": {
             "platform": platform.platform(),
             "architecture": platform.machine(),
@@ -453,8 +474,11 @@ async def _benchmark(samples: int, warmups: int, concurrency: int) -> dict[str, 
         "formatting": format_results,
         "context": {
             "tool_count": len(TOOLS),
-            "tools_list_compact_json_bytes": len(catalog_json),
+            "tools_list_compact_json_bytes": static_gates[
+                "tools_list_compact_json_bytes"
+            ],
         },
+        "gates": deterministic_gates,
     }
 
 
@@ -463,11 +487,24 @@ def main() -> None:
     parser.add_argument("--samples", type=_positive_integer, default=30)
     parser.add_argument("--warmups", type=_non_negative_integer, default=3)
     parser.add_argument("--concurrency", type=_positive_integer, default=32)
+    parser.add_argument("--deterministic-gates-only", action="store_true")
     arguments = parser.parse_args()
-    result = asyncio.run(
-        _benchmark(arguments.samples, arguments.warmups, arguments.concurrency)
-    )
+    if arguments.deterministic_gates_only:
+        result = {
+            "schema_version": 1,
+            "protocol": {
+                "fixture": "static catalog and orchestration-sleep counts",
+                "hosted_wall_time_gated": False,
+            },
+            "gates": _deterministic_static_gates(),
+        }
+    else:
+        result = asyncio.run(
+            _benchmark(arguments.samples, arguments.warmups, arguments.concurrency)
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if not result["gates"]["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

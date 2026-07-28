@@ -1,7 +1,6 @@
 # Agent Eyes MCP tool reference
 
-**Documented baseline:** Agent Eyes 0.9.0 plus the contract-alignment changes in
-this source tree
+**Documented release:** Agent Eyes 0.10.0
 
 Agent Eyes exposes local computer use through the Model Context Protocol (MCP)
 over stdio. It uses operating-system accessibility and real input for normal
@@ -19,14 +18,32 @@ templates, or prompts.
 
 | Platform | Tool count | Platform-only differences |
 |---|---:|---|
-| macOS | 28 | Includes `app`, `window`, and the Apple Events `shadow` compatibility tool. |
-| Windows | 25 | Omits `app`, `window`, and `shadow`. |
-| Linux | 25 | Omits `app`, `window`, and `shadow`. |
+| macOS | 30 | Includes `app`, `window`, and the Apple Events `shadow` compatibility tool. |
+| Windows | 27 | Omits `app`, `window`, and `shadow`. |
+| Linux | 27 | Omits `app`, `window`, and `shadow`. |
 
 All tool argument objects reject unknown properties. JSON-schema bounds and
 schema-encoded argument combinations are enforced before dispatch. Handler-only
 semantics, including URL schemes, non-empty batches, provider compatibility, and
 action-specific conditions, are checked before the affected mutation.
+
+Tool index:
+
+- Transaction fast path: [`observe_target`](#observe_target),
+  [`execute`](#execute)
+- Orientation: [`status`](#status), [`context`](#context),
+  [`list_apps`](#list_apps), [`focused`](#focused)
+- Structured UI: [`tree`](#tree), [`subtree`](#subtree), [`find`](#find),
+  [`pierce`](#pierce)
+- Input: [`click`](#click), [`type`](#type), [`press_key`](#press_key),
+  [`hover`](#hover), [`scroll`](#scroll), [`drag`](#drag),
+  [`fill_form`](#fill_form), [`upload`](#upload)
+- Browser/web: [`list_tabs`](#list_tabs), [`web_tree`](#web_tree),
+  [`navigate`](#navigate), [`js`](#js), [`new_tab`](#new_tab),
+  [`close_tab`](#close_tab), [`dialog`](#dialog), [`wait`](#wait)
+- macOS-only control: [`app`](#app-macos), [`window`](#window-macos),
+  [`shadow`](#shadow-macos-compatibility)
+- Readiness compatibility: [`install_check`](#install_check)
 
 ## Execution modes
 
@@ -71,6 +88,7 @@ snapshot token.
 | `click`, `type`, `fill_form`, `upload` by snapshot | Yes | Yes | No; use `shadow` where applicable |
 | `press_key`, `dialog`, `scroll`, `drag`, `close_tab` | Yes | Yes | No; use `shadow` for key/scroll compatibility |
 | `wait`, `pierce` | Yes | No | No |
+| `execute(target.mode="shadow")` | Yes | No | No |
 | `new_tab(shadow=true)` | No | Yes | No |
 | `shadow` compatibility tool | No | No | Yes |
 
@@ -81,16 +99,17 @@ require literal `shadow: true`; they cannot be called as foreground tools.
 
 ## Targets, snapshots, and element IDs
 
-`target_id` identifies a browser target. Foreground IDs are provider-qualified
-and content-fingerprinted, for example:
+`target_id` identifies a browser target. A foreground ID is an opaque, provider-qualified live handle,
+for example:
 
 ```text
-native:28468:w0:t1:ha39c14bb6193
+native:28468:w0:t1:ra39c14bb6193f72e
 ```
 
-Do not convert native IDs into CDP tab indexes or rely on a mutable list
-position. Refresh `list_tabs` after navigation, closing a tab, or a stale-target
-error.
+The handle must not be parsed or reconstructed, converted into a CDP tab index,
+or replaced by a mutable list position. Reuse it only while its short live lease
+is current. Refresh `list_tabs` after navigation, closing a tab, replacement,
+reordering, or a stale-target error.
 
 Apple Events target IDs are provider-qualified. CDP target IDs are raw,
 provider-owned identifiers and may not carry a prefix. An Apple Events ID cannot
@@ -127,6 +146,11 @@ reusing an old ID.
 | Upload files | 32 |
 | Form fields | 100 |
 | Key modifiers | 4 |
+| `observe_target` selectors | 8 |
+| `execute` steps | 1–8 |
+| Transaction deadline | 1–30,000 ms; 3,000 ms by default |
+| `observe_target` text result | 4 KiB |
+| `execute` text result | 2 KiB |
 | Default text result | 16 KiB |
 | Hard text-result ceiling | 64 KiB |
 
@@ -150,10 +174,15 @@ Common error categories:
 | `AMBIGUOUS_TARGET` | More than one target matches an unsafe shorthand. | Use the exact current ID/snapshot. |
 | `MODE_MISMATCH` | Foreground and shadow records were mixed. | Observe and act in the same explicit mode. |
 | `TARGET_MISMATCH` | Snapshot belongs to another provider/target. | Use the originating snapshot or observe again. |
+| `ELEMENT_NOT_FOUND` | A target or locator matched no accessible element. | Correct or broaden the selector, then observe once. |
+| `AMBIGUOUS_ELEMENT` | A transaction locator matched multiple elements. | Add role/name/value or a `within` scope; never choose one arbitrarily. |
+| `INVALID_TRANSACTION` | A transaction violates its schema or bounded semantic rules. | Fix the request; retrying the same input cannot succeed. |
 | `FOCUS_MISMATCH` | Exact foreground window/tab/element focus could not be proven. | Refresh context/inventory and retry only after verifying the target. |
 | `DEADLINE_EXCEEDED` | The bounded operation did not complete in time. | Observe current state before deciding whether retry is safe. |
 | `PROVIDER_BUSY` | A previous uncertain foreground operation is still settling. | Wait for it to settle, then refresh. Do not route around it. |
 | `OUTCOME_UNKNOWN` | A mutation may have completed but confirmation was lost. | Observe the exact target; never replay blindly. |
+| `UNSUPPORTED_CAPABILITY` | The selected provider cannot perform the requested operation. | Keep the same mode and choose a supported tool or report the gap. |
+| `RESULT_TRUNCATED` | Even compact result metadata could not fit its hard result budget. | Narrow the selectors; do not request an unbounded tree. |
 | `PARTIAL_FAILURE` | A batched operation completed only some items. | Inspect the reported count and refresh affected fields. |
 
 MCP itself does not display a confirmation prompt before dispatch. The client
@@ -162,6 +191,24 @@ enforces explicit mode, exact target, snapshot, stale-state, and input safety
 boundaries.
 
 ## Recommended foreground workflow
+
+Known task:
+
+```text
+execute(target query/exact ID/PID, <=8 locate/action/expect steps)
+```
+
+Exploratory task:
+
+```text
+observe_target(all needed selectors) -> execute(exact target and snapshot)
+```
+
+Both transaction forms inventory and reuse relevant open browser targets. Only
+`execute` supports an explicit `on_missing="open"` fallback. Neither probes a
+shadow provider unless `execute` receives explicit `mode="shadow"` with an exact
+persistent-CDP target. Use the primitive workflow only when the bounded transaction
+operation set cannot express the task:
 
 ```text
 context -> list_tabs(query) -> tree(pid) -> find/subtree -> action(snapshot, id)
@@ -390,6 +437,251 @@ focus, open, navigate, or close tabs.
 }
 ```
 
+### `observe_target`
+
+Resolve and optionally activate one foreground target, scan it once, and evaluate
+all discovery selectors from the same compact accessibility observation. Use this
+once before `execute` when the target or locator shape is not already known.
+
+| Parameter | Required | Type/default | Constraints and meaning |
+|---|---:|---|---|
+| `query` | exactly one target selector | string | Browser task, site, title, or URL terms, 1–512 characters. Open tabs are ranked and reused; a tied top match fails closed. |
+| `target_id` | exactly one target selector | string | Exact provider-qualified foreground ID beginning `native:`, 1–512 characters. |
+| `pid` | exactly one target selector | integer | Exact desktop process, 1–2,147,483,647. |
+| `intent` | no | string, `inspect` | `inspect` preserves focus, so a selected browser tab must already be the visible native tab; `interact` activates and verifies the exact target before scanning. |
+| `selectors` | no | locator array, `[]` | Evaluate 0–8 strict locator objects together from one observation. |
+| `max_results` | no | integer, `10` | Return at most 1–20 matches per selector. The total count still reports all matches. |
+| `deadline_ms` | no | integer, `3000` | One monotonic deadline for resolution, activation, and observation, 1–30,000 ms. |
+
+Exactly one of `query`, `target_id`, or `pid` is required. `observe_target` is
+foreground-only; it does not accept a mode or probe a shadow provider.
+
+Each object in `selectors` supports:
+
+| Field | Required | Type/default | Constraints and meaning |
+|---|---:|---|---|
+| `role` | conditional | string | Accessibility role, at most 128 characters. |
+| `name` | conditional | string | Accessible name/title, at most 512 characters. |
+| `value` | conditional | string | Accessible value, at most 512 characters. Secure values are never returned. |
+| `match` | no | string, `exact` | Case-insensitive `exact`, `contains`, `prefix`, or `suffix` matching applied to every supplied field. |
+| `within` | no | string | Transaction-local alias scope, at most 64 characters. `observe_target` has no alias table, so omit this field; a nonempty scope is unavailable and fails closed. |
+
+At least one of `role`, `name`, or `value` is required in every selector.
+
+**Returns:** compact JSON, at most 4 KiB, with `status`, exact target identity,
+activation/source metadata, immutable snapshot token/provider/generation/revision,
+scan kind/node/cache metadata, and one ordered selector result per request selector.
+Each selector result contains its zero-based `index`, `status` (`missing`, `unique`,
+or `ambiguous`), full `total`, truncation marker, and bounded element metadata. No
+match and multiple matches are discovery results, not arbitrary element choices.
+For follow-up `execute`, reuse the exact returned `native:` target `id`; when the
+returned target `id` begins `pid:`, pass the separate numeric target `pid`
+instead. A later complete inventory replaces obsolete native live-handle leases,
+so refresh rather than synthesizing or repairing an ID.
+
+**Errors:** `INVALID_TRANSACTION` for an invalid target/selector contract;
+`ELEMENT_NOT_FOUND` when the target or accessible tree is absent;
+`AMBIGUOUS_TARGET` for tied/duplicate target resolution; `FOCUS_MISMATCH` when an
+`intent="inspect"` browser target is not already visible or `intent="interact"`
+cannot prove activation; `STALE_SNAPSHOT`,
+`DEADLINE_EXCEEDED`, `UNSUPPORTED_CAPABILITY`, `RESULT_TRUNCATED`, or the common
+readiness/provider errors. This operation does not mutate page data, so correct a
+bad selector or refresh stale inventory before one retry; never start a repeated
+observation/search loop.
+
+**Side effects:** `intent="inspect"` performs a foreground accessibility read and
+creates a process-local snapshot. `intent="interact"` also focuses the exact
+foreground target. Resolution can update the short process-local target cache; it
+never opens a tab or uses a background protocol.
+
+```json
+{
+  "query": "BIT-482 pagination guard Bitbucket pull request",
+  "intent": "interact",
+  "selectors": [
+    {
+      "role": "button",
+      "name": "Add inline comment",
+      "match": "contains"
+    },
+    {
+      "role": "textbox",
+      "name": "Comment",
+      "match": "contains"
+    }
+  ],
+  "max_results": 10,
+  "deadline_ms": 3000
+}
+```
+
+### `execute`
+
+Resolve one exact target and run a bounded sequence of local locate, action, and
+expectation steps without a model round trip between steps. A known task should
+use this as its only MCP call.
+
+| Parameter | Required | Type/default | Constraints and meaning |
+|---|---:|---|---|
+| `target` | yes | object | Strict target object described below. |
+| `steps` | yes | object array | 1–8 operation-specific step objects, executed in order under one deadline. |
+| `expect` | no | locator object | Final unique expectation evaluated after all steps. |
+| `deadline_ms` | no | integer, `3000` | One monotonic transaction deadline, 1–30,000 ms. Child operations cannot outlive it. |
+
+The strict `target` object supports:
+
+| Field | Required | Type/default | Constraints and meaning |
+|---|---:|---|---|
+| `query` | exactly one selector | string | Browser task, site, title, or URL terms, 1–512 characters. Existing open targets are ranked and reused first. |
+| `target_id` | exactly one selector | string | Exact target, 1–512 characters. Foreground requires a provider-qualified `native:` ID; shadow transactions require an exact persistent-CDP target from `list_tabs(shadow=true)`. |
+| `pid` | exactly one selector | integer | Foreground desktop process, 1–2,147,483,647. |
+| `snapshot` | no | string | Exact native snapshot from `observe_target` or persistent-CDP snapshot from `web_tree`, 1–128 characters. It is not allowed with an open-if-missing fallback. Provider/mode/target mismatch fails closed. The snapshot binds the exact target and scope, but execution always performs one fresh scoped accessibility read before locating or acting. Shadow actions revalidate the exact backend node's role and name immediately before dispatch. |
+| `mode` | no | string, `foreground` | `foreground` uses native accessibility and real input. `shadow` is allowed only when explicitly requested by the user and requires one exact persistent-CDP `target_id`; legacy CDP and Apple Events transactions are unsupported. |
+| `url` | conditional | string | Explicit `about`, `http`, or `https` URL, 1–8,192 characters; allowed only with a query and `on_missing="open"`. |
+| `on_missing` | no | string, `fail` | `fail` stops when the selected target is absent. `open` is foreground-only and requires `query` plus `url`; it never accompanies `target_id`, `pid`, or `snapshot`. |
+
+Exactly one of target `query`, `target_id`, or `pid` is required. Shadow mode does
+not accept query ranking, PID selection, a URL, or an open fallback, and it never
+falls back to another shadow provider or foreground input.
+
+Every step has required `op`. Unknown fields are rejected, and each operation
+accepts only the fields listed here:
+
+| `op` | Required fields | Optional fields | Behavior |
+|---|---|---|---|
+| `locate` | `as` and at least one of `role`, `name`, `value` | `match`, `within` | Resolve exactly one element and bind it to a transaction-local alias. |
+| `hover` | `ref` | `expect` | Move to one aliased element. Foreground uses the real pointer; explicit persistent-CDP shadow mode reads the exact backend node's box geometry and dispatches one protocol mouse move. |
+| `click` | `ref` | `expect`, `consequence` | Dispatch one click to one aliased element. |
+| `type` | `ref`, `text` | `expect`, `consequence` | Dispatch text once; an empty string is valid, and the value is never echoed. |
+| `press_key` | `ref`, `key` | `expect`, `consequence` | Dispatch one key to one aliased element. |
+| `scroll` | one nonzero `delta_x` or `delta_y` | `ref`, `expect` | Scroll the target or the aliased element scope. |
+| `expect` | at least one of `role`, `name`, `value` | `match`, `within` | Require exactly one matching element without dispatching input. |
+
+Step fields have these bounds and defaults:
+
+| Field | Type/default | Constraints and meaning |
+|---|---|---|
+| `op` | string | `locate`, `hover`, `click`, `type`, `press_key`, `scroll`, or `expect`. |
+| `as` | string | Alias, 1–64 characters, matching `[A-Za-z][A-Za-z0-9_]*`; aliases are unique and must be defined before use. |
+| `ref` | string | Previously defined alias from the current observation revision, 1–64 characters. Required by element actions and optional for `scroll`; locate again before a later action after any intervening action. |
+| `role` | string | Locator role, at most 128 characters. |
+| `name` | string | Locator name/title, at most 512 characters. |
+| `value` | string | Locator value, at most 512 characters. |
+| `match` | string, `exact` | Case-insensitive `exact`, `contains`, `prefix`, or `suffix` matching. |
+| `within` | string | Previously defined alias whose strict descendants form the locator scope, at most 64 characters. |
+| `text` | string | Text for `type`, at most 16,384 characters. The field must be present, but may be empty. |
+| `key` | string | Key for `press_key`, 1–64 characters. Transaction key steps do not accept modifier fields. |
+| `delta_x`, `delta_y` | integer, `0` | Horizontal/vertical scroll delta, each from -10,000 to 10,000; they cannot both be zero. |
+| `expect` | locator object | Post-action unique condition using the same `role`/`name`/`value`/`match`/`within` contract. |
+| `consequence` | literal `external_write` | Allowed only on `click`, `type`, or `press_key`. Declare at most one consequential action, and place it as the last mutating step; non-mutating expectations may follow. |
+
+Locators resolve from one transaction-local observation. Zero matches fail with
+`ELEMENT_NOT_FOUND`; multiple matches fail with `AMBIGUOUS_ELEMENT`. A successful
+action invalidates active alias bindings and the local view before a later condition
+is checked. A later action therefore needs a new `locate` step. For a scoped
+expectation, Agent Eyes re-resolves the saved `within` locator definition in the new
+revision and refreshes only the affected target scope instead of returning to the
+model.
+
+Supplying a snapshot removes another model discovery round trip; it does not authorize
+stale tree reuse. The snapshot binds the exact native or persistent-CDP target/scope,
+then `execute` reads that live scope once before resolving the first locator. A shadow
+action revalidates the exact backend node's accessible role and name immediately
+before dispatch; loader and root identity alone do not prove in-document semantics.
+
+**Returns:** success is compact JSON, at most 2 KiB. A failed or uncertain result
+is MCP error text beginning `ERROR: ` followed by the same compact JSON shape. It
+contains `status` (`succeeded`, `failed`, or `outcome_unknown`), stable error
+`code` when present, exact `target_id`, `completed_steps`, one-based `failed_step`
+when a step failed, `elapsed_ms`, `retry_safe`, `final_expectation` (`true`,
+`false`, or `null`), and the latest safe `snapshot` or an empty string. Locators,
+page content, URLs, queries, and typed text are not returned.
+
+**Errors:** `INVALID_TRANSACTION` for schema, alias, field, consequence, or mode
+violations; `ELEMENT_NOT_FOUND` or `AMBIGUOUS_ELEMENT` for unsafe locators;
+`AMBIGUOUS_TARGET`, `TARGET_MISMATCH`, `MODE_MISMATCH`, `STALE_SNAPSHOT`, or
+`FOCUS_MISMATCH` for unsafe target state; `DEADLINE_EXCEEDED`, `PROVIDER_BUSY`,
+`UNSUPPORTED_CAPABILITY` (including a legacy-CDP or Apple Events shadow target),
+the common readiness/provider errors, or `OUTCOME_UNKNOWN` after a dispatch whose
+completion cannot be proved. Retry only when the returned `retry_safe` is true.
+Never retry `OUTCOME_UNKNOWN`, and never automatically retry a transaction
+containing an `external_write` consequence.
+
+**Side effects:** foreground mode can activate an exact existing target, open the
+explicit safe URL only when the query has no suitable target and `on_missing` is
+`open`, and send real pointer/keyboard input. Explicit shadow mode stays on its
+selected persistent-CDP target; transaction `hover` never substitutes foreground
+input or another shadow provider. Each mutation is dispatched at most once;
+execution stops after the first failure or uncertain outcome and invalidates
+affected observation/inventory state.
+
+```json
+{
+  "target": {
+    "query": "BIT-482 pagination guard Bitbucket pull request",
+    "mode": "foreground",
+    "on_missing": "open",
+    "url": "https://bitbucket.org/acme/payments/pull-requests/482"
+  },
+  "steps": [
+    {
+      "op": "locate",
+      "as": "diff_row",
+      "role": "group",
+      "name": "src/payments/paginator.py",
+      "match": "contains"
+    },
+    {
+      "op": "locate",
+      "as": "comment_button",
+      "role": "button",
+      "name": "Add inline comment",
+      "match": "contains",
+      "within": "diff_row"
+    },
+    {
+      "op": "click",
+      "ref": "comment_button",
+      "expect": {
+        "role": "textbox",
+        "name": "Comment",
+        "match": "contains"
+      }
+    },
+    {
+      "op": "locate",
+      "as": "editor",
+      "role": "textbox",
+      "name": "Comment",
+      "match": "contains"
+    },
+    {
+      "op": "type",
+      "ref": "editor",
+      "text": "Please keep the pagination guard before materializing this collection."
+    },
+    {
+      "op": "locate",
+      "as": "submit_comment",
+      "role": "button",
+      "name": "Add comment",
+      "match": "exact"
+    },
+    {
+      "op": "click",
+      "ref": "submit_comment",
+      "consequence": "external_write"
+    }
+  ],
+  "expect": {
+    "role": "article",
+    "name": "Please keep the pagination guard",
+    "match": "contains"
+  },
+  "deadline_ms": 3000
+}
+```
+
 ### `web_tree`
 
 Inspect a background protocol target. Prefer `tree(pid)` for normal foreground
@@ -596,7 +888,7 @@ invalidated.
 
 ```json
 {
-  "target_id": "native:28468:w0:t1:ha39c14bb6193"
+  "target_id": "native:28468:w0:t1:ra39c14bb6193f72e"
 }
 ```
 

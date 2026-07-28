@@ -9,6 +9,10 @@ from agent_eyes.cli import build_parser
 from agent_eyes.input_validation import validate_tool_arguments
 from agent_eyes.server import TOOLS
 from agent_eyes.setup.scanner import _ai_tool_definitions
+from agent_eyes.transaction_contract import (
+    parse_execute_request,
+    parse_observe_target_request,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -17,22 +21,13 @@ MCP_REFERENCE = ROOT / "docs" / "api" / "mcp-tools.md"
 README = ROOT / "README.md"
 BENCHMARK_RESULTS_README = ROOT / "benchmarks" / "results" / "README.md"
 RUNTIME_RESULT = (
-    ROOT
-    / "benchmarks"
-    / "results"
-    / "macos-arm64-py312-v0.9.0-runtime.json"
+    ROOT / "benchmarks" / "results" / "macos-arm64-py312-v0.9.0-runtime.json"
 )
 STARTUP_RESULT = (
-    ROOT
-    / "benchmarks"
-    / "results"
-    / "macos-arm64-py312-v0.9.0-startup.json"
+    ROOT / "benchmarks" / "results" / "macos-arm64-py312-v0.9.0-startup.json"
 )
 BASELINE_RESULT = (
-    ROOT
-    / "benchmarks"
-    / "baselines"
-    / "macos-arm64-py312-pre-hardening.json"
+    ROOT / "benchmarks" / "baselines" / "macos-arm64-py312-pre-hardening.json"
 )
 
 
@@ -50,7 +45,11 @@ def _tool_sections(content: str) -> dict[str, str]:
     matches = list(re.finditer(r"^### `([^`]+)`[^\n]*$", tools_content, re.MULTILINE))
     sections: dict[str, str] = {}
     for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(tools_content)
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(tools_content)
+        )
         sections[match.group(1)] = tools_content[match.start() : end]
     return sections
 
@@ -90,6 +89,46 @@ def test_mcp_reference_covers_effective_tools_properties_and_valid_examples():
         for raw_example in examples:
             arguments = json.loads(raw_example)
             validate_tool_arguments(tool.inputSchema, arguments)
+            if tool.name == "observe_target":
+                parse_observe_target_request(arguments)
+            elif tool.name == "execute":
+                parse_execute_request(arguments)
+
+
+def test_mcp_reference_counts_and_indexes_the_additive_transaction_tools():
+    content = MCP_REFERENCE.read_text(encoding="utf-8")
+
+    assert "| macOS | 30 |" in content
+    assert "| Windows | 27 |" in content
+    assert "| Linux | 27 |" in content
+    assert "[`observe_target`](#observe_target)" in content
+    assert "[`execute`](#execute)" in content
+    assert '| `execute(target.mode="shadow")` | Yes | No | No |' in content
+    assert (
+        "explicit persistent-CDP shadow mode reads the exact backend node's box "
+        "geometry and dispatches one protocol mouse move"
+    ) in content
+    assert "`hover` has no shadow route." in content
+    assert "The snapshot binds the exact target and scope" in content
+    assert "execution always performs one fresh scoped accessibility read" in content
+    assert "loader and root identity alone do not prove" in content
+
+
+def test_v010_references_document_setup_completion_and_opaque_native_ids():
+    cli = CLI_REFERENCE.read_text(encoding="utf-8")
+    mcp = MCP_REFERENCE.read_text(encoding="utf-8")
+
+    assert "**Documented release:** 0.10.0" in cli
+    assert "Setup is the complete first-run flow" in cli
+    assert "Do not run `agent-eyes install` or `agent-eyes init` afterward" in cli
+    assert "repair and advanced split-flow commands" in cli
+
+    assert "**Documented release:** Agent Eyes 0.10.0" in mcp
+    assert "opaque, provider-qualified live handle" in mcp
+    assert "must not be parsed or reconstructed" in mcp
+    assert "content-fingerprinted" not in mcp
+    assert "content fingerprint" not in mcp
+    assert ":ha39c14bb6193" not in mcp
 
 
 def test_local_documentation_links_resolve():
@@ -123,9 +162,7 @@ def test_readme_benchmark_table_matches_checked_in_results():
     baseline_immediate = baseline["latency_ms"]["native_event_immediate_completion"][
         "p95"
     ]
-    baseline_formatting = baseline["latency_ms"]["format_1000_browser_targets"][
-        "p95"
-    ]
+    baseline_formatting = baseline["latency_ms"]["format_1000_browser_targets"]["p95"]
     baseline_catalog = baseline["context_bytes"]["tools_list_compact_json"]
 
     expected_values = (

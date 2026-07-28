@@ -4,10 +4,12 @@ import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from unittest.mock import Mock
 
 from mcp.types import CallToolResult
 
 from agent_eyes.tool_contract import MAX_TYPED_TEXT_CHARS
+from agent_eyes.transaction_contract import ExecuteRequest
 
 
 def _result_text(result) -> str:
@@ -228,3 +230,58 @@ def test_mixed_or_unguarded_pointer_modes_fail_before_readiness_or_dispatch(
 
     readiness.assert_not_awaited()
     dispatch.assert_not_awaited()
+
+
+def test_semantically_invalid_transaction_fails_before_readiness_or_dispatch(
+    monkeypatch,
+):
+    from agent_eyes import server
+
+    readiness = AsyncMock(side_effect=AssertionError("readiness must not run"))
+    dispatch = AsyncMock(side_effect=AssertionError("dispatch must not run"))
+    monkeypatch.setattr(server, "_ensure_runtime_readiness", readiness)
+    monkeypatch.setattr(server, "_dispatch_prepared", dispatch)
+
+    result = asyncio.run(
+        server.call_tool(
+            "execute",
+            {
+                "target": {"pid": 42},
+                "steps": [
+                    {"op": "locate", "as": "save", "role": "button"},
+                    {"op": "locate", "as": "save", "name": "Save"},
+                ],
+            },
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert "INVALID_TRANSACTION" in _result_text(result)
+    readiness.assert_not_awaited()
+    dispatch.assert_not_awaited()
+
+
+def test_valid_transaction_is_parsed_once_and_dispatches_typed_request(monkeypatch):
+    from agent_eyes import server
+
+    arguments = {
+        "target": {"pid": 42},
+        "steps": [{"op": "locate", "as": "save", "role": "button"}],
+    }
+    parser = Mock(wraps=server.parse_execute_request)
+    readiness = AsyncMock(return_value=SimpleNamespace(core_ready=True))
+    dispatch = AsyncMock(return_value="status=completed")
+    monkeypatch.setattr(server, "parse_execute_request", parser)
+    monkeypatch.setattr(server, "_ensure_runtime_readiness", readiness)
+    monkeypatch.setattr(server, "_dispatch_prepared", dispatch)
+
+    result = asyncio.run(server.call_tool("execute", arguments))
+
+    assert _result_text(SimpleNamespace(content=result)) == "status=completed"
+    parser.assert_called_once_with(arguments)
+    readiness.assert_awaited_once()
+    dispatch.assert_awaited_once()
+    name, prepared = dispatch.await_args.args
+    assert name == "execute"
+    assert isinstance(prepared, ExecuteRequest)

@@ -1,0 +1,108 @@
+{
+  "context": {
+    "tool_count": 30,
+    "tools_list_compact_json_bytes": 16026
+  },
+  "correctness": {
+    "allowed_sleep_modules": [
+      "input_sim.py",
+      "native_events.py",
+      "setup/readiness.py"
+    ],
+    "fixed_orchestration_sleep_calls": 0,
+    "singleflight_provider_calls": [
+      1
+    ]
+  },
+  "environment": {
+    "agent_eyes": "0.10.0",
+    "architecture": "arm64",
+    "git_head": "6a18442",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.11"
+  },
+  "formatting": {
+    "1000": {
+      "latency": {
+        "max_ms": 3.605,
+        "median_ms": 2.324,
+        "p95_ms": 3.5
+      },
+      "output_bytes": 1555,
+      "shown_targets": 10
+    },
+    "50": {
+      "latency": {
+        "max_ms": 0.564,
+        "median_ms": 0.323,
+        "p95_ms": 0.506
+      },
+      "output_bytes": 1552,
+      "shown_targets": 10
+    }
+  },
+  "gates": {
+    "fixed_orchestration_sleep_calls": 0,
+    "passed": true,
+    "singleflight_provider_calls": [
+      1
+    ],
+    "tool_catalog_limit_bytes": 16384,
+    "tools_list_compact_json_bytes": 16026
+  },
+  "latency": {
+    "cli_help": {
+      "max_ms": 40.449,
+      "median_ms": 37.036,
+      "p95_ms": 40.157
+    },
+    "cli_import": {
+      "max_ms": 83.663,
+      "median_ms": 37.245,
+      "p95_ms": 81.171
+    },
+    "coordinator_foreground_noop": {
+      "max_ms": 0.001,
+      "median_ms": 0.001,
+      "p95_ms": 0.001
+    },
+    "event_loop_heartbeat_lag": {
+      "max_ms": 4.435,
+      "median_ms": 1.052,
+      "p95_ms": 2.221
+    },
+    "fast_input_1000_char_composite": {
+      "max_ms": 0.001,
+      "median_ms": 0.001,
+      "p95_ms": 0.001
+    },
+    "immediate_event_completion": {
+      "max_ms": 0.622,
+      "median_ms": 0.334,
+      "p95_ms": 0.445
+    },
+    "provider_deadline_response": {
+      "max_ms": 11.36,
+      "median_ms": 11.074,
+      "p95_ms": 11.349
+    },
+    "singleflight_observation": {
+      "max_ms": 0.459,
+      "median_ms": 0.302,
+      "p95_ms": 0.429
+    },
+    "snapshot_resolve": {
+      "max_ms": 0.001,
+      "median_ms": 0.001,
+      "p95_ms": 0.001
+    }
+  },
+  "protocol": {
+    "concurrency": 32,
+    "fixture": "deterministic; no live browser or network latency",
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "samples": 30,
+    "warmups": 3
+  },
+  "schema_version": 3
+}

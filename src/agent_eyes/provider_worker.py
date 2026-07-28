@@ -157,6 +157,7 @@ class ProviderWorker:
         budget: OperationBudget,
         operation: str,
         state: ProviderCallState | None = None,
+        pre_dispatch: Callable[[], None] | None = None,
     ) -> _T:
         """Run one sync call; timed-out active work retains its lane until finished."""
         if not operation:
@@ -173,6 +174,8 @@ class ProviderWorker:
                 # A request may expire while queued for the OS-owned thread.
                 # Check before marking it dispatched or touching the provider.
                 budget.checkpoint(f"{self._name} provider dispatch")
+                if pre_dispatch is not None:
+                    pre_dispatch()
                 call_state._mark_started()
                 return call()
 

@@ -9,7 +9,7 @@ import tarfile
 import pytest
 
 
-ROOT = "agent_eyes-0.9.0"
+ROOT = "agent_eyes-0.10.0"
 EPOCH = 1_784_692_386
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "normalize_sdist.py"
 SPEC = importlib.util.spec_from_file_location("normalize_sdist", SCRIPT)

@@ -49,6 +49,7 @@ class AutomationCoordinator:
         self._flights: dict[Hashable, _Flight] = {}
         self._flights_guard = asyncio.Lock()
         self._foreground_poison: set[asyncio.Task[Any]] = set()
+        self._shadow_poison: dict[Hashable, set[asyncio.Task[Any]]] = {}
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -114,6 +115,22 @@ class AutomationCoordinator:
         self._foreground_poison.add(task)
         task.add_done_callback(self._foreground_recovered)
 
+    def poison_shadow_until(
+        self,
+        target_id: Hashable,
+        recovery: Awaitable[Any],
+    ) -> None:
+        """Reject same-target shadow work until an uncertain command settles."""
+        self._ensure_open()
+        task = asyncio.create_task(
+            recovery,
+            name="agent-eyes-shadow-recovery",
+        )
+        self._shadow_poison.setdefault(target_id, set()).add(task)
+        task.add_done_callback(
+            lambda done, key=target_id: self._shadow_recovered(key, done)
+        )
+
     async def execute_shadow(
         self,
         target_id: Hashable,
@@ -123,11 +140,17 @@ class AutomationCoordinator:
         operation_manages_deadline: bool = False,
     ) -> _T:
         self._ensure_open()
+        self._raise_if_shadow_poisoned(target_id)
         entry = self._retain_shadow_lock(target_id)
+
+        async def checked_operation() -> _T:
+            self._raise_if_shadow_poisoned(target_id)
+            return await operation()
+
         try:
             return await self._execute_locked(
                 entry.lock,
-                operation,
+                checked_operation,
                 budget=budget,
                 operation_manages_deadline=operation_manages_deadline,
                 queue_name="shadow target mutation queue",
@@ -149,6 +172,9 @@ class AutomationCoordinator:
         async with self._flights_guard:
             tasks = tuple(flight.task for flight in self._flights.values())
         tasks += tuple(self._foreground_poison)
+        tasks += tuple(
+            task for poisoned in self._shadow_poison.values() for task in poisoned
+        )
         if tasks:
             for task in tasks:
                 task.cancel()
@@ -160,6 +186,8 @@ class AutomationCoordinator:
                 await asyncio.gather(*done, return_exceptions=True)
         async with self._flights_guard:
             self._flights.clear()
+        self._foreground_poison.clear()
+        self._shadow_poison.clear()
         self.observations.close()
 
     async def _execute_locked(
@@ -235,6 +263,27 @@ class AutomationCoordinator:
 
     def _foreground_recovered(self, task: asyncio.Task[Any]) -> None:
         self._foreground_poison.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _raise_if_shadow_poisoned(self, target_id: Hashable) -> None:
+        poisoned = self._shadow_poison.get(target_id, ())
+        if any(not task.done() for task in poisoned):
+            raise OperationError(
+                OperationErrorCode.PROVIDER_BUSY,
+                "a prior shadow mutation on this target may still be running",
+            )
+
+    def _shadow_recovered(
+        self,
+        target_id: Hashable,
+        task: asyncio.Task[Any],
+    ) -> None:
+        poisoned = self._shadow_poison.get(target_id)
+        if poisoned is not None:
+            poisoned.discard(task)
+            if not poisoned:
+                self._shadow_poison.pop(target_id, None)
         if not task.cancelled():
             task.exception()
 

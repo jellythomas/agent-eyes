@@ -63,6 +63,8 @@ _ALL_AGENT_EYES_TOOLS = [
     "mcp__agent-eyes__context",
     "mcp__agent-eyes__shadow",
     "mcp__agent-eyes__pierce",
+    "mcp__agent-eyes__observe_target",
+    "mcp__agent-eyes__execute",
 ]
 
 _MACOS_ONLY_AGENT_EYES_TOOLS = frozenset(

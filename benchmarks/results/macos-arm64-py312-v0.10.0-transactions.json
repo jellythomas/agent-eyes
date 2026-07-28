@@ -1,0 +1,226 @@
+{
+  "environment": {
+    "agent_eyes": "0.10.0",
+    "architecture": "arm64",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.11"
+  },
+  "evidence": {
+    "discovery": {
+      "activations": [
+        1
+      ],
+      "dispatches": [
+        3
+      ],
+      "event_closes": [
+        3
+      ],
+      "event_registrations": [
+        3
+      ],
+      "external_writes": [
+        1
+      ],
+      "full_observations": [
+        0
+      ],
+      "full_scans_before_first_mutation": [
+        1
+      ],
+      "inventory_calls": [
+        1
+      ],
+      "max_activations_per_call": [
+        1
+      ],
+      "mcp_calls": [
+        2
+      ],
+      "revisions": [
+        4
+      ],
+      "scoped_observations": [
+        6
+      ],
+      "shadow_probes": [
+        0
+      ],
+      "worker_calls": [
+        22
+      ]
+    },
+    "known": {
+      "activations": [
+        1
+      ],
+      "dispatches": [
+        3
+      ],
+      "event_closes": [
+        3
+      ],
+      "event_registrations": [
+        3
+      ],
+      "external_writes": [
+        1
+      ],
+      "full_observations": [
+        0
+      ],
+      "full_scans_before_first_mutation": [
+        1
+      ],
+      "inventory_calls": [
+        1
+      ],
+      "max_activations_per_call": [
+        1
+      ],
+      "mcp_calls": [
+        1
+      ],
+      "revisions": [
+        4
+      ],
+      "scoped_observations": [
+        5
+      ],
+      "shadow_probes": [
+        0
+      ],
+      "worker_calls": [
+        19
+      ]
+    },
+    "observe": {
+      "activations": [
+        0
+      ],
+      "dispatches": [
+        0
+      ],
+      "event_closes": [
+        0
+      ],
+      "event_registrations": [
+        0
+      ],
+      "external_writes": [
+        0
+      ],
+      "full_observations": [
+        0
+      ],
+      "inventory_calls": [
+        1
+      ],
+      "mcp_calls": [
+        1
+      ],
+      "revisions": [
+        0
+      ],
+      "scoped_observations": [
+        1
+      ],
+      "shadow_probes": [
+        0
+      ],
+      "worker_calls": [
+        4
+      ]
+    },
+    "reveal": {
+      "activations": [
+        1
+      ],
+      "dispatches": [
+        2
+      ],
+      "event_closes": [
+        2
+      ],
+      "event_registrations": [
+        2
+      ],
+      "external_writes": [
+        0
+      ],
+      "full_observations": [
+        0
+      ],
+      "full_scans_before_first_mutation": [
+        1
+      ],
+      "inventory_calls": [
+        1
+      ],
+      "max_activations_per_call": [
+        1
+      ],
+      "mcp_calls": [
+        1
+      ],
+      "revisions": [
+        2
+      ],
+      "scoped_observations": [
+        3
+      ],
+      "shadow_probes": [
+        0
+      ],
+      "worker_calls": [
+        12
+      ]
+    }
+  },
+  "gates": {
+    "catalog_bytes": 16384,
+    "execute_bytes": 2048,
+    "observe_target_bytes": 4096,
+    "passed": true
+  },
+  "output": {
+    "catalog_bytes": 16026,
+    "execute_max_bytes": 174,
+    "observe_target_max_bytes": 505
+  },
+  "protocol": {
+    "fixed_orchestration_sleeps": 0,
+    "fixture": "deterministic Bitbucket-like foreground transaction; no network or rendering latency",
+    "percentile": "sorted[ceil(0.95*n)-1]",
+    "samples": 30,
+    "warmups": 3
+  },
+  "reference_latency": {
+    "discovery": {
+      "max_ms": 3.009,
+      "median_ms": 1.797,
+      "p95_ms": 2.672
+    },
+    "known": {
+      "max_ms": 2.431,
+      "median_ms": 1.484,
+      "p95_ms": 2.006
+    },
+    "release_gating": false,
+    "targets_ms": {
+      "median": 1000.0,
+      "p95": 3000.0
+    }
+  },
+  "retained_resources_before_fixture_close": {
+    "active_subscriptions": 0,
+    "active_workers": 0,
+    "observation_flights": 0,
+    "resolver_cache_entries": 1,
+    "resolver_exact_leases": 1,
+    "resolver_flights": 0,
+    "shadow_locks": 0,
+    "snapshots": 1
+  },
+  "schema_version": 2
+}

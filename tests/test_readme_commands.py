@@ -36,7 +36,15 @@ def test_readme_has_an_ordered_install_to_ready_path():
     assert "agent-eyes doctor --verbose" in content
     assert "`ready`" in content
     assert "`status`" in content
-    assert "`list_tabs`" in content
+    assert "`execute`" in content
+
+
+def test_setup_is_the_complete_bootstrap_without_mandatory_follow_up_commands():
+    content = _readme()
+
+    assert "Setup is the complete bootstrap" in content
+    assert "Do not run `agent-eyes install` or `agent-eyes init` afterward" in content
+    assert "repair and advanced split-flow commands" in content
 
 
 def test_readme_explains_exactly_what_setup_can_and_cannot_do():
@@ -127,6 +135,34 @@ def test_readme_preserves_readiness_platform_and_performance_guidance():
     assert "benchmarks/benchmark_cdp_bounds.py" in content
     assert "benchmarks/benchmark_journeys.py" in content
     assert "benchmarks/stress_concurrency.py" in content
+
+
+def test_readme_and_canonical_skill_prefer_the_bounded_transaction_fast_path():
+    readme = _readme()
+    skill = SKILLS[0].read_text(encoding="utf-8")
+
+    assert "30 tools on macOS and 27 on Windows/Linux" in readme
+    assert "call `execute` once" in readme
+    assert "call `observe_target` once" in readme
+    assert "then call `execute` once" in readme
+    assert "one live scoped" in readme
+    assert "accessibility refresh before locating or acting" in readme
+    assert "opaque live handle" in readme
+    assert "Do not parse or reconstruct it" in readme
+    assert "content fingerprint" not in readme
+
+    assert "For a known task, call `execute` once" in skill
+    assert "use at most two normal-path calls" in skill
+    assert "Never enter a repeated tree/find" in skill
+    assert "Never retry that transaction or mutation" in skill
+    assert 'consequence="external_write"' in skill
+    assert 'mode="shadow"' in skill
+    assert "persistent-CDP target" in skill
+    assert "Legacy CDP and Apple Events transactions are unsupported" in skill
+    assert "Given a native snapshot" in skill
+    assert "foreground `execute` still performs" in skill
+    assert "one live scoped accessibility refresh" in skill
+    assert "document-revision validation" in skill
 
 
 def test_bundled_skills_use_the_latest_bootstrap_and_correct_boundaries():

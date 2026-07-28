@@ -1,0 +1,113 @@
+{
+  "cancellation_boundaries": {
+    "capability_preflight": {
+      "completed_steps": null,
+      "dispatches": 0,
+      "failed_step": null,
+      "refreshes": 0,
+      "retry_safe": null,
+      "terminal": "cancelled"
+    },
+    "final_expectation": {
+      "completed_steps": 2,
+      "dispatches": 1,
+      "failed_step": null,
+      "refreshes": 1,
+      "retry_safe": false,
+      "terminal": "outcome_unknown"
+    },
+    "focus_preflight": {
+      "completed_steps": null,
+      "dispatches": 0,
+      "failed_step": null,
+      "refreshes": 0,
+      "retry_safe": null,
+      "terminal": "cancelled"
+    },
+    "initial_observation": {
+      "completed_steps": null,
+      "dispatches": 0,
+      "failed_step": null,
+      "refreshes": 0,
+      "retry_safe": null,
+      "terminal": "cancelled"
+    },
+    "provider_dispatch": {
+      "completed_steps": 1,
+      "dispatches": 1,
+      "failed_step": 2,
+      "refreshes": 0,
+      "retry_safe": false,
+      "terminal": "outcome_unknown"
+    },
+    "scoped_refresh": {
+      "completed_steps": 1,
+      "dispatches": 1,
+      "failed_step": 2,
+      "refreshes": 1,
+      "retry_safe": false,
+      "terminal": "outcome_unknown"
+    },
+    "target_resolution": {
+      "completed_steps": null,
+      "dispatches": 0,
+      "failed_step": null,
+      "refreshes": 0,
+      "retry_safe": null,
+      "terminal": "cancelled"
+    }
+  },
+  "foreground_queue": {
+    "cancelled": 16,
+    "cancelled_dispatches": 0,
+    "completed": 16,
+    "completed_operations": 16,
+    "concurrency": 32,
+    "dispatches": 16,
+    "duplicate_dispatches": 0,
+    "entered_queue": 32,
+    "max_active_operations": 1,
+    "queue_locked_after": false,
+    "started_operations": 16,
+    "tree_reads": 16
+  },
+  "resources": {
+    "closed_subscriptions": 10000,
+    "coordinator_flights": 0,
+    "coordinator_poison": 0,
+    "coordinator_shadow_locks": 0,
+    "cycles": 10000,
+    "foreground_locked": false,
+    "inventory_calls": 10000,
+    "live_provider_references": 0,
+    "live_subscriptions": 0,
+    "live_threaded_subscriptions": 0,
+    "live_workers_after_close": 0,
+    "native_event_threads": 0,
+    "opened_subscriptions": 10000,
+    "released_references": 10000,
+    "resolver_cache_entries": 0,
+    "resolver_flights": 0,
+    "resolver_lease_entries": 0,
+    "snapshots": 0,
+    "threaded_subscription_cycles": 32,
+    "workers_clean_before_close": true
+  },
+  "schema_version": 1,
+  "snapshot_rss": {
+    "baseline_rss_bytes": 61734912,
+    "cycles": 10000,
+    "final_rss_bytes": 61734912,
+    "growth_bytes": 0,
+    "growth_percent": 0.0,
+    "leaked_snapshots": 0,
+    "maximum_live_snapshots": 1,
+    "minimum_threshold_bytes": 10485760,
+    "payload_bytes_per_cycle": 4096,
+    "released_records": 10000,
+    "rss_source": "ps-rss",
+    "threshold_bytes": 10485760,
+    "threshold_percent": 5,
+    "warmup_cycles": 512
+  }
+}
