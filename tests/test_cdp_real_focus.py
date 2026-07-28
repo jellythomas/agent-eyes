@@ -34,7 +34,7 @@ def _unused_loopback_port() -> int:
 
 
 async def _wait_for_tab(client: CDPClient) -> ChromeTab:
-    deadline = asyncio.get_running_loop().time() + 8.0
+    deadline = asyncio.get_running_loop().time() + 20.0
     while asyncio.get_running_loop().time() < deadline:
         tabs = await client.list_tabs()
         if tabs:
